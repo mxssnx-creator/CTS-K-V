@@ -157,7 +157,7 @@ export function ConnectionSettingsDialog({
     volumeType: "usdt",
     positionMode: "one_way",
     leveragePercentage: 100,
-    useMaximalLeverage: false,
+    useMaximalLeverage: true,
     useSystemCloseOnly: false,
   })
 
@@ -618,21 +618,24 @@ export function ConnectionSettingsDialog({
                         step={1}
                         value={overview.leveragePercentage}
                         onChange={(v) => setOverview(p => ({ ...p, leveragePercentage: v }))}
-                        disabled={overview.useMaximalLeverage}
+                        disabled={true}
                       />
                     </div>
                   </div>
 
-                  <div className="flex items-center justify-between rounded-md border border-border p-3 mt-3">
+                  {/* Maximal leverage is always on — operator policy. The toggle is
+                      shown as locked so the UI makes the setting visible and
+                      auditable, but cannot be turned off from here. */}
+                  <div className="flex items-center justify-between rounded-md border border-border p-3 mt-3 opacity-70">
                     <div className="space-y-0.5">
                       <Label className="text-xs font-medium">Use Maximal Leverage</Label>
                       <p className="text-[11px] text-muted-foreground">
-                        {"Size positions at the exchange's maximum leverage (overrides the leverage %)."}
+                        {"Always on — engine uses the exchange's maximum supported leverage."}
                       </p>
                     </div>
                     <Switch
-                      checked={overview.useMaximalLeverage}
-                      onCheckedChange={(checked) => setOverview(p => ({ ...p, useMaximalLeverage: checked }))}
+                      checked={true}
+                      disabled={true}
                     />
                   </div>
 

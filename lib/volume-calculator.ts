@@ -9,6 +9,7 @@
  */
 
 import { initRedis, getSettings, getAppSettings, setSettings, getRedisClient, getConnection } from "@/lib/redis-db"
+import { getMaxLeverageForExchange } from "@/lib/leverage-policy"
 
 interface VolumeCalculationParams {
   baseVolumeFactor?: number
@@ -430,12 +431,14 @@ export class VolumeCalculator {
         return Number.isFinite(raw) && raw > 0 ? raw : 2
       })()
 
-      const leveragePercentage = parseFloat(String(settings.leveragePercentage ?? "100"))
-      // `parseHash` coerces the stored "true"/"1" to boolean true, so a
-      // strict `=== true` check is now safe (the old
-      // `=== "true"` string compare would always miss).
-      const useMaxLeverage = settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true"
-      const rawLeverage = useMaxLeverage ? 125 : Math.round(125 * (leveragePercentage / 100))
+      // Operator policy: always use the exchange's maximum supported leverage.
+      // `useMaximalLeverage` and `leveragePercentage` are no longer consulted
+      // here — the predefinition lookup in `getMaxLeverageForExchange` is the
+      // single source of truth. The two downstream safety nets still apply:
+      //   1. resolveBalanceAndLeverage caps to the balance-based bracket.
+      //   2. The live-stage 101204 auto-halve retry handles per-symbol limits.
+      const connection = await getConnection(connectionId).catch(() => null)
+      const rawLeverage = getMaxLeverageForExchange(connection?.exchange)
 
       // Delegate balance-fetch + leverage-cap to the helper method so the
       // logic lives in its own clean scope (no let mutation, no TDZ risk).

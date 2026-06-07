@@ -282,12 +282,12 @@ export class PseudoPositionManager {
           const raw = parseFloat(String(settings.positions_average ?? "2"))
           return Number.isFinite(raw) && raw > 0 ? raw : 2
         })()
-        const leveragePercentage = parseFloat(String(settings.leveragePercentage ?? "100"))
-        const useMaxLeverage =
-          settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true"
-        const rawLeverage = useMaxLeverage
-          ? 125
-          : Math.round(125 * (leveragePercentage / 100))
+        // Operator policy: always max leverage — resolved from the exchange
+        // predefinition rather than a stored preference flag.
+        const { getMaxLeverageForExchange: _getMaxLev } = await import("@/lib/leverage-policy")
+        const { getConnection: _getConn } = await import("@/lib/redis-db")
+        const _conn = await _getConn(this.connectionId).catch(() => null)
+        const rawLeverage = _getMaxLev(_conn?.exchange)
         const { accountBalance, maxLeverage } =
           await VolumeCalculator.resolveBalanceAndLeverage(this.connectionId, rawLeverage)
         const tradingPair = await getSettings(`trading_pair:${params.symbol}`)
