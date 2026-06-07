@@ -215,8 +215,37 @@ export function ConnectionSettingsDialog({
           symbolOrder: (settings.symbol_order as SymbolOrder) || prev.symbolOrder,
           symbolCount: Number(settings.symbol_count) || prev.symbolCount,
         }))
-        if (settings.strategies?.main)   setStratMain(settings.strategies.main)
-        if (settings.strategies?.preset) setStratPreset(settings.strategies.preset)
+        // Merge saved strategy channels with per-field defaults so older
+        // saves (pre-slider, with missing or out-of-range fields) never feed
+        // undefined into .toFixed() or NaN into Slider's value prop.
+        const mergeStratChannel = (
+          saved: unknown,
+          defaults: StrategyChannel,
+        ): StrategyChannel => {
+          if (!saved || typeof saved !== "object") return defaults
+          const s = saved as Record<string, unknown>
+          const mergeStage = (stage: StrategyType): StrategyParams => {
+            const rawVal = s[stage]
+            const raw = (rawVal && typeof rawVal === "object" ? rawVal : {}) as Record<string, unknown>
+            const def = defaults[stage]
+            return {
+              enabled:           typeof raw.enabled === "boolean" ? raw.enabled : def.enabled,
+              min_profit_factor: Number.isFinite(Number(raw.min_profit_factor)) && Number(raw.min_profit_factor) >= 0.1
+                ? Number(raw.min_profit_factor) : def.min_profit_factor,
+              max_drawdown_time: Number.isFinite(Number(raw.max_drawdown_time)) && Number(raw.max_drawdown_time) >= 20
+                ? Number(raw.max_drawdown_time) : def.max_drawdown_time,
+              max_positions:     Number.isFinite(Number(raw.max_positions)) && Number(raw.max_positions) >= 1
+                ? Number(raw.max_positions) : def.max_positions,
+            }
+          }
+          return {
+            base: mergeStage("base"),
+            main: mergeStage("main"),
+            real: mergeStage("real"),
+          }
+        }
+        if (settings.strategies?.main)   setStratMain(mergeStratChannel(settings.strategies.main, DEFAULT_STRATEGY_PROFILE))
+        if (settings.strategies?.preset) setStratPreset(mergeStratChannel(settings.strategies.preset, DEFAULT_STRATEGY_PROFILE))
         // Merge saved coord into defaults so older saves (without the
         // Block ratio / max-stack fields, or without some variants) load
         // cleanly and the new sliders aren't fed undefined.
@@ -321,7 +350,7 @@ export function ConnectionSettingsDialog({
 
   // ─────────────────────���───────────────────────────────────────────
   // EXCHANGE SYMBOLS REFRESH
-  // ────────────────────────────────────────────��────────────────────
+  // ────────────────────────────────────────────���────────────────────
 
   const refreshExchangeSymbols = useCallback(async () => {
     setLoadingSymbols(true)
@@ -1079,7 +1108,9 @@ function StrategyOptionsPanel({
 
       <div className="grid gap-2">
         {VARIANT_META.map(({ key, label, desc, defaultOn }) => {
-          const enabled = variants[key]
+          // `variants[key]` may be undefined if loaded from older persisted data
+          // that predates the field — fall back to the spec default.
+          const enabled = typeof variants[key] === "boolean" ? variants[key] : defaultOn
           return (
             <div
               key={key}
