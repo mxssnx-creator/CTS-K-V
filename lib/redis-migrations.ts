@@ -3,7 +3,7 @@
  * Handles schema initialization and data migrations for all system components
  */
 
-import { getRedisClient, ensureCoreRedis, setMigrationsRun, haveMigrationsRun, getAllConnections } from "./redis-db"
+import { getRedisClient, ensureCoreRedis, setMigrationsRun, haveMigrationsRun } from "./redis-db"
 
 /**
  * Reset the in-process migration guards.
@@ -1253,12 +1253,33 @@ const migrations: Migration[] = [
       // the existing fields, and we only hset the missing defaults. The
       // existing counters and snapshots are preserved.
 
-      const allConnections = await getAllConnections()
+      // ── DEADLOCK FIX: Use raw client, NOT getAllConnections() ────────────────
+      // getAllConnections() calls initRedis() internally. Since we are already
+      // INSIDE initRedis() running migrations, that creates a circular wait that
+      // deadlocks the entire server (event loop blocked, all routes timeout).
+      // Use client.keys() directly — exactly as migrations 020-024 do.
+      const idSet025 = new Set<string>()
+      try {
+        const connKeys025 = (await client.keys("connection:*")) || []
+        for (const k of connKeys025) {
+          if (typeof k !== "string") continue
+          if (k.startsWith("connection_settings:")) continue
+          const id = k.slice("connection:".length)
+          if (id) idSet025.add(id)
+        }
+      } catch { /* keys() unavailable */ }
+      for (const setName025 of ["connections", "connections:main:enabled"]) {
+        try {
+          const ids = (await client.smembers(setName025)) || []
+          for (const id of ids) if (typeof id === "string" && id) idSet025.add(id)
+        } catch { /* missing set */ }
+      }
+
       const now = new Date().toISOString()
       const epochMs = Date.now()
 
-      for (const conn of allConnections) {
-        const progKey = `progression:${conn.id}`
+      for (const connId025 of idSet025) {
+        const progKey = `progression:${connId025}`
 
         // Read current state (if any)
         const existing = (await client.hgetall(progKey).catch(() => ({}))) as
@@ -1269,7 +1290,7 @@ const migrations: Migration[] = [
         // Default progression state structure — write only missing fields
         const defaults: Record<string, string> = {
           // ── Identity & Session ──
-          connection_id: conn.id,
+          connection_id: connId025,
           session_number: have.session_number ?? "0",
           epoch: have.epoch ?? String(epochMs),
           started_at: have.started_at ?? String(epochMs),
@@ -1346,14 +1367,14 @@ const migrations: Migration[] = [
       const haveIndex = progressionIndex || {}
       if (!haveIndex.total_connections) {
         await client.hset("progression:index", {
-          total_connections: String(allConnections.length),
+          total_connections: String(idSet025.size),
           last_initialized: now,
           schema_version: "25",
         })
       }
 
       console.log(
-        `[v0] Migration 025: initialized progression state for ${allConnections.length} connections (defaults for missing fields, preserved existing counters)`,
+        `[v0] Migration 025: initialized progression state for ${idSet025.size} connections (defaults for missing fields, preserved existing counters)`,
       )
     },
     down: async (client: any) => {
