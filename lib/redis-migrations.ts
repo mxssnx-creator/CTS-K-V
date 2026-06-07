@@ -3,7 +3,7 @@
  * Handles schema initialization and data migrations for all system components
  */
 
-import { getRedisClient, ensureCoreRedis, setMigrationsRun, haveMigrationsRun } from "./redis-db"
+import { getRedisClient, ensureCoreRedis, setMigrationsRun, haveMigrationsRun, getAllConnections } from "./redis-db"
 
 /**
  * Reset the in-process migration guards.
@@ -1229,6 +1229,135 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "23")
+    },
+  },
+  {
+    name: "025-initialize-progression-state-hashes",
+    version: 25,
+    up: async (client: any) => {
+      await client.set("_schema_version", "25")
+
+      // ── Initialize progression:{connectionId} hashes for all connections ────
+      // These hashes track counters, snapshots, and cycle metrics for each
+      // connection's trade engine. Previously they were created on-demand
+      // (lazy initialization) when the first log event fired. This created
+      // a race condition during crashes: if Redis crashed after migrations
+      // completed but BEFORE the engine's first progression write, the hash
+      // didn't exist, causing missing or corrupted progression state.
+      //
+      // IMPACT: This ensures every connection has a valid progression hash
+      // with zeroed counters + default values at startup, so any subsequent
+      // crash doesn't leave the progression state missing or incomplete.
+      //
+      // IDEMPOTENT: If a progression hash already exists, hgetall returns
+      // the existing fields, and we only hset the missing defaults. The
+      // existing counters and snapshots are preserved.
+
+      const allConnections = await getAllConnections()
+      const now = new Date().toISOString()
+      const epochMs = Date.now()
+
+      for (const conn of allConnections) {
+        const progKey = `progression:${conn.id}`
+
+        // Read current state (if any)
+        const existing = (await client.hgetall(progKey).catch(() => ({}))) as
+          | Record<string, string>
+          | null
+        const have = existing || {}
+
+        // Default progression state structure — write only missing fields
+        const defaults: Record<string, string> = {
+          // ── Identity & Session ──
+          connection_id: conn.id,
+          session_number: have.session_number ?? "0",
+          epoch: have.epoch ?? String(epochMs),
+          started_at: have.started_at ?? String(epochMs),
+
+          // ── Cycle Counters (hincrby discipline — never overwrite!) ──
+          cycles_completed: have.cycles_completed ?? "0",
+          successful_cycles: have.successful_cycles ?? "0",
+          failed_cycles: have.failed_cycles ?? "0",
+
+          // ── Per-Processor Counters ──
+          indication_cycle_count: have.indication_cycle_count ?? "0",
+          indication_live_cycle_count: have.indication_live_cycle_count ?? "0",
+          strategy_cycle_count: have.strategy_cycle_count ?? "0",
+          strategy_live_cycle_count: have.strategy_live_cycle_count ?? "0",
+          realtime_cycle_count: have.realtime_cycle_count ?? "0",
+          realtime_live_cycle_count: have.realtime_live_cycle_count ?? "0",
+          frames_processed: have.frames_processed ?? "0",
+
+          // ── Indication Type Counters ──
+          indications_direction_count: have.indications_direction_count ?? "0",
+          indications_move_count: have.indications_move_count ?? "0",
+          indications_active_count: have.indications_active_count ?? "0",
+          indications_active_advanced_count: have.indications_active_advanced_count ?? "0",
+          indications_optimal_count: have.indications_optimal_count ?? "0",
+          indications_auto_count: have.indications_auto_count ?? "0",
+
+          // ── Strategy Set Counters ──
+          strategies_base_total: have.strategies_base_total ?? "0",
+          strategies_base_evaluated: have.strategies_base_evaluated ?? "0",
+          strategies_main_total: have.strategies_main_total ?? "0",
+          strategies_main_evaluated: have.strategies_main_evaluated ?? "0",
+          strategies_real_total: have.strategies_real_total ?? "0",
+          strategies_real_evaluated: have.strategies_real_evaluated ?? "0",
+
+          // ── Trade / Profit Counters ──
+          total_trades: have.total_trades ?? "0",
+          successful_trades: have.successful_trades ?? "0",
+          total_profit: have.total_profit ?? "0",
+
+          // ── Snapshot Fields (hset discipline) ──
+          cycle_success_rate: have.cycle_success_rate ?? "0",
+          trade_success_rate: have.trade_success_rate ?? "0",
+          cycle_time_ms: have.cycle_time_ms ?? "0",
+          last_cycle_time: have.last_cycle_time ?? now,
+          last_update: have.last_update ?? now,
+
+          // ── Engine State ──
+          engine_started: have.engine_started ?? "false",
+          prehistoric_phase_active: have.prehistoric_phase_active ?? "false",
+          prehistoric_symbols_processed_count: have.prehistoric_symbols_processed_count ?? "0",
+          prehistoric_candles_processed: have.prehistoric_candles_processed ?? "0",
+          intervals_processed: have.intervals_processed ?? "0",
+          indications_count: have.indications_count ?? "0",
+          strategies_count: have.strategies_count ?? "0",
+        }
+
+        // Write only missing fields — preserve existing counters
+        const toWrite: Record<string, string> = {}
+        for (const [field, value] of Object.entries(defaults)) {
+          if (have[field] === undefined || have[field] === null || have[field] === "") {
+            toWrite[field] = value
+          }
+        }
+
+        if (Object.keys(toWrite).length > 0) {
+          await client.hset(progKey, toWrite)
+        }
+      }
+
+      // Also initialize the global progression index (if needed by monitoring)
+      const progressionIndex = (await client.hgetall("progression:index").catch(() => ({}))) as
+        | Record<string, string>
+        | null
+      const haveIndex = progressionIndex || {}
+      if (!haveIndex.total_connections) {
+        await client.hset("progression:index", {
+          total_connections: String(allConnections.length),
+          last_initialized: now,
+          schema_version: "25",
+        })
+      }
+
+      console.log(
+        `[v0] Migration 025: initialized progression state for ${allConnections.length} connections (defaults for missing fields, preserved existing counters)`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "24")
     },
   },
 ]
