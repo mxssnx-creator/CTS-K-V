@@ -1,8 +1,9 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { SystemLogger } from "@/lib/system-logger"
-import { updateConnection, initRedis, getConnection, getRedisClient } from "@/lib/redis-db"
+import { updateConnection, initRedis, getConnection, getRedisClient, setSettings, getSettings } from "@/lib/redis-db"
 import { RedisTrades, RedisPositions } from "@/lib/redis-operations"
 import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
+import { getTradeEngine } from "@/lib/trade-engine"
 
 export async function GET(
   request: NextRequest,
@@ -221,6 +222,98 @@ export async function PATCH(
       }
     } catch (mirrorErr) {
       console.error("[v0] [Settings] eval-knob hash mirror failed:", mirrorErr)
+    }
+
+    // ── Symbols → engine symbol source (auto-resolve top-N on save) ─────
+    // The dialog saves `symbols` (manual list), `symbol_order` (volume /
+    // volatility / newest / manual) and `symbol_count` into
+    // `connection_settings`. But the engine's `getSymbols()` reads the
+    // ACTIVE list from the connection object's `active_symbols` (and the
+    // `trade_engine_state:{id}` hash) — it never looks at
+    // `connection_settings.symbols`. So without this bridge a saved symbol
+    // selection silently never reached the engine.
+    //
+    // Behaviour:
+    //   • symbol_order === "manual" (or a non-empty `symbols` array with that
+    //     order): use the operator's explicit list, truncated to symbol_count.
+    //   • otherwise: AUTO-RESOLVE the top-N by the chosen order from the public
+    //     exchange ticker API (volume / volatility), N = symbol_count.
+    // The resolved list is written to BOTH `active_symbols` on the connection
+    // and the `trade_engine_state:{id}` hash, then the live engine's symbol
+    // cache is invalidated so the next tick (≤ TTL) picks it up without a
+    // restart.
+    const touchedSymbols =
+      Array.isArray((settings as Record<string, unknown>).symbols) ||
+      typeof (settings as Record<string, unknown>).symbol_order === "string" ||
+      (settings as Record<string, unknown>).symbol_count !== undefined
+    if (touchedSymbols) {
+      try {
+        const order = String((merged as Record<string, unknown>).symbol_order || "volume_24h")
+        const rawCount = Number((merged as Record<string, unknown>).symbol_count)
+        const count = Number.isFinite(rawCount) && rawCount > 0 ? Math.max(1, Math.min(50, Math.floor(rawCount))) : 3
+        const manualList = Array.isArray((merged as Record<string, unknown>).symbols)
+          ? ((merged as Record<string, unknown>).symbols as unknown[]).filter(
+              (s): s is string => typeof s === "string" && s.length > 0,
+            )
+          : []
+
+        let resolved: string[] = []
+        if (order === "manual" && manualList.length > 0) {
+          // Operator-curated list wins verbatim (still capped at count).
+          resolved = manualList.slice(0, count)
+        } else {
+          // Auto-resolve top-N by the chosen order from the public ticker API.
+          const exchange = String((connection as Record<string, unknown>).exchange || "bingx").toLowerCase()
+          const sort = order.startsWith("volatil") ? "volatility" : "volume"
+          const origin = new URL(request.url).origin
+          try {
+            const ctrl = new AbortController()
+            const t = setTimeout(() => ctrl.abort(), 8000)
+            const topRes = await fetch(
+              `${origin}/api/exchange/${exchange}/top-symbols?limit=${count}&sort=${sort}&t=${Date.now()}`,
+              { signal: ctrl.signal, cache: "no-store" },
+            ).finally(() => clearTimeout(t))
+            if (topRes.ok) {
+              const topData = await topRes.json()
+              const list: string[] = Array.isArray(topData.symbolList)
+                ? topData.symbolList.filter((s: unknown): s is string => typeof s === "string" && s.length > 0)
+                : []
+              resolved = list.slice(0, count)
+            }
+          } catch (fetchErr) {
+            console.warn("[v0] [Settings] top-symbols auto-resolve failed:", fetchErr instanceof Error ? fetchErr.message : fetchErr)
+          }
+          // If auto-resolve produced nothing (sandbox/outage), fall back to any
+          // manual list the operator had, so we never wipe the engine's symbols.
+          if (resolved.length === 0 && manualList.length > 0) resolved = manualList.slice(0, count)
+        }
+
+        if (resolved.length > 0) {
+          // 1. Persist as the connection's ACTIVE symbol source (what the engine reads).
+          await updateConnection(id, { active_symbols: JSON.stringify(resolved) })
+          // 2. Mirror into trade_engine_state (the engine's primary lookup) +
+          //    seed the prehistoric symbol total so the progress bar denominator
+          //    matches the new selection immediately.
+          const stateKey = `trade_engine_state:${id}`
+          const prevState = (await getSettings(stateKey)) || {}
+          await setSettings(stateKey, {
+            ...prevState,
+            connection_id: id,
+            symbols: JSON.stringify(resolved),
+            active_symbols: JSON.stringify(resolved),
+            config_set_symbols_total: resolved.length,
+            updated_at: new Date().toISOString(),
+          })
+          // 3. Invalidate the running engine's in-memory symbol cache so the
+          //    change takes effect on the next tick without a restart.
+          try {
+            getTradeEngine()?.getEngineManager(id)?.invalidateSymbolsCache()
+          } catch { /* engine may not be running yet — state above is enough */ }
+          console.log(`[v0] [Settings] Resolved ${resolved.length} symbol(s) for ${id} (order=${order}): ${resolved.join(", ")}`)
+        }
+      } catch (symErr) {
+        console.error("[v0] [Settings] symbol auto-resolve failed:", symErr)
+      }
     }
 
     // Full propagation. PATCH only ships a partial settings payload, so

@@ -2,7 +2,12 @@ import { NextResponse } from "next/server"
 
 export const dynamic = "force-dynamic"
 
-// In-memory cache — volatile symbols don't change rapidly, 60s TTL is fine
+type SortKey = "volume" | "volatility"
+type Ticker = { symbol: string; priceChangePercent: number; volume: number }
+
+// In-memory cache — volatile symbols don't change rapidly, 60s TTL is fine.
+// Keyed by `${exchange}:${sort}` so a volume-sorted and a volatility-sorted
+// request don't clobber each other's cached top-1.
 const cache = new Map<string, { symbol: string; priceChangePercent: number; timestamp: number }>()
 const CACHE_TTL = 60_000
 
@@ -16,25 +21,35 @@ const FALLBACK: Record<string, string> = {
   orangex: "BTCUSDT",
 }
 
+function normaliseSort(raw: string | null): SortKey {
+  const v = (raw || "").toLowerCase()
+  // The dialog maps both `volume_24h`/`volume_1h` → "volume" and
+  // `volatility_*` → "volatility"; `newest`/`manual` fall back to volume.
+  if (v.startsWith("volatil")) return "volatility"
+  return "volume"
+}
+
 async function fetchMostVolatileSymbols(
   exchange: string,
   limit = 1,
-): Promise<{ symbol: string; priceChangePercent: number; symbols: { symbol: string; priceChangePercent: number }[] }> {
-  const safeLimit = Math.max(1, Math.min(10, Math.floor(limit) || 1))
+  sort: SortKey = "volume",
+): Promise<{ symbol: string; priceChangePercent: number; symbols: { symbol: string; priceChangePercent: number; volume: number }[] }> {
+  const safeLimit = Math.max(1, Math.min(50, Math.floor(limit) || 1))
+  const cacheKey = `${exchange}:${sort}`
   // Cache only keeps the single top symbol — for limit > 1 we always fetch fresh
   // (still cheap: one public REST call with 5s timeout) and return the sorted list.
   if (safeLimit === 1) {
-    const cached = cache.get(exchange)
+    const cached = cache.get(cacheKey)
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
       return {
         symbol: cached.symbol,
         priceChangePercent: cached.priceChangePercent,
-        symbols: [{ symbol: cached.symbol, priceChangePercent: cached.priceChangePercent }],
+        symbols: [{ symbol: cached.symbol, priceChangePercent: cached.priceChangePercent, volume: 0 }],
       }
     }
   }
 
-  let tickers: { symbol: string; priceChangePercent: number }[] = []
+  let tickers: Ticker[] = []
 
   try {
     if (exchange === "binance") {
@@ -57,6 +72,7 @@ async function fetchMostVolatileSymbols(
         .map(t => ({
           symbol: t.symbol,
           priceChangePercent: Math.abs(parseFloat(t.priceChangePercent)),
+          volume: parseFloat(t.quoteVolume) || 0,
         }))
 
     } else if (exchange === "bybit") {
@@ -89,6 +105,7 @@ async function fetchMostVolatileSymbols(
               .map(t => ({
                 symbol: t.symbol,
                 priceChangePercent: Math.abs(parseFloat(t.priceChangePercent)),
+                volume: parseFloat(t.quoteVolume) || 0,
               }))
           }
         } else {
@@ -101,6 +118,7 @@ async function fetchMostVolatileSymbols(
             .map((t: any) => ({
               symbol: t.symbol,
               priceChangePercent: Math.abs(parseFloat(t.price24hPcnt || "0") * 100),
+              volume: parseFloat(t.turnover24h) || 0,
             }))
         }
       } catch (bybitErr) {
@@ -122,6 +140,7 @@ async function fetchMostVolatileSymbols(
         .map((t: any) => ({
           symbol: (t.symbol as string).replace("-", ""),
           priceChangePercent: Math.abs(parseFloat(t.priceChangePercent || "0")),
+          volume: parseFloat(t.quoteVolume || t.volume || "0") || 0,
         }))
 
     } else if (exchange === "okx") {
@@ -139,6 +158,7 @@ async function fetchMostVolatileSymbols(
         .map((t: any) => ({
           symbol: (t.instId as string).replace("-SWAP", "").replace("-", ""),
           priceChangePercent: Math.abs(parseFloat(t.sodUtc8 || "0")),
+          volume: parseFloat(t.volCcy24h || "0") || 0,
         }))
     }
   } catch (err) {
@@ -159,8 +179,9 @@ async function fetchMostVolatileSymbols(
     const ordered = [preferred, ...SAFE_MAJORS.filter(s => s !== preferred)]
     const fallbackSymbols = ordered.slice(0, safeLimit).map((symbol, i) => ({
       symbol,
-      // Tiny descending synthetic volatility keeps a stable, sensible sort order.
+      // Tiny descending synthetic metrics keep a stable, sensible sort order.
       priceChangePercent: i === 0 ? 0 : 0.5,
+      volume: Math.max(0, (ordered.length - i) * 1000),
     }))
     return { symbol: preferred, priceChangePercent: 0, symbols: fallbackSymbols }
   }
@@ -173,12 +194,17 @@ async function fetchMostVolatileSymbols(
     const clean = tickers.filter(t => !looksBogus(t.symbol))
     const needed = Math.max(0, safeLimit - clean.length)
     const extras = SAFE_MAJORS.filter(s => !clean.some(c => c.symbol === s)).slice(0, needed)
-      .map(s => ({ symbol: s, priceChangePercent: 0.5 }))
-    tickers = [...clean, ...extras].slice(0, safeLimit)
+      .map(s => ({ symbol: s, priceChangePercent: 0.5, volume: 1000 }))
+    tickers = [...clean, ...extras].slice(0, Math.max(safeLimit, clean.length))
   }
 
-  // Sort by absolute price change % descending — highest volatility first
-  tickers.sort((a, b) => b.priceChangePercent - a.priceChangePercent)
+  // Sort by the requested key, descending. "volume" → 24h quote/turnover
+  // volume (liquidity-first); "volatility" → absolute 24h price change %.
+  tickers.sort((a, b) =>
+    sort === "volatility"
+      ? b.priceChangePercent - a.priceChangePercent
+      : b.volume - a.volume,
+  )
 
   // De-duplicate (guards against any exchange returning the same symbol twice)
   const seen = new Set<string>()
@@ -190,18 +216,19 @@ async function fetchMostVolatileSymbols(
 
   const topN = unique.slice(0, safeLimit)
   const top = topN[0]
-  cache.set(exchange, { symbol: top.symbol, priceChangePercent: top.priceChangePercent, timestamp: Date.now() })
+  cache.set(cacheKey, { symbol: top.symbol, priceChangePercent: top.priceChangePercent, timestamp: Date.now() })
 
   return { symbol: top.symbol, priceChangePercent: top.priceChangePercent, symbols: topN }
 }
 
 /**
- * GET /api/exchange/[exchange]/top-symbols?limit=N
- * Returns the top N most volatile symbols on the exchange (by 24h price change %).
- * - limit defaults to 1 and is clamped to [1,10]
+ * GET /api/exchange/[exchange]/top-symbols?limit=N&sort=volume|volatility
+ * Returns the top N symbols on the exchange, ordered by the requested key.
+ * - limit defaults to 1 and is clamped to [1,50]
+ * - sort defaults to "volume" (liquidity-first); "volatility" orders by 24h |%Δ|
  * - `symbol` keeps the top-1 for backward-compatibility with existing callers
- * - `symbols` is now a sorted list of objects: [{ symbol, priceChangePercent }, ...]
- *   (older callers using `symbols: [string]` should switch to `symbol` or read `.symbol`).
+ * - `symbols` is a sorted list of objects: [{ symbol, priceChangePercent, volume }, ...]
+ * - `symbolList` is the plain string[] for convenience
  * Uses public exchange REST APIs — no auth required.
  */
 export async function GET(request: Request, { params }: { params: Promise<{ exchange: string }> }) {
@@ -211,15 +238,17 @@ export async function GET(request: Request, { params }: { params: Promise<{ exch
 
     const { searchParams } = new URL(request.url)
     const limit = parseInt(searchParams.get("limit") || "1", 10) || 1
+    const sort = normaliseSort(searchParams.get("sort"))
 
-    const { symbol, priceChangePercent, symbols } = await fetchMostVolatileSymbols(normalised, limit)
+    const { symbol, priceChangePercent, symbols } = await fetchMostVolatileSymbols(normalised, limit, sort)
 
     return NextResponse.json({
       success: true,
       exchange: normalised,
+      sort,
       symbol,
       priceChangePercent,
-      symbols,                             // [{ symbol, priceChangePercent }]
+      symbols,                             // [{ symbol, priceChangePercent, volume }]
       symbolList: symbols.map(s => s.symbol), // plain string[] for convenience
       count: symbols.length,
       timestamp: new Date().toISOString(),
