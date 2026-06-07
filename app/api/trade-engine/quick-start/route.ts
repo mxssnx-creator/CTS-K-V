@@ -608,20 +608,26 @@ export async function POST(request: Request) {
           console.warn(`${LOG_PREFIX}: Pre-start cleanup warning:`, restartErr)
         }
 
-        await coordinator.startAll()
-        await coordinator.refreshEngines()
-        
-        // CRITICAL: Apply cache fix to all indication processors after engines are started
-        patchIndicationProcessorCaches(coordinator)
-        
-        // Set global engine state to running
-        await client.hset("trade_engine:global", { 
-          status: "running", 
-          started_at: new Date().toISOString(),
-          coordinator_ready: "true"
+        // Fire-and-forget: startAll picks up the newly-updated connection in
+        // the background. We do NOT await it — it can take seconds to spin up
+        // engines for every eligible connection and we don't want that time
+        // inside the HTTP handler.
+        coordinator.startAll().catch((e: unknown) => {
+          console.warn(`${LOG_PREFIX} startAll background warning:`, e)
         })
-        
-        console.log(`${LOG_PREFIX} ✓ Global Coordinator started successfully with cache fix applied`)
+
+        // CRITICAL: Apply cache fix to all indication processors after engines are started.
+        // Non-blocking — just patches in-process objects, no I/O.
+        setImmediate(() => patchIndicationProcessorCaches(coordinator))
+
+        // Persist coordinator-ready marker. Cheap hset — does not await engine boot.
+        client.hset("trade_engine:global", {
+          status: "running",
+          started_at: new Date().toISOString(),
+          coordinator_ready: "true",
+        }).catch(() => {})
+
+        console.log(`${LOG_PREFIX} ✓ Global Coordinator boot dispatched (fire-and-forget)`)
         await logProgressionEvent("global", "global_coordinator_started", "info", "Global Trade Engine Coordinator started via QuickStart")
         
       } catch (globalStartError) {
@@ -644,28 +650,33 @@ export async function POST(request: Request) {
           updated_at: new Date().toISOString(),
         })
         
-        try {
-          const settings = await loadSettingsAsync()
-          const coordinator = getGlobalTradeEngineCoordinator()
-          
-          await coordinator.startEngine(connectionId, {
-            connectionId,
-            connection_name: connection.name,
-            exchange: exchangeName,
-            engine_type: "main",
-            indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
-            strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
-            realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
-          })
-          
-          // Ensure connection is marked as live trade enabled
-          await updateConnection(connectionId, {
-            ...connection,
-            is_live_trade: "1",
-            updated_at: new Date().toISOString(),
-          })
-          
-            console.log(`${LOG_PREFIX} ✓ Main Engine started for ${connection.name}`)
+        // Kick off the engine asynchronously — startEngine() can block for
+        // several seconds while it syncs exchange time and spins up workers.
+        // Awaiting it inside the HTTP handler causes the request to hang.
+        // We log the result via a detached promise so diagnostics are preserved.
+        ;(async () => {
+          try {
+            const settings = await loadSettingsAsync()
+            const coord = getGlobalTradeEngineCoordinator()
+
+            await coord.startEngine(connectionId, {
+              connectionId,
+              connection_name: connection.name,
+              exchange: exchangeName,
+              engine_type: "main",
+              indicationInterval: settings.mainEngineIntervalMs ? settings.mainEngineIntervalMs / 1000 : 5,
+              strategyInterval: settings.strategyUpdateIntervalMs ? settings.strategyUpdateIntervalMs / 1000 : 10,
+              realtimeInterval: settings.realtimeIntervalMs ? settings.realtimeIntervalMs / 1000 : 0.3,
+            })
+
+            // Ensure is_live_trade is persisted after engine confirms start.
+            await updateConnection(connectionId, {
+              ...connection,
+              is_live_trade: "1",
+              updated_at: new Date().toISOString(),
+            })
+
+            console.log(`${LOG_PREFIX} ✓ Main Engine started for ${connection.name} (async)`)
             await logProgressionEvent(connectionId, "engine_started", "info", "Main Trade Engine started via QuickStart", {
               connectionId,
               connectionName: connection.name,
@@ -673,25 +684,16 @@ export async function POST(request: Request) {
               testPassed,
             })
 
-            // Immediate evaluation kick — ensures the first Real/Live sets (and real
-            // exchange order attempts) are computed right now instead of waiting for
-            // the next 5-10 s timer tick. This is a major part of "it worked before".
-            setImmediate(() => {
-              try {
-                const coord = getGlobalTradeEngineCoordinator()
-                coord.refreshEngines().catch(() => {})
-                // The armed strategy processor will now see the fresh symbols +
-                // the Main/Real bootstrap relaxations and produce qualifying Live sets
-                // on its very first tick (or this refresh may trigger one).
-                console.log(`${LOG_PREFIX} Post-quickstart immediate evaluation kick dispatched for ${connectionId}`)
-              } catch { /* non-fatal */ }
-            })
+            // Kick a refresh so the new symbols + bootstrap relaxations are
+            // evaluated on the very first tick rather than waiting for the timer.
+            coord.refreshEngines().catch(() => {})
           } catch (engineError) {
-          console.error(`${LOG_PREFIX} Failed to start engine:`, engineError)
-          await logProgressionEvent(connectionId, "engine_start_error", "error", "Failed to start engine", {
-            error: engineError instanceof Error ? engineError.message : String(engineError),
-          })
-        }
+            console.error(`${LOG_PREFIX} Engine start failed (async):`, engineError)
+            logProgressionEvent(connectionId, "engine_start_error", "error", "Failed to start engine", {
+              error: engineError instanceof Error ? engineError.message : String(engineError),
+            }).catch(() => {})
+          }
+        })()
       }
     
     // Store in global quickstart state
@@ -721,105 +723,130 @@ export async function POST(request: Request) {
     // Get all logs for response
     const allLogs = await getProgressionLogs(connectionId)
     
-    // Calculate comprehensive engine counts from Redis
+    // Collect engine counts from Redis in a single parallel batch.
+    // IMPORTANT: do NOT use client.keys() here — it is O(N) over the whole
+    // keyspace and will stall the event loop (and this HTTP handler) for
+    // seconds when the DB has grown. Use bounded scards/gets only.
     const startStatsTime = Date.now()
-    
-    const engineState = (await getSettings(`trade_engine_state:${connectionId}`)) || {}
 
-    // Basic counts
-    const indicationsCount = toNumber(await client.get(`indications:${connectionId}:count`).catch(() => 0))
-    const strategiesCount = toNumber(await client.get(`strategies:${connectionId}:count`).catch(() => 0))
-    const positionsCount = await client.scard(`positions:${connectionId}`).catch(() => 0)
-    const tradesCount = await client.scard(`trades:${connectionId}`).catch(() => 0)
-    
-    // Detailed indication counts by type
-    const directionIndications = toNumber(await client.get(`indications:${connectionId}:direction:count`).catch(() => 0))
-    const moveIndications = toNumber(await client.get(`indications:${connectionId}:move:count`).catch(() => 0))
-    const activeIndications = toNumber(await client.get(`indications:${connectionId}:active:count`).catch(() => 0))
-    const optimalIndications = toNumber(await client.get(`indications:${connectionId}:optimal:count`).catch(() => 0))
-    const autoIndications = toNumber(await client.get(`indications:${connectionId}:auto:count`).catch(() => 0))
+    const [
+      engineState,
+      indicationsCount,
+      strategiesCount,
+      positionsCount,
+      tradesCount,
+      directionIndications,
+      moveIndications,
+      activeIndications,
+      optimalIndications,
+      autoIndications,
+      stratBase,
+      stratMain,
+      stratReal,
+      stratEvalBase,
+      stratEvalMain,
+      stratEvalReal,
+      basePseudoPositions,
+      mainPseudoPositions,
+      realPseudoPositions,
+      livePositionsCount,
+      prehistoricSymbols,
+      intervalsProcessed,
+      progressionState,
+      basePseudoDir,
+      basePseudoMove,
+      basePseudoActive,
+      basePseudoOptimal,
+    ] = await Promise.all([
+      getSettings(`trade_engine_state:${connectionId}`).catch(() => ({} as Record<string,unknown>)),
+      client.get(`indications:${connectionId}:count`).catch(() => null),
+      client.get(`strategies:${connectionId}:count`).catch(() => null),
+      client.scard(`positions:${connectionId}`).catch(() => 0),
+      client.scard(`trades:${connectionId}`).catch(() => 0),
+      client.get(`indications:${connectionId}:direction:count`).catch(() => null),
+      client.get(`indications:${connectionId}:move:count`).catch(() => null),
+      client.get(`indications:${connectionId}:active:count`).catch(() => null),
+      client.get(`indications:${connectionId}:optimal:count`).catch(() => null),
+      client.get(`indications:${connectionId}:auto:count`).catch(() => null),
+      client.get(`strategies:${connectionId}:base:count`).catch(() => null),
+      client.get(`strategies:${connectionId}:main:count`).catch(() => null),
+      client.get(`strategies:${connectionId}:real:count`).catch(() => null),
+      client.get(`strategies:${connectionId}:base:evaluated`).catch(() => null),
+      client.get(`strategies:${connectionId}:main:evaluated`).catch(() => null),
+      client.get(`strategies:${connectionId}:real:evaluated`).catch(() => null),
+      client.scard(`base_pseudo:${connectionId}`).catch(() => 0),
+      client.scard(`main_pseudo:${connectionId}`).catch(() => 0),
+      client.scard(`real_pseudo:${connectionId}`).catch(() => 0),
+      client.scard(`positions:${connectionId}:live`).catch(() => 0),
+      // Bounded: scard over the dedup SET written by ConfigSetProcessor (one member per symbol).
+      client.scard(`prehistoric:${connectionId}:symbols`).catch(() => 0),
+      client.get(`intervals:${connectionId}:processed_count`).catch(() => null),
+      client.hgetall(`progression:${connectionId}`).catch(() => ({} as Record<string, string>)),
+      client.scard(`base_pseudo:${connectionId}:direction`).catch(() => 0),
+      client.scard(`base_pseudo:${connectionId}:move`).catch(() => 0),
+      client.scard(`base_pseudo:${connectionId}:active`).catch(() => 0),
+      client.scard(`base_pseudo:${connectionId}:optimal`).catch(() => 0),
+    ])
 
+    const safeEngineState = (engineState ?? {}) as Record<string, unknown>
+    const safeProgressionState = (progressionState ?? {}) as Record<string, string>
+    const indCount = toNumber(indicationsCount)
+    const dirInd  = toNumber(directionIndications)
+    const moveInd = toNumber(moveIndications)
+    const actInd  = toNumber(activeIndications)
+    const optInd  = toNumber(optimalIndications)
+    const autoInd = toNumber(autoIndications)
+    const cycleDuration = Number(
+      safeEngineState?.last_cycle_duration ||
+      safeProgressionState?.last_cycle_duration ||
+      safeProgressionState?.cycle_duration ||
+      0,
+    )
+    const totalCycleDuration = Date.now() - startStatsTime
     const strategyCounts = {
-      base: toNumber(await client.get(`strategies:${connectionId}:base:count`).catch(() => 0)),
-      main: toNumber(await client.get(`strategies:${connectionId}:main:count`).catch(() => 0)),
-      real: toNumber(await client.get(`strategies:${connectionId}:real:count`).catch(() => 0)),
+      base: toNumber(stratBase),
+      main: toNumber(stratMain),
+      real: toNumber(stratReal),
     }
     const strategyEvaluated = {
-      base: toNumber(await client.get(`strategies:${connectionId}:base:evaluated`).catch(() => 0)),
-      main: toNumber(await client.get(`strategies:${connectionId}:main:evaluated`).catch(() => 0)),
-      real: toNumber(await client.get(`strategies:${connectionId}:real:evaluated`).catch(() => 0)),
+      base: toNumber(stratEvalBase),
+      main: toNumber(stratEvalMain),
+      real: toNumber(stratEvalReal),
     }
-    
-    // Pseudo positions by type — Real stage counts are active/open validated only (reconciled)
-    const basePseudoPositions = await client.scard(`base_pseudo:${connectionId}`).catch(() => 0)
-    const mainPseudoPositions = await client.scard(`main_pseudo:${connectionId}`).catch(() => 0)
-    const realPseudoPositions = await client.scard(`real_pseudo:${connectionId}`).catch(() => 0)
-    const realPseudoActive = realPseudoPositions
-    
-    // Live positions (real exchange positions)
-    const livePositionsCount = await client.scard(`positions:${connectionId}:live`).catch(() => 0)
-    
-    // Get prehistoric data info
-    const prehistoricSymbols = await client.scard(`prehistoric:${connectionId}:symbols`).catch(() => 0)
-    let prehistoricDataSize = 0
-    try {
-      const keys = await client.keys(`prehistoric:${connectionId}:*`)
-      prehistoricDataSize = keys.length
-    } catch { /* ignore */ }
-    
-    // Get intervals processed
-    const intervalsProcessed = toNumber(await client.get(`intervals:${connectionId}:processed_count`).catch(() => 0))
-    
-    // Get cycle duration from settings
-    const progressionState = await client.hgetall(`progression:${connectionId}`).catch(() => ({} as Record<string, string>)) || {}
-    const cycleDuration = Number(engineState?.last_cycle_duration || progressionState?.last_cycle_duration || progressionState?.cycle_duration || 0)
-    const totalCycleDuration = Date.now() - startStatsTime
-    
+
     // Build comprehensive stats object
     const overallStats = {
-      // Symbols
       symbolsCount: symbols.length,
       symbolsProcessing: symbols,
       prehistoricSymbolsLoaded: prehistoricSymbols,
-      prehistoricDataSize,
-      
-      // Intervals
-      intervalsProcessed,
-      
-      // Indications by type
-       indicationsByType: {
-         direction: directionIndications,
-         move: moveIndications,
-         active: activeIndications,
-         optimal: optimalIndications,
-         auto: autoIndications,
-         total: indicationsCount || directionIndications + moveIndications + activeIndications + optimalIndications + autoIndications,
-       },
-       strategyCounts,
-       strategyEvaluated,
-      
-       // Pseudo positions by type
-       pseudoPositions: {
-         base: basePseudoPositions,
-         baseByIndicationType: {
-           direction: await client.scard(`base_pseudo:${connectionId}:direction`).catch(() => 0),
-           move: await client.scard(`base_pseudo:${connectionId}:move`).catch(() => 0),
-           active: await client.scard(`base_pseudo:${connectionId}:active`).catch(() => 0),
-           optimal: await client.scard(`base_pseudo:${connectionId}:optimal`).catch(() => 0),
-         },
-         main: mainPseudoPositions,
-         real: realPseudoPositions,
-         realActive: realPseudoActive,
-         realActiveOpenValidated: realPseudoActive,
-         // Cascade pipeline — NOT a sum. `total` and real* reflect only active/open validated Real-stage positions
-         // (closed/invalidated/mirrored ones are removed via reconciliation + closeOrInvalidateRealPseudo).
-         total: realPseudoPositions,
-       },
-      
-      // Live positions
+      // prehistoricDataSize replaced with bounded scard above (no O(N) keys scan).
+      prehistoricDataSize: prehistoricSymbols,
+      intervalsProcessed: toNumber(intervalsProcessed),
+      indicationsByType: {
+        direction: dirInd,
+        move: moveInd,
+        active: actInd,
+        optimal: optInd,
+        auto: autoInd,
+        total: indCount || dirInd + moveInd + actInd + optInd + autoInd,
+      },
+      strategyCounts,
+      strategyEvaluated,
+      pseudoPositions: {
+        base: basePseudoPositions,
+        baseByIndicationType: {
+          direction: basePseudoDir,
+          move: basePseudoMove,
+          active: basePseudoActive,
+          optimal: basePseudoOptimal,
+        },
+        main: mainPseudoPositions,
+        real: realPseudoPositions,
+        realActive: realPseudoPositions,
+        realActiveOpenValidated: realPseudoPositions,
+        total: realPseudoPositions,
+      },
       livePositions: livePositionsCount,
-      
-      // Timing
       cycleDurationMs: cycleDuration,
       statsCollectionDurationMs: totalCycleDuration,
       totalDuration,
@@ -827,8 +854,8 @@ export async function POST(request: Request) {
     
     console.log(`${LOG_PREFIX}: === COMPREHENSIVE STATS ===`)
     console.log(`${LOG_PREFIX}: Symbols: ${symbols.length}, Prehistoric: ${prehistoricSymbols}`)
-    console.log(`${LOG_PREFIX}: Indications - Direction: ${directionIndications}, Move: ${moveIndications}, Active: ${activeIndications}, Optimal: ${optimalIndications}`)
-    console.log(`${LOG_PREFIX}: Pseudo Positions - Base: ${basePseudoPositions}, Main: ${mainPseudoPositions}, Real(active/open validated Stage Real): ${realPseudoPositions}`)
+    console.log(`${LOG_PREFIX}: Indications - Direction: ${dirInd}, Move: ${moveInd}, Active: ${actInd}, Optimal: ${optInd}`)
+    console.log(`${LOG_PREFIX}: Pseudo Positions - Base: ${basePseudoPositions}, Main: ${mainPseudoPositions}, Real: ${realPseudoPositions}`)
     console.log(`${LOG_PREFIX}: Live Positions: ${livePositionsCount}, Cycle Duration: ${cycleDuration}ms`)
     
     return NextResponse.json({
@@ -844,8 +871,8 @@ export async function POST(request: Request) {
         testBalance,
       },
       engineCounts: {
-        indications: indicationsCount,
-        strategies: strategiesCount,
+        indications: indCount,
+        strategies: toNumber(strategiesCount),
         positions: positionsCount,
         trades: tradesCount,
       },
