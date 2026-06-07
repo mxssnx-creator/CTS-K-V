@@ -686,7 +686,7 @@ export class StrategyCoordinator {
     },
     real: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default ��� operator-tunable
+      minProfitFactor: 1.0,   // spec default ����� operator-tunable
       confidence: 0.65,       // advisory only
       description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
@@ -776,6 +776,41 @@ export class StrategyCoordinator {
       this.METRICS.main.maxDrawdownTime = mainDdtMin
       this.METRICS.real.maxDrawdownTime = realDdtMin
       this.METRICS.live.maxDrawdownTime = liveDdtMin
+
+      // ── Per-stage eval position-count thresholds (CRITICAL wiring fix) ──
+      // `mainEvalPosCount` / `realEvalPosCount` are the minimum entryCount a
+      // Set must contain before Main/Real validation considers it. The
+      // settings dialog saves these AND the PATCH route mirrors them into the
+      // `connection_settings:{id}` hash, but until now NOTHING read them back —
+      // the coordinator used its constructor defaults (15 / 10) forever, so
+      // operator changes silently never took effect. Resolution order per the
+      // approved plan: per-connection `connection_settings:{id}` hash → global
+      // `app_settings` → built-in default. Clamp [1, 200]. Read on the same
+      // PF-threshold TTL cadence so a save is picked up within one refresh
+      // window without per-cycle HGETALL overhead.
+      const evalCount = (raw: unknown, fallback: number): number | null => {
+        const n = Number(raw)
+        if (!Number.isFinite(n) || n < 1) return null
+        return Math.min(200, Math.max(1, Math.floor(n)))
+      }
+      try {
+        const client = getRedisClient()
+        const cs = ((await client.hgetall(`connection_settings:${this.connectionId}`)) ||
+          {}) as Record<string, string>
+        // connection hash wins, then global app_settings, then default.
+        const mainEval =
+          evalCount(cs?.mainEvalPosCount, 0) ??
+          evalCount((s as any).mainEvalPosCount, 0) ??
+          15
+        const realEval =
+          evalCount(cs?.realEvalPosCount, 0) ??
+          evalCount((s as any).realEvalPosCount, 0) ??
+          10
+        this._coordinationSettings.mainEvalPosCount = mainEval
+        this._coordinationSettings.realEvalPosCount = realEval
+      } catch {
+        /* keep last-known / default eval counts on read miss */
+      }
     } catch (err) {
       // Don't fail the whole flow on a settings read miss — the
       // already-loaded values (either the defaults or the last
@@ -3423,7 +3458,7 @@ export class StrategyCoordinator {
 
                 // Multi-step trailing — Set carries its own profile from
                 // BASE, so trailing-on/off and the three ratios are
-                // operator-determined per the matrix in Settings →
+                // operator-determined per the matrix in Settings ���
                 // Strategy → Trailing. Sets WITHOUT a profile keep the
                 // legacy single-step behaviour with statistical on/off
                 // (`bestEntry.confidence >= 0.85`).

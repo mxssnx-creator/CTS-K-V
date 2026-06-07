@@ -237,6 +237,20 @@ export class ConfigSetProcessor {
         if (candles.length === 0) {
           console.log(`[v0] [ConfigSetProcessor] ⚠ no candles for ${symbol} — skipping`)
           symbolsWithoutData++
+          // CRITICAL ("0/N stuck" fix): a symbol with no prehistoric candles
+          // must STILL count toward the processed total, otherwise
+          // `symbols_processed` can never reach `symbols_total` and the
+          // dashboard sticks at "X/N" forever. Add it to the canonical SET
+          // (single atomic source of truth) and mirror the distinct count
+          // into the hash. SADD is idempotent so a replay can't double-count.
+          try {
+            await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
+            await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400)
+            const distinctSkipProcessed = await client.scard(`prehistoric:${this.connectionId}:symbols`)
+            await client.hset(`prehistoric:${this.connectionId}`, {
+              symbols_processed: String(distinctSkipProcessed),
+            })
+          } catch { /* non-critical */ }
           await logProgressionEvent(this.connectionId, "config_set_symbol_skipped", "warning", `No prehistoric candles for ${symbol}`, {
             symbol,
             stage: "prehistoric",
@@ -341,16 +355,27 @@ export class ConfigSetProcessor {
         // writes to separate `prehistoric_indications_total` and
         // `prehistoric_strategies_total` keys. This prevents the "jumped counters"
         // effect when transitioning from setup to live trading.
+        //
+        // CRITICAL ("0/N stuck" fix): `symbols_processed` is derived from the
+        // cardinality of the `prehistoric:{id}:symbols` SET, NOT the shared
+        // mutable `symbolsProcessed` local. With SYMBOL_CONCURRENCY parallel
+        // workers, writing `String(symbolsProcessed)` raced — an out-of-order
+        // async write could stamp a STALE (lower) value over a newer one,
+        // freezing the dashboard at "X/N". SADD + SCARD is order-independent
+        // and idempotent, so the distinct count is always monotonic and exact.
+        await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
+        const distinctProcessed = await client
+          .scard(`prehistoric:${this.connectionId}:symbols`)
+          .catch(() => symbolsProcessed)
         await Promise.all([
           progressWrite,
           client.hincrby(progressKey, "prehistoric_indications_total", indicationResults),
           client.hincrby(progressKey, "prehistoric_strategies_total", strategyPositions),
           client.expire(progressKey, 7 * 24 * 60 * 60),
-          client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol),
           client.expire(`prehistoric:${this.connectionId}:symbols`, 86400),
           client.hset(`prehistoric:${this.connectionId}`, {
             candles_loaded: String(candlesProcessed),
-            symbols_processed: String(symbolsProcessed),
+            symbols_processed: String(distinctProcessed),
             intervals_processed: String(totalIntervalsProcessed),
             missing_intervals: String(missingIntervalsLoaded),
           }),
