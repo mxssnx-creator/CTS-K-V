@@ -151,8 +151,6 @@ export function ExchangeConnectionSettingsDialog({
 
   const handleSave = async () => {
     try {
-      console.log("[v0] Saving connection settings for:", connectionId, settings)
-
       const response = await fetch(`/api/settings/connections/${connectionId}/settings`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },

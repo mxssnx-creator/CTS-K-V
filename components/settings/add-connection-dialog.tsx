@@ -76,12 +76,14 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
   }, [open])
 
   useEffect(() => {
-    // Update API type based on exchange
-    const exchange = formData.exchange
-    const apiTypes = EXCHANGE_API_TYPES[exchange] || []
+    // Update API type based on exchange. Use the functional updater to avoid
+    // capturing stale `formData` — the dependency array only lists `exchange`
+    // but the callback reads and spreads the whole form object.
+    const apiTypes = EXCHANGE_API_TYPES[formData.exchange] || []
     if (apiTypes.length > 0 && !apiTypes.includes(formData.api_type)) {
-      setFormData({ ...formData, api_type: apiTypes[0] })
+      setFormData(prev => ({ ...prev, api_type: apiTypes[0] }))
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [formData.exchange])
 
   useEffect(() => {
@@ -290,8 +292,8 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
           formattedLogs.push(`✓ BTC Price: $${btcPrice}`)
 
         }
-      } catch (e) {
-        console.log("[v0] Could not fetch BTC price")
+      } catch {
+        // BTC price is decorative context — a fetch failure is non-fatal
       }
 
       if (response.ok) {
@@ -360,8 +362,6 @@ export function AddConnectionDialog({ open, onOpenChange, onConnectionAdded, onS
 
       const result = await response.json()
       const connectionId = result.id || result.connectionId
-      
-      console.log("[v0] [AddConnectionDialog] Connection created with ID:", connectionId)
       
       toast.success("Connection added successfully")
       

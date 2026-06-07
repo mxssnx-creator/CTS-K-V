@@ -9,9 +9,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Switch } from "@/components/ui/switch"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { AlertCircle } from "lucide-react"
+import { AlertCircle, Loader2, Lock, Eye, EyeOff, Zap, Check } from "lucide-react"
 import { toast } from "@/lib/simple-toast"
-import { Loader2, Lock, Eye, EyeOff, Zap, Check } from "lucide-react"
 import { 
   EXCHANGE_API_TYPES,
   EXCHANGE_CONNECTION_METHODS,

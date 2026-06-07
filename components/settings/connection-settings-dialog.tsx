@@ -144,6 +144,10 @@ export function ConnectionSettingsDialog({
   exchange = "bingx",
 }: ConnectionSettingsDialogProps) {
   const [tab, setTab] = useState<"overview" | "symbols" | "indications" | "strategies">("overview")
+
+  // Reset tab to Overview every time the dialog opens so state from a
+  // previous session does not persist between open/close cycles.
+  useEffect(() => { if (open) setTab("overview") }, [open])
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [exchangeKey, setExchangeKey] = useState<string>(exchange)
@@ -178,7 +182,7 @@ export function ConnectionSettingsDialog({
   const [stratPreset, setStratPreset] = useState<StrategyChannel>(DEFAULT_STRATEGY_PROFILE)
   const [coordination, setCoordination] = useState<CoordinationSettings>(DEFAULT_COORDINATION_SETTINGS)
 
-  // ─────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────���───────────────────
   // LOAD
   // ──────────────────────────────────────�����──────────────────────────
 
@@ -199,7 +203,9 @@ export function ConnectionSettingsDialog({
         const conn     = data.connection || {}
         setExchangeKey(String(conn.exchange || exchange).toLowerCase())
         setOverview({
-          volumeFactorBase:   Number(settings.volume_factor)        ?? Number(conn.volume_factor) ?? 1.0,
+          // Use `||` not `??` — Number(null/undefined) is 0 (falsy), not NaN,
+          // so `?? 1.0` would never fire on a missing field.
+          volumeFactorBase:   Number(settings.volume_factor)        || Number(conn.volume_factor) || 1.0,
           volumeFactorLive:   Number(settings.volume_factor_live)   || 1.0,
           volumeFactorPreset: Number(settings.volume_factor_preset) || 1.0,
           marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
@@ -409,23 +415,20 @@ export function ConnectionSettingsDialog({
           main:   stratMain,
           preset: stratPreset,
         },
-        // Strategy coordination (axes + variants toggles)
-          coordination_settings: coordination,
-          coordinationSettings:  coordination, // legacy alias
-          // Flat top-level mirror so the engine + `getStrategyTracking`
-          // can read it as a plain `connection_settings` HASH field
-          // without parsing the nested coordination JSON every cycle.
-          prevPosMinCount: coordination.prevPosMinCount,
-          // Flat top-level mirror for the new stage-validation knobs so
-          // the engine picks them up via `connection_settings:{conn}`
-          // without parsing the nested coordination JSON every cycle.
-          mainEvalPosCount: coordination.mainEvalPosCount,
-          realEvalPosCount: coordination.realEvalPosCount,
-          // Flat mirror for the windowed-eval knob: prevPosWindow is the
-          // single cumulative last-N window feeding BOTH the windowed PF and
-          // the windowed DDT. The coordinator reads it straight off the
-          // `connection_settings:{conn}` hash each refresh window.
-          prevPosWindow:    coordination.prevPosWindow,
+        // Strategy coordination (axes + variants toggles).
+        // These MUST be top-level keys in the payload — NOT nested inside
+        // `strategies`. Previously they were mis-indented one level too deep,
+        // which caused them to be persisted as `strategies.coordination_settings`
+        // and never reached the engine's connection_settings hash reader.
+        coordination_settings: coordination,
+        coordinationSettings:  coordination, // legacy alias
+        // Flat top-level mirrors so the engine + `getStrategyTracking`
+        // can read them as plain `connection_settings` HASH fields
+        // without parsing the nested coordination JSON every cycle.
+        prevPosMinCount:  coordination.prevPosMinCount,
+        mainEvalPosCount: coordination.mainEvalPosCount,
+        realEvalPosCount: coordination.realEvalPosCount,
+        prevPosWindow:    coordination.prevPosWindow,
       }
 
       const [settingsRes, indRes] = await Promise.all([
