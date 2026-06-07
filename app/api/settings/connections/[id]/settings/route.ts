@@ -5,6 +5,7 @@ import { RedisTrades, RedisPositions } from "@/lib/redis-operations"
 import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
 import { getTradeEngine } from "@/lib/trade-engine"
 import { fetchTopSymbols } from "@/lib/top-symbols"
+import { ProgressionStateManager } from "@/lib/progression-state-manager"
 
 export async function GET(
   request: NextRequest,
@@ -310,6 +311,43 @@ export async function PATCH(
         }
       } catch (symErr) {
         console.error("[v0] [Settings] symbol auto-resolve failed:", symErr)
+      }
+    }
+
+    // ── Progression clean-up on significant settings changes ─────────────────
+    // When the operator changes symbols, live-trade mode, testnet flag, or other
+    // fields that alter what the progression computes, we must clean the previous
+    // progress BEFORE the engine hot-reloads — otherwise the dashboard shows a
+    // blended timeline spanning two different configurations (old symbols + old PF
+    // output mixed with new-config output). `recoordinateForActualOne` compares the
+    // stored snapshot against the current live state and archives + resets the
+    // progression hash when a mismatch is detected, producing a fresh, solid
+    // progression aligned to the new configuration.
+    //
+    // Fields that trigger this: anything that changes what symbols the engine runs,
+    // or that changes the code-path (live/testnet/preset mode, connection method,
+    // margin type, position mode). Pure cosmetic changes (name, UI labels) skip it.
+    const significantKeys = [
+      "symbols", "symbol_order", "symbol_count", "active_symbols",
+      "is_live_trade", "is_testnet", "is_preset_trade",
+      "connection_method", "margin_mode", "margin_type", "position_mode",
+    ]
+    const touchedSignificant = significantKeys.some((k) =>
+      Object.prototype.hasOwnProperty.call(settings, k)
+    )
+    if (touchedSignificant) {
+      try {
+        // Allow the symbol resolver above to finish writing to Redis BEFORE
+        // we compare snapshots — use setImmediate to yield to any in-flight
+        // microtask queue flush, then call recoordinate synchronously.
+        await ProgressionStateManager.recoordinateForActualOne(id)
+      } catch (recoordErr) {
+        // Non-fatal: the engine will still hot-reload with the new settings;
+        // we just won't have wiped the old progression hash.
+        console.warn(
+          `[v0] [Settings PATCH] recoordinateForActualOne failed for ${id} (non-fatal):`,
+          recoordErr instanceof Error ? recoordErr.message : String(recoordErr),
+        )
       }
     }
 
