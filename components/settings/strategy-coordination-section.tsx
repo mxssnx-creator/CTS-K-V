@@ -121,7 +121,7 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
   variants: {
     trailing: true,
     block:    true,
-    dca:      true,
+    dca:      false, // off by default per operator spec
     pause:    true,
   },
   blockVolumeRatio: 1.0,

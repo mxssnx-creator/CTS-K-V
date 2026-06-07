@@ -127,9 +127,9 @@ const DEFAULT_INDICATION_PROFILE: ChannelProfile = {
   auto:      { enabled: false, range: 25, timeout: 90, interval: 15 },
 }
 const DEFAULT_STRATEGY_PROFILE: StrategyChannel = {
-  base: { enabled: true, min_profit_factor: 1.10, max_drawdown_time: 180, max_positions: 250 },
-  main: { enabled: true, min_profit_factor: 1.15, max_drawdown_time: 180, max_positions: 250 },
-  real: { enabled: true, min_profit_factor: 1.20, max_drawdown_time: 180, max_positions: 100 },
+  base: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 250 },
+  main: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 250 },
+  real: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 100 },
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -321,7 +321,7 @@ export function ConnectionSettingsDialog({
 
   // ─────────────────────���───────────────────────────────────────────
   // EXCHANGE SYMBOLS REFRESH
-  // ─────────────────────────────────────────────────────────────────
+  // ────────────────────────────────────────────��────────────────────
 
   const refreshExchangeSymbols = useCallback(async () => {
     setLoadingSymbols(true)
@@ -776,11 +776,19 @@ export function ConnectionSettingsDialog({
                       <TabsTrigger value="preset" className="text-xs px-4">Preset</TabsTrigger>
                       <TabsTrigger value="coordination" className="text-xs px-4">Coordination</TabsTrigger>
                     </TabsList>
-                    <TabsContent value="main">
+                    <TabsContent value="main" className="space-y-4">
                       <StrategyProfileEditor profile={stratMain} onChange={setStratMain} />
+                      <StrategyOptionsPanel
+                        variants={coordination.variants}
+                        onChange={(v) => setCoordination((p) => ({ ...p, variants: { ...p.variants, ...v } }))}
+                      />
                     </TabsContent>
-                    <TabsContent value="preset">
+                    <TabsContent value="preset" className="space-y-4">
                       <StrategyProfileEditor profile={stratPreset} onChange={setStratPreset} />
+                      <StrategyOptionsPanel
+                        variants={coordination.variants}
+                        onChange={(v) => setCoordination((p) => ({ ...p, variants: { ...p.variants, ...v } }))}
+                      />
                     </TabsContent>
                     <TabsContent value="coordination">
                       <StrategyCoordinationSection value={coordination} onChange={setCoordination} />
@@ -899,6 +907,28 @@ function IndicationProfileEditor({
   )
 }
 
+// ── Stage accent colours ─────────────────────────────────────────────
+const STAGE_ACCENT: Record<StrategyType, { border: string; bg: string; dot: string; label: string }> = {
+  base: {
+    border: "border-orange-300/40",
+    bg:     "bg-orange-50/30 dark:bg-orange-950/10",
+    dot:    "bg-orange-400",
+    label:  "Base",
+  },
+  main: {
+    border: "border-yellow-300/40",
+    bg:     "bg-yellow-50/30 dark:bg-yellow-950/10",
+    dot:    "bg-yellow-400",
+    label:  "Main",
+  },
+  real: {
+    border: "border-emerald-300/40",
+    bg:     "bg-emerald-50/30 dark:bg-emerald-950/10",
+    dot:    "bg-emerald-400",
+    label:  "Real",
+  },
+}
+
 function StrategyProfileEditor({
   profile, onChange,
 }: { profile: StrategyChannel; onChange: (p: StrategyChannel) => void }) {
@@ -906,45 +936,179 @@ function StrategyProfileEditor({
     onChange({ ...profile, [type]: { ...profile[type], ...patch } })
   }
   return (
-    <div className="space-y-3">
+    <div className="space-y-2.5">
       {STRATEGY_TYPES.map((type) => {
         const p = profile[type]
-        const accent =
-          type === "base" ? "border-orange-300/50 bg-orange-50/30 dark:bg-orange-950/10" :
-          type === "main" ? "border-yellow-300/50 bg-yellow-50/30 dark:bg-yellow-950/10" :
-          "border-green-300/50 bg-green-50/30 dark:bg-green-950/10"
+        const ac = STAGE_ACCENT[type]
         return (
-          <div key={type} className={`rounded-md border p-3 transition-opacity ${accent} ${p.enabled ? "" : "opacity-60"}`}>
-            <div className="flex items-center justify-between mb-3">
+          <div
+            key={type}
+            className={`rounded-lg border ${ac.border} ${ac.bg} p-3.5 transition-opacity ${p.enabled ? "" : "opacity-50"}`}
+          >
+            {/* Header row */}
+            <div className="flex items-center justify-between mb-3.5">
+              <div className="flex items-center gap-2.5">
+                <span className={`h-2 w-2 rounded-full ${ac.dot} shrink-0`} />
+                <span className="text-sm font-semibold tracking-tight">{ac.label} Stage</span>
+              </div>
               <div className="flex items-center gap-2">
+                <span className={`text-[10px] font-medium ${p.enabled ? "text-foreground" : "text-muted-foreground"}`}>
+                  {p.enabled ? "Active" : "Disabled"}
+                </span>
                 <Switch
                   checked={p.enabled}
                   onCheckedChange={(v) => update(type, { enabled: v })}
                 />
-                <Label className="text-sm font-medium capitalize">{type} Strategy</Label>
               </div>
-              <Badge variant={p.enabled ? "default" : "outline"} className="text-[9px]">
-                {p.enabled ? "Enabled" : "Disabled"}
-              </Badge>
             </div>
 
-            <div className="grid grid-cols-3 gap-3">
-              <NumberField
-                label="Min PF" suffix="×" min={1} max={3} step={0.05}
-                value={p.min_profit_factor} onChange={(v) => update(type, { min_profit_factor: v })} disabled={!p.enabled}
+            {/* Min PF slider */}
+            <div className="space-y-2 mb-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <Label className="text-xs font-medium">Min Profit Factor</Label>
+                  <div className="text-[10px] text-muted-foreground">Minimum PF required to pass this stage</div>
+                </div>
+                <span className="font-mono text-sm tabular-nums font-semibold min-w-[3rem] text-right">
+                  {p.min_profit_factor.toFixed(1)}
+                </span>
+              </div>
+              <Slider
+                min={0.1} max={3} step={0.1}
+                value={[p.min_profit_factor]}
+                onValueChange={([v]) => update(type, { min_profit_factor: Number(v.toFixed(1)) })}
+                disabled={!p.enabled}
+                className="py-1"
               />
-              <NumberField
-                label="Max DDT" suffix="m" min={1} max={1440} step={1}
-                value={p.max_drawdown_time} onChange={(v) => update(type, { max_drawdown_time: v })} disabled={!p.enabled}
+              <div className="flex justify-between text-[10px] text-muted-foreground">
+                <span>0.1</span>
+                <span className="text-muted-foreground/60">default 0.9</span>
+                <span>3.0</span>
+              </div>
+            </div>
+
+            {/* Max DDT slider */}
+            <div className="space-y-2 mb-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <Label className="text-xs font-medium">Max Drawdown Time</Label>
+                  <div className="text-[10px] text-muted-foreground">Maximum allowed drawdown duration</div>
+                </div>
+                <span className="font-mono text-sm tabular-nums font-semibold min-w-[4rem] text-right">
+                  {p.max_drawdown_time} min
+                </span>
+              </div>
+              <Slider
+                min={20} max={800} step={2}
+                value={[p.max_drawdown_time]}
+                onValueChange={([v]) => update(type, { max_drawdown_time: v })}
+                disabled={!p.enabled}
+                className="py-1"
               />
+              <div className="flex justify-between text-[10px] text-muted-foreground">
+                <span>20 min</span>
+                <span className="text-muted-foreground/60">default 160</span>
+                <span>800 min</span>
+              </div>
+            </div>
+
+            {/* Max Positions — keep as compact number field */}
+            <div className="pt-1 border-t border-border/40">
               <NumberField
-                label="Max Pos" suffix="" min={1} max={1000} step={1}
-                value={p.max_positions} onChange={(v) => update(type, { max_positions: v })} disabled={!p.enabled}
+                label="Max Positions"
+                suffix=""
+                min={1} max={1000} step={1}
+                value={p.max_positions}
+                onChange={(v) => update(type, { max_positions: v })}
+                disabled={!p.enabled}
               />
             </div>
           </div>
         )
       })}
+    </div>
+  )
+}
+
+// ── Strategy Options Panel ────────────────────────────────────────────
+// Surfaces the Trailing / Block / DCA variant toggles directly in the
+// Strategies tab so operators can enable / disable them without opening
+// the deeper Coordination sub-tab.
+const VARIANT_META: {
+  key:   keyof CoordinationSettings["variants"]
+  label: string
+  desc:  string
+  defaultOn: boolean
+}[] = [
+  {
+    key: "trailing",
+    label: "Trailing",
+    desc:  "Fires when last-N results show consecutive wins. Aggressively follows momentum.",
+    defaultOn: true,
+  },
+  {
+    key: "block",
+    label: "Block",
+    desc:  "Add-on entries when continuousCount is in the 1–2 range. Independent of axes.",
+    defaultOn: true,
+  },
+  {
+    key: "dca",
+    label: "DCA",
+    desc:  "Dollar-cost averaging on prior losses. Gate: prevLosses ≥ 1. Off by default.",
+    defaultOn: false,
+  },
+]
+
+function StrategyOptionsPanel({
+  variants,
+  onChange,
+}: {
+  variants: CoordinationSettings["variants"]
+  onChange: (patch: Partial<CoordinationSettings["variants"]>) => void
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-card/60 p-3.5 space-y-3">
+      <div className="flex items-center gap-2">
+        <div className="flex h-5 w-5 items-center justify-center rounded bg-primary/10">
+          <Zap className="h-3 w-3 text-primary" />
+        </div>
+        <span className="text-sm font-semibold">Strategy Options</span>
+        <span className="text-[10px] text-muted-foreground ml-1">Categorical variants applied on top of axis sets</span>
+      </div>
+
+      <div className="grid gap-2">
+        {VARIANT_META.map(({ key, label, desc, defaultOn }) => {
+          const enabled = variants[key]
+          return (
+            <div
+              key={key}
+              className={`flex items-start justify-between gap-3 rounded-md border px-3 py-2.5 transition-colors ${
+                enabled
+                  ? "border-primary/30 bg-primary/5"
+                  : "border-border bg-muted/20"
+              }`}
+            >
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-medium">{label}</span>
+                  {!defaultOn && (
+                    <span className="text-[9px] uppercase tracking-wide rounded-sm px-1 py-0.5 bg-muted text-muted-foreground font-medium">
+                      off by default
+                    </span>
+                  )}
+                </div>
+                <div className="text-[10px] text-muted-foreground leading-relaxed mt-0.5">{desc}</div>
+              </div>
+              <Switch
+                checked={enabled}
+                onCheckedChange={(v) => onChange({ [key]: v })}
+                className="mt-0.5 shrink-0"
+              />
+            </div>
+          )
+        })}
+      </div>
     </div>
   )
 }
