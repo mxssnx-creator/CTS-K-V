@@ -2076,11 +2076,24 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
       return { success: true, message: `Already at latest version ${finalVersion}`, version: finalVersion }
     }
 
+    // Per-migration deadline: 30 s is very generous for any individual
+    // migration. If a migration hangs (e.g. due to a circular initRedis
+    // call or an infinite Redis await), we fail-fast with a clear error
+    // rather than blocking the entire event loop until the process dies.
+    const MIGRATION_DEADLINE_MS = 30_000
     console.log(`[v0] [Migrations] Running ${pendingMigrations.length} pending migrations...`)
     for (const migration of pendingMigrations) {
       try {
         console.log(`[v0] [Migrations] Running: ${migration.name} (v${migration.version})`)
-        await migration.up(client)
+        await Promise.race([
+          migration.up(client),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`Migration ${migration.name} exceeded ${MIGRATION_DEADLINE_MS}ms deadline`)),
+              MIGRATION_DEADLINE_MS,
+            ),
+          ),
+        ])
         console.log(`[v0] [Migrations] ✓ Completed: ${migration.name}`)
       } catch (error) {
         console.error(`[v0] [Migrations] ✗ Failed during ${migration.name}:`, error)

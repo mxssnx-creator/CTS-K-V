@@ -1230,9 +1230,33 @@ export async function initRedis(): Promise<void> {
     if (!migrationsRan) {
       // runMigrations() calls ensureCoreRedis() internally (NOT initRedis), so
       // there is no re-entrancy with the promise we are currently inside.
-      const { runMigrations } = await import("@/lib/redis-migrations")
-      await runMigrations()
-      migrationsRan = true
+      //
+      // SAFETY: Wrap with a 35-second deadline. If a migration deadlocks
+      // (e.g. by calling initRedis() internally, which awaits THIS very
+      // promise), the race rejects after 35 s so the server becomes
+      // responsive. The underlying migration may still resolve later, but
+      // the server is unblocked. The migration runner also has its own
+      // per-migration 30-second deadline for individual migrations.
+      const { runMigrations, resetMigrationRunState } = await import("@/lib/redis-migrations")
+      const MIGRATIONS_DEADLINE_MS = 35_000
+      try {
+        await Promise.race([
+          runMigrations(),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`runMigrations() exceeded ${MIGRATIONS_DEADLINE_MS}ms global deadline — aborting to keep server responsive`)),
+              MIGRATIONS_DEADLINE_MS,
+            ),
+          ),
+        ])
+        migrationsRan = true
+      } catch (migErr) {
+        console.error("[v0] [Redis] runMigrations deadline/error:", migErr instanceof Error ? migErr.message : migErr)
+        // Reset so the next cold-boot can attempt migrations again
+        resetMigrationRunState()
+        migrationsRan = false
+        // Do NOT rethrow — let the server start anyway with schema as-is
+      }
     }
 
     connectionsInitialized = true

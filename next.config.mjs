@@ -1,3 +1,4 @@
+// Migration 025 deadlock fix applied — forces full server restart
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: false,
