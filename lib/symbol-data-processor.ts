@@ -5,6 +5,7 @@
 
 import { getRedisClient, getSettings, setSettings } from "@/lib/redis-db"
 import { EngineProgressManager, getProgressManager } from "./engine-progress-manager"
+import { getPrehistoricProgressTracker } from "@/lib/prehistoric-progress-tracker"
 
 export interface SymbolDataResult {
   symbol: string
@@ -45,6 +46,10 @@ export class SymbolDataProcessor {
     await this.progressManager.addSymbol(symbol)
     await this.progressManager.addInfoLog(`Starting prehistoric data load for ${symbol}`)
 
+    // Update progress tracker
+    const tracker = getPrehistoricProgressTracker(this.connectionId)
+    await tracker.startSymbol(symbol)
+
     try {
       // Fetch OHLCV data from exchange
       const result = await this.fetchOHLCVData(symbol, exchange)
@@ -61,11 +66,16 @@ export class SymbolDataProcessor {
       )
 
       if (success) {
+        // Update progress tracker with completion
+        await tracker.completeSymbol(symbol, result.candles)
+        
         await this.progressManager.addInfoLog(
           `✓ ${symbol}: ${result.candles} candles loaded in ${duration}ms`,
           { symbol, candles: result.candles, duration }
         )
       } else {
+        // Record error in tracker
+        await tracker.errorSymbol(symbol, result.errorMessage || 'Unknown error')
         await this.progressManager.addError('prehistoric_load', result.errorMessage || 'Unknown error', symbol)
       }
 
@@ -74,6 +84,9 @@ export class SymbolDataProcessor {
     } catch (error) {
       const duration = Date.now() - startTime
       const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+      
+      // Record error in tracker
+      await tracker.errorSymbol(symbol, errorMessage)
       
       await this.progressManager.updateSymbolPrehistoric(symbol, 0, 1, duration, false)
       await this.progressManager.addError('prehistoric_load', errorMessage, symbol)
@@ -97,6 +110,10 @@ export class SymbolDataProcessor {
     await this.progressManager.setPrehistoricTotal(symbols.length)
     await this.progressManager.setPrehistoricInProgress(true)
 
+    // Initialize progress tracker for stable reporting
+    const tracker = getPrehistoricProgressTracker(this.connectionId)
+    await tracker.initialize(symbols)
+
     const promises = symbols.map(symbol => this.loadPrehistoricData(symbol, exchange))
     const results = await Promise.all(promises)
 
@@ -105,6 +122,10 @@ export class SymbolDataProcessor {
     const successCount = results.filter(r => r.success).length
 
     await this.progressManager.setPrehistoricCompleted(successCount === symbols.length)
+    
+    // Mark prehistoric complete in tracker
+    await tracker.markComplete("live")
+    
     await this.progressManager.addInfoLog(
       `Prehistoric load complete: ${successCount}/${symbols.length} symbols, ${totalCandles} candles, ${totalErrors} errors`
     )
