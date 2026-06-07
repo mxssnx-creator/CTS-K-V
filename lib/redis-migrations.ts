@@ -1381,6 +1381,97 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "24")
     },
   },
+  {
+    name: "026-per-connection-pf-ddt-leverage-defaults",
+    version: 26,
+    up: async (client: any) => {
+      await client.set("_schema_version", "26")
+
+      // Backfill the per-connection strategy-tuning fields the engine now
+      // resolves connection-first (connection_settings hash → global
+      // app_settings → built-in default). These were wired this session:
+      //   • loadAppPFThresholds() overlays this hash on global app_settings
+      //     for PF thresholds, per-stage DDT (hours), and stage min-pos counts
+      //   • VolumeCalculator overlays this hash for per-connection leverage
+      //   • the settings PATCH route now flattens the dialog's nested
+      //     `strategies.main.{base,main,real}` values + leverage into here
+      //
+      // Before this migration only the v23 eval-knobs lived in the hash, so a
+      // never-edited connection had EMPTY pf/ddt/leverage fields and silently
+      // inherited global/defaults. Seeding spec defaults makes the resolved
+      // value explicit + identical across dev/prod from first boot, and keeps
+      // the dialog's hydrate path showing real numbers instead of blanks.
+      //
+      // Idempotent: read the hash first, write only ABSENT fields (the
+      // emulator has no hsetnx, so set-if-absent = hgetall + conditional
+      // hset). An operator who already tuned a value via the wired PATCH path
+      // is never clobbered, and re-running is a no-op.
+      const SPEC_DEFAULTS_026: Record<string, string> = {
+        // PF thresholds (× multipliers) — match METRICS spec defaults.
+        baseProfitFactor: "0.9",
+        mainProfitFactor: "1.0",
+        realProfitFactor: "1.0",
+        liveProfitFactor: "1.0",
+        // Per-stage DDT ceilings in HOURS (coordinator ×60 → minutes; 4h spec).
+        maxDrawdownTimeMainHours: "4",
+        maxDrawdownTimeRealHours: "4",
+        maxDrawdownTimeLiveHours: "4",
+        // Stage min position counts (entryCount floor before validation).
+        stageMinPosCountBase: "1",
+        stageMinPosCountMain: "1",
+        stageMinPosCountReal: "1",
+        // Per-connection leverage sizing (VolumeCalculator overlay).
+        leveragePercentage: "100",
+        useMaximalLeverage: "false",
+      }
+
+      // Canonical id source = keys("connection:*") (same as 020-025), with
+      // the SET sources unioned in so disabled/template connections still get
+      // seeded. DEADLOCK-SAFE: raw client only, never getAllConnections().
+      const idSet026 = new Set<string>()
+      try {
+        const connKeys026 = (await client.keys("connection:*")) || []
+        for (const k of connKeys026) {
+          if (typeof k !== "string") continue
+          if (k.startsWith("connection_settings:")) continue
+          const id = k.slice("connection:".length)
+          if (id) idSet026.add(id)
+        }
+      } catch { /* keys() unavailable — fall through to set sources */ }
+      for (const setName026 of ["connections", "connections:main:enabled"]) {
+        try {
+          const ids = (await client.smembers(setName026)) || []
+          for (const id of ids) if (typeof id === "string" && id) idSet026.add(id)
+        } catch { /* missing set */ }
+      }
+
+      let seeded026 = 0
+      for (const connId026 of idSet026) {
+        const key = `connection_settings:${connId026}`
+        const existing = (await client.hgetall(key).catch(() => ({}))) as
+          | Record<string, string>
+          | null
+        const have = existing || {}
+        const toWrite: Record<string, string> = {}
+        for (const [field, value] of Object.entries(SPEC_DEFAULTS_026)) {
+          if (have[field] === undefined || have[field] === null || have[field] === "") {
+            toWrite[field] = value
+          }
+        }
+        if (Object.keys(toWrite).length > 0) {
+          await client.hset(key, toWrite)
+          seeded026 += Object.keys(toWrite).length
+        }
+      }
+
+      console.log(
+        `[v0] Migration 026: Seeded per-connection PF/DDT/leverage defaults for ${idSet026.size} connections (${seeded026} fields written)`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "25")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
