@@ -2706,11 +2706,28 @@ export async function executeLivePosition(
         await incrementMetric(connectionId, "live_margin_cents_total", Math.round(newMargin * 100))
       }
     }
+    // ── CRITICAL FIX: Include full real position context in progression ──
+    // This logs the complete lineage from real set → live execution,
+    // allowing dashboards to trace back which strategy configuration
+    // and axis window state produced this live position. Previously,
+    // this context was lost after creation, breaking the "relay back to
+    // original progress" link for ETH/SOL and other multi-set symbols.
     await logProgressionEvent(connectionId, "live_trading", "info", `Live position created ${realPosition.symbol}`, {
+      livePositionId: livePosition.id,
+      realPositionId: realPosition.id,
       status: livePosition.status,
       orderId: livePosition.orderId,
       executedQuantity: livePosition.executedQuantity,
       volumeUsd: livePosition.volumeUsd,
+      // ── Real position context (critical for multi-symbol / multi-set debugging) ──
+      realSetKey: realPosition.setKey,
+      realParentSetKey: realPosition.parentSetKey,
+      realSetVariant: realPosition.setVariant,
+      realAxisWindows: realPosition.axisWindows,
+      // ── Entry metrics ──
+      leverage: realPosition.leverage,
+      quantity: realPosition.quantity,
+      direction: realPosition.direction,
     })
 
     return livePosition
@@ -3140,7 +3157,17 @@ export async function closeLivePosition(
       }
     }
 
+    // ── Include lineage context in close logging ──
+    // When a live position closes, log its original real set context
+    // so dashboards can trace the complete lifecycle:
+    // real set → live creation → SL/TP/manual close → final P&L
     await logProgressionEvent(connectionId, "live_trading", "info", `Closed live position ${position.symbol}`, {
+      livePositionId: position.id,
+      realPositionId: position.realPositionId,
+      realSetKey: position.setKey,
+      realParentSetKey: position.parentSetKey,
+      realSetVariant: position.setVariant,
+      realAxisWindows: position.axisWindows,
       pnl,
       roi,
       closePrice,

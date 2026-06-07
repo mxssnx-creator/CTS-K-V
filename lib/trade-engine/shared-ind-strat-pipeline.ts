@@ -224,6 +224,34 @@ async function executeReadyStrategiesAsLiveOrders(
         const livePos = await executeLivePosition(connectionId, realPosition, exchangeConnector)
         if (livePos?.status === "filled" || livePos?.status === "placed") {
           createdCount++
+          // ── CRITICAL FIX: Log full RealPosition context to progression ──
+          // When a live position is created, the progression logs need to capture:
+          // - Which real Set it came from (setKey, profitFactor, variant)
+          // - Its axis windows (prev, last, cont, pause states)
+          // - The best-entry metrics (profitFactor, leverage, confidence)
+          // This is the "relay back to original progress" — linking the live
+          // execution back to its originating strategy set. Without this,
+          // dashboards show "position created" but lose the context of which
+          // strategy variation and set axis drove the creation.
+          const { logProgressionEvent } = await import("@/lib/engine-progression-logs")
+          await logProgressionEvent(
+            connectionId,
+            "live_trading",
+            "info",
+            `Live position dispatched from real set ${symbol}/${realSet.direction}`,
+            {
+              livePositionId: livePos.id,
+              realSetKey: realSet.setKey,
+              parentSetKey: realSet.parentSetKey,
+              setVariant: realSet.variant,
+              axisWindows: realSet.axisWindows,
+              entryProfitFactor: bestEntry.profitFactor,
+              entryConfidence: bestEntry.confidence,
+              leverage: realPosition.leverage,
+              quantity: realPosition.quantity,
+              status: livePos.status,
+            }
+          )
         } else {
           failedCount++
         }
