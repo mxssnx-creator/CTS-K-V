@@ -418,13 +418,18 @@ export class ConfigSetProcessor {
         // path's post-prehistoric handler). Fire-and-forget — a stuck
         // Redis write should never delay the next symbol.
         try {
+          // Use the monotonic SCARD-derived `distinctProcessed` (NOT the racy
+          // `symbolsProcessed` local) for BOTH the percent and the X/Y display
+          // so the progress bar and the "symbols processed of N" label can
+          // never regress under parallel workers — they advance in lockstep
+          // with the authoritative distinct-symbol set.
           const total = Math.max(1, symbols.length)
-          const pct = Math.min(95, 15 + Math.round((symbolsProcessed / total) * 80))
+          const pct = Math.min(95, 15 + Math.round((distinctProcessed / total) * 80))
           void setSettings(`engine_progression:${this.connectionId}`, {
             phase: "prehistoric_data",
             progress: pct,
-            detail: `Prehistoric calc filling sets — ${symbolsProcessed}/${total} symbols processed`,
-            sub_current: symbolsProcessed,
+            detail: `Prehistoric calc filling sets — ${distinctProcessed}/${total} symbols processed`,
+            sub_current: distinctProcessed,
             sub_total: total,
             sub_item: symbol,
             connection_id: this.connectionId,
@@ -442,6 +447,34 @@ export class ConfigSetProcessor {
       } catch (error) {
         console.error(`[v0] [ConfigSetProcessor] ✗ ${symbol}:`, error instanceof Error ? error.message : String(error))
         errors++
+        // CRITICAL ("stuck below 100%" fix): a symbol that throws mid-process
+        // must STILL count toward progress, otherwise the SCARD-derived
+        // distinct count never reaches N and the bar freezes forever. Mirror
+        // the skip-branch accounting: add to the canonical SET (idempotent),
+        // bump the legacy counter, and advance the dashboard percent using the
+        // monotonic distinct count.
+        symbolsProcessed++
+        try {
+          await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
+          await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400)
+          await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
+          const distinctErrProcessed = await client.scard(`prehistoric:${this.connectionId}:symbols`)
+          await client.hset(`prehistoric:${this.connectionId}`, {
+            symbols_processed: String(distinctErrProcessed),
+          })
+          const totalSyms = Math.max(1, symbols.length)
+          const errPct = Math.min(95, 15 + Math.round((distinctErrProcessed / totalSyms) * 80))
+          void setSettings(`engine_progression:${this.connectionId}`, {
+            phase: "prehistoric_data",
+            progress: errPct,
+            detail: `Prehistoric calc filling sets — ${distinctErrProcessed}/${totalSyms} symbols processed (error: ${symbol})`,
+            sub_current: distinctErrProcessed,
+            sub_total: totalSyms,
+            sub_item: symbol,
+            connection_id: this.connectionId,
+            updated_at: new Date().toISOString(),
+          }).catch(() => { /* non-critical */ })
+        } catch { /* non-critical */ }
         await logProgressionEvent(this.connectionId, "config_set_symbol_error", "error", `Prehistoric processing failed for ${symbol}`, {
           symbol,
           error: error instanceof Error ? error.message : String(error),
@@ -662,7 +695,7 @@ export class ConfigSetProcessor {
     // calc is done" signal. Without this call the phase stayed `active`
     // forever even though processing had finished.
     try {
-      await ProgressionStateManager.completePrehistoricPhase(this.connectionId)
+      await ProgressionStateManager.completePrehistoricPhase(this.connectionId, symbols.length)
     } catch (err) {
       console.warn(
         `[v0] [ConfigSetProcessor] completePrehistoricPhase failed:`,

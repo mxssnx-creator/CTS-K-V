@@ -149,6 +149,22 @@ export interface StrategyStageTracking {
     // Per-variant cumulative counts at Real (post-filter)
     // Indexed by variant name ("default" | "trailing" | "block" | "dca" | "pause")
     variantsAccumulated: Record<string, number>
+    /**
+     * ── Averaged running counts (operator spec) ──────────────────────
+     * Averages of the live Real-stage counts sampled over a fixed
+     * calculation interval (the interval itself is an internal detail and
+     * is NOT surfaced in the UI — only these averaged counts are shown):
+     *   - activeSets:    avg number of Real Sets running
+     *   - posPerSet:     avg positions (entries) held per running Set
+     *   - posOpen:       avg total open positions across running Sets
+     *   - samples:       how many samples backed the averages (diagnostic)
+     */
+    averages: {
+      activeSets: number
+      posPerSet: number
+      posOpen: number
+      samples: number
+    }
   }
   live: {
     setsActive: number                // currently on exchange with open positions
@@ -191,6 +207,20 @@ export interface StrategyStageTracking {
     minCount: number
     /** True when current count clears `minCount` and PF blending is active. */
     active: boolean
+  }
+  /**
+   * ── Stage pass-through percentages (operator spec) ──────────────────
+   * "Percentages of Sets evals Base, Main, Real Stages." Modeled as the
+   * cascade survival rate of the filter pipeline:
+   *   - base: 100% (entry point — every evaluated Base Set counts)
+   *   - main: Main evaluated / Base evaluated  (how much survived Base→Main)
+   *   - real: Real evaluated / Main evaluated  (how much survived Main→Real)
+   * Each value is a 0–100 percentage, clamped to [0,100].
+   */
+  stageEvalPercent: {
+    base: number
+    main: number
+    real: number
   }
 }
 
@@ -409,6 +439,71 @@ export async function getStrategyTracking(
     return sum
   })()
 
+  // ── Real averaged running counts ──────────────────────────────────
+  // Average the per-cycle Real samples written by the coordinator
+  // (`real_samples:{conn}`, a bounded ring of {t, sets, pps, open}) over a
+  // fixed calculation interval. The interval is an internal detail; only
+  // the resulting averaged counts are surfaced. lrange is O(N) over a
+  // ≤600-entry capped list and never blocks.
+  const REAL_AVG_INTERVAL_MS = 5 * 60 * 1000
+  const realAverages = await (async () => {
+    try {
+      const raw = (await client
+        .lrange(`real_samples:${connectionId}`, 0, -1)
+        .catch(() => [])) as string[]
+      const cutoff = Date.now() - REAL_AVG_INTERVAL_MS
+      let nSets = 0, nPps = 0, nOpen = 0, count = 0
+      for (const entry of raw) {
+        try {
+          const s = JSON.parse(entry) as { t: number; sets: number; pps: number; open: number }
+          if (!s || typeof s.t !== "number" || s.t < cutoff) continue
+          nSets += Number(s.sets) || 0
+          nPps  += Number(s.pps) || 0
+          nOpen += Number(s.open) || 0
+          count++
+        } catch { /* skip malformed sample */ }
+      }
+      if (count === 0) {
+        // No samples in-window: fall back to the latest live snapshot so the
+        // tiles show the current values rather than zero on a fresh boot.
+        return {
+          activeSets: realCombined,
+          posPerSet: Number(real.avg_pos_per_set || "0"),
+          posOpen: Number(real.entries_total || "0"),
+          samples: 0,
+        }
+      }
+      return {
+        activeSets: Number((nSets / count).toFixed(2)),
+        posPerSet: Number((nPps / count).toFixed(2)),
+        posOpen: Number((nOpen / count).toFixed(2)),
+        samples: count,
+      }
+    } catch {
+      return { activeSets: 0, posPerSet: 0, posOpen: 0, samples: 0 }
+    }
+  })()
+
+  // ── Stage pass-through percentages (cascade survival rate) ────────
+  // Uses the cumulative lifetime counters the coordinator maintains so the
+  // ratios are stable instead of oscillating with per-cycle snapshots:
+  //   strategies_{stage}_total      = Sets the stage OUTPUT (promoted)
+  //   strategies_{stage}_evaluated  = Sets that ENTERED the stage (input)
+  // base = 100% entry point; main = Main output / Main input (Base→Main
+  // survival); real = Real output / Real input (Main→Real survival).
+  // Each clamped to [0,100].
+  const mainOutput    = Number(prog.strategies_main_total || "0")
+  const mainInput     = Number(prog.strategies_main_evaluated || "0")
+  const realOutput    = Number(prog.strategies_real_total || "0")
+  const realInput     = Number(prog.strategies_real_evaluated || "0")
+  const pct = (num: number, den: number): number =>
+    den > 0 ? Math.max(0, Math.min(100, Number(((num / den) * 100).toFixed(1)))) : 0
+  const stageEvalPercent = {
+    base: mainInput > 0 || mainOutput > 0 ? 100 : 0,
+    main: pct(mainOutput, mainInput),
+    real: pct(realOutput, realInput),
+  }
+
   return {
     base: {
       setsActivelyProcessing: baseActivelyProcessing,
@@ -458,6 +553,7 @@ export async function getStrategyTracking(
         general:     realGeneral,
         combined:    realCombined,
       },
+      averages: realAverages,
     },
     live: {
       setsActive: liveActive,
@@ -477,6 +573,7 @@ export async function getStrategyTracking(
       minCount: prevPosMinCount,
       active: prevPos.hasSignal,
     },
+    stageEvalPercent,
   }
 }
 

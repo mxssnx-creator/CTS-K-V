@@ -87,7 +87,7 @@
  * ╚═════════════════════════════════════════════════════════════════════════╝
  */
 
-import { getRedisClient, initRedis } from "@/lib/redis-db"
+import { getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
 
 export interface ProgressionState {
   connectionId: string
@@ -459,21 +459,53 @@ return {
   }
 
   /**
-   * Mark prehistoric phase as complete
+   * Mark prehistoric phase as complete.
+   *
+   * Deterministically PINS the terminal progress state so the dashboard can
+   * never be left showing a sub-100% bar or an "X/N" label short of N once the
+   * run has actually finished — even if a symbol was skipped (no data) or threw
+   * mid-process and the live percent never organically reached the end. Pass
+   * `symbolTotal` (the connection's configured symbol count) to stamp the
+   * authoritative final counts.
    */
-  static async completePrehistoricPhase(connectionId: string): Promise<void> {
+  static async completePrehistoricPhase(connectionId: string, symbolTotal?: number): Promise<void> {
     try {
       const client = getRedisClient()
       if (!client) {
         await initRedis()
       }
-      const actualClient = getRedisClient()
       const key = `progression:${connectionId}`
 
       await client.hset(key, {
         prehistoric_phase_active: "false",
         last_update: new Date().toISOString(),
       })
+
+      // Pin the prehistoric counter hash + the dashboard progress bar to their
+      // terminal values. We clamp the displayed processed count to the distinct
+      // SET cardinality (authoritative) but never below `symbolTotal` so the
+      // label reads a clean "N/N".
+      try {
+        const distinct = await client
+          .scard(`prehistoric:${connectionId}:symbols`)
+          .catch(() => 0)
+        const total = Math.max(1, symbolTotal ?? distinct ?? 1)
+        const finalProcessed = Math.max(distinct, total)
+        await client.hset(`prehistoric:${connectionId}`, {
+          symbols_processed: String(finalProcessed),
+          symbols_total: String(total),
+          is_complete: "1",
+        })
+        await setSettings(`engine_progression:${connectionId}`, {
+          phase: "prehistoric_data",
+          progress: 95,
+          detail: `Prehistoric calc complete — ${finalProcessed}/${total} symbols processed`,
+          sub_current: finalProcessed,
+          sub_total: total,
+          connection_id: connectionId,
+          updated_at: new Date().toISOString(),
+        }).catch(() => { /* non-critical */ })
+      } catch { /* non-critical */ }
 
       console.log(`[v0] [Prehistoric] Phase completed for connection ${connectionId}`)
     } catch (error) {

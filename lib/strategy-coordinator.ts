@@ -686,7 +686,7 @@ export class StrategyCoordinator {
     },
     real: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default ������� operator-tunable
+      minProfitFactor: 1.0,   // spec default ��������� operator-tunable
       confidence: 0.65,       // advisory only
       description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
@@ -1018,7 +1018,7 @@ export class StrategyCoordinator {
     return out
   }
 
-  // ─── STAGE 1: BASE ───────────────────────────────────────────────────────────
+  // ─���─ STAGE 1: BASE ───────────────────────────────────────────────────────────
 
   /**
    * Read the multi-step trailing matrix from Redis settings (mirror-aware).
@@ -1641,7 +1641,7 @@ export class StrategyCoordinator {
     // ── Await all async builds to complete ───────────────────────────────
     const results = await Promise.all(buildTasks)
     
-    // ── Process results and populate mainSets ────────────────────────────
+    // ── Process results and populate mainSets ──���─────────────────────────
     for (const result of results) {
       const { baseSet, profile, built, cachedSet } = result
       const set = cachedSet || built
@@ -2579,6 +2579,15 @@ export class StrategyCoordinator {
         return realActiveBaseKeys.has(base)
       }).length
 
+      // Open positions = sum of entryCount across the Real Sets that are
+      // actively running now (each entry is one open position the Set holds).
+      const realOpenPositions = realSets.reduce((sum, s) => {
+        const base = (s.parentSetKey ?? s.setKey).split("#")[0]
+        return realActiveBaseKeys.has(base) ? sum + (s.entryCount || 0) : sum
+      }, 0)
+      // Positions (entries) per running Set — averaged over running Sets only.
+      const realPosPerRunningSet = realRunningNow > 0 ? realOpenPositions / realRunningNow : 0
+
       // ── Real 4-perspective stats (Overall / Accumulated / General / Combined) ──
       // Per operator spec: "in Strategies Real ensure correct stats..
       // Overall, Accumulated, General, Combined."
@@ -2711,6 +2720,30 @@ export class StrategyCoordinator {
       )
 
       // ── P1-1: Real-stage per-variant aggregation ───────────���────────
+      // ── Real-stage rolling sample (for averaged count stats) ──────────
+      // Push one timestamped sample of the live Real counts per (symbol,
+      // cycle) onto a bounded ring list. The tracking layer averages all
+      // samples inside a fixed interval window to produce the displayed
+      // "average" Active Sets / Positions-per-Set / Positions-Open figures.
+      // lpush + ltrim is O(1)-ish and order-independent, so concurrent
+      // symbol workers can never corrupt or stall it (no read-modify-write).
+      // The interval window itself is an internal calc detail — the UI shows
+      // only the resulting averages, never the "N minutes" framing.
+      try {
+        const sampleKey = `real_samples:${this.connectionId}`
+        const sample = JSON.stringify({
+          t: Date.now(),
+          sets: realRunningNow,
+          pps: Number(realPosPerRunningSet.toFixed(3)),
+          open: realOpenPositions,
+        })
+        writes.push(
+          client.lpush(sampleKey, sample),
+          client.ltrim(sampleKey, 0, 599),
+          client.expire(sampleKey, 3600),
+        )
+      } catch { /* non-critical */ }
+
       // Same shape as Main's `variantAgg` but computed over the Real
       // output (post-PF/DDT filter). Lets the stats API answer "how
       // much of Real is Default vs Adjust{Block, DCA} vs Trailing?"
@@ -4056,7 +4089,7 @@ export class StrategyCoordinator {
    * Deterministic fingerprint of {base Set × variant × position context}.
    * Drives the "IF NOT ALREADY CREATED" dedup check.
    *
-   * ── Bucket ranges (P0-3, spec-aligned) ─��───────────────────────────
+   * ── Bucket ranges (P0-3, spec-aligned) ─��────────────────────��──────
    * Spec ranges:
    *   - Prev Positions         1-12   (13 buckets 0-12)
    *   - Last Positions W/L     1-4    (5 buckets each 0-4)
