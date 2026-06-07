@@ -455,18 +455,23 @@ export async function GET(
       Array<{ realPositionId: string }>
     >()
     try {
-      const realKeys = await client.keys(`real:position:*`)
-      if (realKeys.length > 0) {
-        const caps = realKeys.slice(0, 500)
+      // Use the connection-scoped position-id list instead of O(N) client.keys().
+      // `real:positions:{connectionId}` is maintained by the Real stage (lpush on
+      // creation) and gives us a bounded, connection-filtered set in O(1) per id.
+      // client.keys("real:position:*") was a blocking O(keyspace) scan that stalled
+      // the event loop and scanned ALL connections' positions just to then discard
+      // the ones belonging to other connections.
+      const realIds = ((await client
+        .lrange(`real:positions:${connectionId}`, 0, 499)
+        .catch(() => [])) || []) as string[]
+      if (realIds.length > 0) {
         const raws = await Promise.all(
-          caps.map((k: string) => client.get(k).catch(() => null)),
+          realIds.map((id: string) => client.get(`real:position:${id}`).catch(() => null)),
         )
         for (const raw of raws) {
           if (!raw) continue
           try {
             const pos = JSON.parse(raw as string)
-            // Filter by this connection only (pos object contains connectionId field)
-            if (pos.connectionId !== connectionId) continue
             if (pos.status === "closed") continue
             realOpen++
             // Index for live position join (fallback path)
@@ -1815,7 +1820,7 @@ export async function GET(
       indWindow60m = Math.round(ratePerMin * Math.min(60, elapsedMin))
     }
 
-    // ── METADATA section ─────────────────────────────────────────────────────
+    // ── METADATA section ─────────────────────────────────────────────��───────
     const phase    = ep?.phase || "unknown"
     const progress = n(ep?.progress)
     const message  = ep?.detail || ep?.message || ""

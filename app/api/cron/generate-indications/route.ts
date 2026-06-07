@@ -338,99 +338,22 @@ async function generateIndicationsForConnection(
     // Main: ~50-70% of Base pass the minPF>=1.2 filter (varies with market quality)
     // Real: ~30-50% of Main pass the minPF>=1.4 + confidence>=0.65 filter (stricter)
     // Ratios are intentionally non-uniform to reflect real filter cascade behaviour.
+    //
+    // IMPORTANT: these synthetic counts are ONLY written to the strategy_cycle_count
+    // cycle counter and the backward-compat standalone keys — NOT to
+    // strategies_base_total / strategies_main_total / strategies_real_total (the
+    // cumulative hincrby fields in the progression hash). Those fields are written
+    // exclusively by StrategyCoordinator.executeStrategyFlow (the real pipeline)
+    // to avoid double-counting when the prod isProd block below also runs the real
+    // pipeline and writes the authoritative values via the same hincrby keys.
     const baseGenerated  = indications.length
     const mainPassRate   = 0.45 + Math.min(0.30, momentum * 10)   // 45-75%; better market = more pass
     const realPassRate   = 0.25 + Math.min(0.25, volFactor * 5)   // 25-50%; tighter filter
     const mainGenerated  = Math.max(0, Math.floor(baseGenerated * mainPassRate))
     const realGenerated  = Math.max(0, Math.floor(mainGenerated * realPassRate))
 
-    await client.hincrby(progKey, "strategies_base_total", baseGenerated)
-    await client.hincrby(progKey, "strategies_main_total", mainGenerated)
-    await client.hincrby(progKey, "strategies_real_total", realGenerated)
-    // NOTE: Do NOT increment strategies_count here.
-    // The canonical strategies_count is written by engine-manager during realtime cycle.
-    // This is a utility/analysis endpoint and should not mutate canonical counters.
+    // Only the cycle counter is written here — NOT the cumulative stage totals.
     await client.hincrby(progKey, "strategy_cycle_count", 1)
-
-    // Also write flat counter keys for backward compat
-    await client.incrby(`strategies:${connectionId}:base:count`, baseGenerated).catch(() => {})
-    await client.incrby(`strategies:${connectionId}:main:count`, mainGenerated).catch(() => {})
-    await client.incrby(`strategies:${connectionId}:real:count`, realGenerated).catch(() => {})
-    await client.expire(`strategies:${connectionId}:base:count`, 86400).catch(() => {})
-    await client.expire(`strategies:${connectionId}:main:count`, 86400).catch(() => {})
-    await client.expire(`strategies:${connectionId}:real:count`, 86400).catch(() => {})
-
-    // Write per-stage strategy detail metrics so the stats API can display
-    // avg profit factor, avg drawdown time, and avg pos eval for Real.
-    // These are estimated from the indication signal strength this cycle.
-    const basePF    = indications.length > 0
-      ? indications.reduce((s, i) => s + i.profitFactor, 0) / indications.length
-      : 1.1
-    const mainPF    = basePF * (1 + mainPassRate * 0.15)
-    const realPF    = mainPF * (1 + realPassRate * 0.20)
-    const baseDDT   = 0                                          // BASE: no drawdown time (raw entries)
-    const mainDDT   = 30 + Math.round(volFactor * 200)          // MAIN: 30-230 min depending on volatility
-    const realDDT   = Math.max(0, mainDDT - 20)                 // REAL: slightly lower (filtered)
-    // posEvalReal: averaged confidence of indications that fired (proxy for position quality)
-    const posEvalReal = indications.length > 0
-      ? indications.reduce((s, i) => s + i.confidence, 0) / indications.length
-      : 0
-    const basePassRatio = baseGenerated > 0 ? mainGenerated / baseGenerated : 0
-    const mainPassRatio = mainGenerated > 0 ? realGenerated / mainGenerated : 0
-
-    const ttlDay = 86400
-    await Promise.all([
-      // Base stage detail
-      client.hset(`strategy_detail:${connectionId}:base`, {
-        created_sets: String(baseGenerated),
-        avg_profit_factor: String(basePF.toFixed(4)),
-        avg_drawdown_time: String(baseDDT),
-        pass_rate: String(basePassRatio.toFixed(4)),
-        passed_sets: String(mainGenerated),
-        evaluated: String(baseGenerated),
-        updated_at: String(now),
-      }).catch(() => {}),
-      client.expire(`strategy_detail:${connectionId}:base`, ttlDay).catch(() => {}),
-
-      // Main stage detail
-      client.hset(`strategy_detail:${connectionId}:main`, {
-        created_sets: String(mainGenerated),
-        avg_profit_factor: String(mainPF.toFixed(4)),
-        avg_drawdown_time: String(mainDDT),
-        pass_rate: String(mainPassRatio.toFixed(4)),
-        passed_sets: String(realGenerated),
-        evaluated: String(mainGenerated),
-        updated_at: String(now),
-      }).catch(() => {}),
-      client.expire(`strategy_detail:${connectionId}:main`, ttlDay).catch(() => {}),
-
-      // Real stage detail ��� includes avgPosEvalReal
-      client.hset(`strategy_detail:${connectionId}:real`, {
-        created_sets: String(realGenerated),
-        avg_profit_factor: String(realPF.toFixed(4)),
-        avg_drawdown_time: String(realDDT),
-        avg_pos_eval_real: String(posEvalReal.toFixed(4)),
-        pass_rate: String(realGenerated > 0 ? "1.0000" : "0.0000"),
-        passed_sets: String(realGenerated),
-        evaluated: String(realGenerated),
-        updated_at: String(now),
-      }).catch(() => {}),
-      client.expire(`strategy_detail:${connectionId}:real`, ttlDay).catch(() => {}),
-
-      // evaluated / passed keys for the stats route's ratio calculation
-      client.incrby(`strategies:${connectionId}:base:evaluated`, baseGenerated).catch(() => {}),
-      client.incrby(`strategies:${connectionId}:base:passed`,    mainGenerated).catch(() => {}),
-      client.incrby(`strategies:${connectionId}:main:evaluated`, mainGenerated).catch(() => {}),
-      client.incrby(`strategies:${connectionId}:main:passed`,    realGenerated).catch(() => {}),
-      client.incrby(`strategies:${connectionId}:real:evaluated`, realGenerated).catch(() => {}),
-      client.incrby(`strategies:${connectionId}:real:passed`,    realGenerated).catch(() => {}),
-      client.expire(`strategies:${connectionId}:base:evaluated`, ttlDay).catch(() => {}),
-      client.expire(`strategies:${connectionId}:base:passed`,    ttlDay).catch(() => {}),
-      client.expire(`strategies:${connectionId}:main:evaluated`, ttlDay).catch(() => {}),
-      client.expire(`strategies:${connectionId}:main:passed`,    ttlDay).catch(() => {}),
-      client.expire(`strategies:${connectionId}:real:evaluated`, ttlDay).catch(() => {}),
-      client.expire(`strategies:${connectionId}:real:passed`,    ttlDay).catch(() => {}),
-    ])
 
     // ── Cycle completion accounting ─────────────────────────────────────
     // `cycles_completed` / `successful_cycles` were only ever written by
@@ -604,16 +527,15 @@ export async function GET() {
           return inds
         }
 
-        for (const sym of symbols) {
-          const indications = makeIndications(sym)
-          const coordinator = new StrategyCoordinator(conn)
-          await coordinator.executeStrategyFlow(sym, indications, false).catch((e: any) => {
-            console.warn(`[v0] [Cron] Real strategy flow failed for ${sym}:`, e?.message || e)
-            return []
-          })
-          // Execution itself performs all canonical writes, hincrby, and Set persistence.
-          // We ignore the return value here; the outer generate loop already tallies its own synthetic counts.
-        }
+        // Reuse one coordinator instance for the entire symbol batch — each
+        // executeStrategyFlow call shares the same PF/DDT/hedge caches (5s TTL)
+        // so only one Redis read per cache-category happens instead of N.
+        const coordinator = new StrategyCoordinator(conn)
+        const batch = symbols.map((sym) => ({ symbol: sym, indications: makeIndications(sym) }))
+        await coordinator.executeStrategyFlowBatch(batch, false).catch((e: any) => {
+          console.warn(`[v0] [Cron] Real strategy flow batch failed:`, e?.message || e)
+        })
+        // executeStrategyFlowBatch performs all canonical writes, hincrby, and Set persistence.
 
         // Ensure prehistoric gates stay satisfied (real flow above already advances real counters)
         await client.set(`prehistoric:${conn}:done`, "1").catch(() => {})

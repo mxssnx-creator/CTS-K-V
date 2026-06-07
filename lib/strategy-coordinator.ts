@@ -686,7 +686,7 @@ export class StrategyCoordinator {
     },
     real: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default ��������� operator-tunable
+      minProfitFactor: 1.0,   // spec default ����������� operator-tunable
       confidence: 0.65,       // advisory only
       description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
@@ -1470,7 +1470,7 @@ export class StrategyCoordinator {
       baseSets = stored?.sets || []
     }
 
-    const metrics = this.METRICS.main
+    const metricsMain = this.METRICS.main
     const maxEntries = this.config.maxEntriesPerSet || 250
     const ctx = posCtx ?? this.neutralPositionContext()
     const mainSets: StrategySet[] = []
@@ -1482,6 +1482,11 @@ export class StrategyCoordinator {
     // Apply a one-time mild relaxation only for prod + live_trade after quickstart.
     // This mirrors the Real-stage bootstrap and restores the behaviour where
     // "it used to produce live orders on first quickstart".
+    // IMPORTANT: use a LOCAL minPF variable — never mutate this.METRICS.main
+    // in-place. The class field is shared across all symbols in the same cycle
+    // (and across cycles within the 5s PF-cache window), so an in-place write
+    // would bleed the relaxed threshold into every subsequent symbol's call.
+    let mainMinPF = metricsMain.minProfitFactor
     try {
       const { isProductionEnvironment, getConnection: getConn } = await import("@/lib/redis-db")
       const { isTruthyFlag } = await import("@/lib/connection-state-utils")
@@ -1489,17 +1494,20 @@ export class StrategyCoordinator {
         const conn = await getConn(this.connectionId).catch(() => null as any)
         const liveOn = isTruthyFlag(conn?.is_live_trade) || isTruthyFlag(conn?.live_trade_enabled)
         if (liveOn) {
-          const origPF = metrics.minProfitFactor
-          metrics.minProfitFactor = Math.min(origPF, 0.85)
-          if (origPF !== metrics.minProfitFactor) {
+          const relaxed = Math.min(mainMinPF, 0.85)
+          if (relaxed !== mainMinPF) {
             console.log(
               `[v0] [StrategyCoordinator] ${this.connectionId} MAIN bootstrap (prod + live quickstart): ` +
-              `relaxed minProfitFactor ${origPF} → ${metrics.minProfitFactor} to allow first Base→Main→Real flow.`
+              `relaxed minProfitFactor ${mainMinPF} → ${relaxed} to allow first Base→Main→Real flow.`
             )
+            mainMinPF = relaxed
           }
         }
       }
     } catch { /* non-fatal */ }
+    // Build a cycle-local metrics view so the shared METRICS object is never
+    // mutated and every symbol in the same batch uses its own threshold copy.
+    const metrics: EvaluationMetrics = { ...metricsMain, minProfitFactor: mainMinPF }
 
     // ── Stage-validation min-position threshold (operator spec) ────
     // "Main has to evaluate from stage Base with profitfactor for X
@@ -1893,9 +1901,6 @@ export class StrategyCoordinator {
       await Promise.all(writes)
     } catch { /* non-critical — Redis write failure should not kill strategy flow */ }
 
-    if (baseSets.length > 0) {
-    }
-
     return {
       result: {
         type: "main",
@@ -2026,7 +2031,7 @@ export class StrategyCoordinator {
     }
     const mainSets: StrategySet[] = inputSets ?? (stored?.sets || [])
 
-    const metrics = this.METRICS.real
+    const metricsReal = this.METRICS.real
 
      // ── Stage-validation min-position threshold (operator spec, systemwide fix) ────
      // Same semantics as Main: Sets below `realEvalPosCount` are
@@ -2051,6 +2056,11 @@ export class StrategyCoordinator {
       // so the first qualifying axis/profile sets can escalate to Live execution.
       // PF/DDT still apply (just lowered), and normal strictness returns as soon
       // as real history accumulates.
+      // IMPORTANT: use a LOCAL minPF — never mutate this.METRICS.real in-place.
+      // The class field is shared across all symbols in the same cycle and across
+      // cycles within the 5s PF-cache window; an in-place mutation bleeds the
+      // relaxed threshold into every subsequent symbol's Real evaluation.
+      let realMinPF = metricsReal.minProfitFactor
       try {
         const { getConnection: getConn } = await import("@/lib/redis-db")
         const { isTruthyFlag } = await import("@/lib/connection-state-utils")
@@ -2062,18 +2072,19 @@ export class StrategyCoordinator {
 
           // PF bootstrap relaxation — lower the Real gate slightly to allow first
           // cycles to promote sets when live trading is explicitly enabled.
-          const originalRealPF = metrics.minProfitFactor
-          metrics.minProfitFactor = Math.min(originalRealPF, 0.75)
-
-          if (originalRealPF !== metrics.minProfitFactor) {
+          const relaxed = Math.min(realMinPF, 0.75)
+          if (relaxed !== realMinPF) {
             console.log(
               `[v0] [StrategyCoordinator] ${this.connectionId} REAL bootstrap (live quickstart): ` +
-              `relaxed minProfitFactor ${originalRealPF} → ${metrics.minProfitFactor} and posCount→${realMinPos} ` +
+              `relaxed minProfitFactor ${realMinPF} → ${relaxed} and posCount→${realMinPos} ` +
               `to allow first Real→Live escalation while history builds.`
             )
+            realMinPF = relaxed
           }
         }
       } catch { /* non-fatal */ }
+      // Build a cycle-local metrics view — shared METRICS.real never mutated.
+      const metrics: EvaluationMetrics = { ...metricsReal, minProfitFactor: realMinPF }
      
      // Get real active keys for validation (moved outside try block for scope access)
      let realActiveKeysForVP: Set<string> = new Set()
@@ -2362,25 +2373,11 @@ export class StrategyCoordinator {
       const { bumpRealPosAccumulation, bumpValidPositions, bumpAxisPosAccumulation, bumpHedgePosAccumulation } = await import(
         "@/lib/pos-history",
       )
-      const realActiveKeysForVP = await (async () => {
-        try {
-          const c = getRedisClient()
-          const base = new Set<string>(
-            (await c
-              .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
-              .catch(() => [])) as string[],
-          )
-          // Same authoritative enrichment as the validation gate above so the
-          // "running now" valid-positions counter agrees with the filter: a
-          // Set with an open live position counts as running regardless of the
-          // (unreliable) active_config_keys fingerprint set.
-          try {
-            const liveSetKeys = await this.getOpenLiveSetKeys()
-            for (const k of liveSetKeys) base.add(k)
-          } catch { /* fail-open */ }
-          return base
-        } catch { return new Set<string>() }
-      })()
+      // Reuse `realActiveKeysForVP` already resolved at the function's top
+      // (smembers + getOpenLiveSetKeys). Performing a second fetch here was a
+      // redundant extra round-trip pair (one SMEMBERS + one live-positions scan)
+      // on every Real-stage cycle, adding ~2 Redis RTTs with zero benefit since
+      // the data can't change within the same async function call.
       const accPipeline = getRedisClient().multi()
       for (const s of realSets) {
         const parentKey = s.parentSetKey || s.setKey.split("#")[0]
@@ -2541,16 +2538,10 @@ export class StrategyCoordinator {
       // Position evaluation real: average confidence of REAL sets
       // (how well did the Real stage filter perform)
       const realAvgConf = realSets.length > 0 ? realSets.reduce((s, st) => s + (st.avgConfidence || 0), 0) / realSets.length : 0
-      // passRatioReal = fraction of ELIGIBLE Main Sets (those that reached the
-      // PF/DDT gate — not the ones gated out before it by insufficient_pos_count)
-      // that passed into Real. Using mainSets.length as the denominator deflates
-      // the ratio because mainSets includes the large axis fan-out (~320 Sets per
-      // Base Set) while realSets are comparatively few after the PF gate.
-      // The correct denominator is the count of Sets that were actually evaluated
-      // against PF/DDT criteria (not pre-rejected by the pos-count gate).
-      const mainPFEligible = mainSetsEligible.filter(
-        (s) => !(s.status === "invalid" && s.rejectionReason?.includes("insufficient_pos_count")),
-      ).length
+      // passRatioReal = fraction of ELIGIBLE Main Sets that passed into Real.
+      // `mainPFEligible` is computed once above (outside this try-block) and
+      // reused here — the duplicate inner `const mainPFEligible` that used to
+      // shadow it was removed to fix the redundant filter re-computation.
       const passRatioReal = mainPFEligible > 0 ? realSets.length / mainPFEligible : 0
       const realEntriesTotal  = realSets.reduce((s, st) => s + (st.entryCount || 0), 0)
       const realAvgPosPerSet  = realSets.length > 0 ? realEntriesTotal / realSets.length : 0
@@ -3950,7 +3941,7 @@ export class StrategyCoordinator {
               // One entry per axis Set so:
               //   • variant-aggregate loop counts it (passed_sets / sumPF / sumDDT)
               //   • Real-stage tuner has something to mutate
-              //   • per-axis Pos-acc ledger has a non-zero delta to record
+              //   �� per-axis Pos-acc ledger has a non-zero delta to record
               // Quality fields are inherited from the Base default's
               // realised-history aggregates; positionState carries the
               // axis tuple so the dashboard can drill in.
