@@ -13,14 +13,15 @@ export async function GET(request: NextRequest) {
   try {
     await initRedis()
     const { searchParams } = new URL(request.url)
-    const connectionId = searchParams.get("connection_id")
+    // Accept both snake_case (connection_id) and camelCase (connectionId) for compatibility
+    const connectionId = searchParams.get("connection_id") || searchParams.get("connectionId")
     const status = searchParams.get("status") || "all"
     const symbol = searchParams.get("symbol")
     const limit = Math.min(parseInt(searchParams.get("limit") || "100"), 1000)
     const offset = parseInt(searchParams.get("offset") || "0")
 
     if (!connectionId) {
-      return NextResponse.json({ success: false, error: "connection_id required" }, { status: 400 })
+      return NextResponse.json({ success: false, error: "connection_id or connectionId required" }, { status: 400 })
     }
 
     const client = getRedisClient()
@@ -109,7 +110,8 @@ export async function POST(request: NextRequest) {
     const body = await request.json()
     
     const {
-      connection_id,
+      connection_id: _connection_id,
+      connectionId: _connectionId,
       symbol,
       position_type,
       entry_price,
@@ -121,6 +123,8 @@ export async function POST(request: NextRequest) {
       side,
       trade_mode,
     } = body
+    // Accept both snake_case and camelCase
+    const connection_id = _connection_id ?? _connectionId
 
     // Validate required fields
     if (!connection_id || !symbol || !position_type || !entry_price || !quantity) {
