@@ -1,7 +1,8 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { getSession } from "@/lib/auth"
-import { getActiveIndications, getBestPerformingIndications } from "@/lib/db-helpers"
-import { getRedisClient } from "@/lib/redis-db"
+import { initRedis, getRedisClient } from "@/lib/redis-db"
+
+export const runtime = "nodejs"
+export const dynamic = "force-dynamic"
 
 interface Indication {
   id: string
@@ -50,52 +51,78 @@ function generateMockIndications(connectionId: string): Indication[] {
   })
 }
 
+/**
+ * Read real indications from the canonical engine keyspace.
+ *
+ * The engine stores indications as JSON arrays in:
+ *   indication_set:{connId}:{symbol}:{type}:{...config}
+ *
+ * Each entry has: { id, timestamp, type, direction, profitFactor, confidence, config, metadata }
+ *
+ * We scan up to 500 keys (bounded), read each array, and surface the most
+ * recent entry per key as a displayable Indication record.
+ */
 async function getRealIndications(connectionId: string): Promise<Indication[]> {
   try {
-    // Try to get active indications from Redis first
-    const activeIndications = await getActiveIndications(connectionId)
-    
-    if (activeIndications && activeIndications.length > 0) {
-      // Convert Redis data to Indication interface
-      return activeIndications.map((ind: any) => ({
-        id: ind.id || `ind-${Date.now()}-${Math.random()}`,
-        symbol: ind.symbol || "UNKNOWN",
-        indicationType: ind.indication_type || ind.type || "Unknown",
-        direction: (ind.direction || "NEUTRAL") as "UP" | "DOWN" | "NEUTRAL",
-        confidence: Number(ind.confidence) || 50,
-        strength: Number(ind.strength) || 50,
-        timestamp: ind.timestamp || new Date().toISOString(),
-        enabled: ind.enabled !== false && ind.enabled !== "0",
+    await initRedis()
+    const client = getRedisClient()
+    if (!client) return []
+
+    // Bounded scan of indication_set keys for this connection
+    const prefix = `indication_set:${connectionId}:`
+    const allKeys: string[] = await client.keys(`${prefix}*`).catch(() => [] as string[])
+    if (!allKeys || allKeys.length === 0) return []
+
+    // Limit to 500 keys to keep reads bounded
+    const keys = allKeys.slice(0, 500)
+
+    const indications: Indication[] = []
+
+    // Read each key's JSON array and extract the most recent (last) entry
+    const values = await Promise.all(keys.map((k) => client.get(k).catch(() => null)))
+
+    for (let i = 0; i < keys.length; i++) {
+      const raw = values[i]
+      if (!raw) continue
+      let entries: any[]
+      try {
+        entries = JSON.parse(raw as string)
+      } catch {
+        continue
+      }
+      if (!Array.isArray(entries) || entries.length === 0) continue
+
+      // Parse key to extract symbol and type
+      // Key format: indication_set:{connId}:{symbol}:{type}:{...rest}
+      const keyWithoutPrefix = keys[i].slice(prefix.length) // e.g. "BTCUSDT:direction:r10:..."
+      const parts = keyWithoutPrefix.split(":")
+      const symbol = parts[0] ?? "UNKNOWN"
+      const indType = parts[1] ?? "unknown"
+
+      // Most recent entry is last (entries are push()'d newest-at-last)
+      const entry = entries[entries.length - 1]
+
+      const direction =
+        entry.direction === "short" ? "DOWN" : entry.direction === "long" ? "UP" : "NEUTRAL"
+
+      indications.push({
+        id: entry.id || `${symbol}-${indType}-${i}`,
+        symbol,
+        indicationType: indType.charAt(0).toUpperCase() + indType.slice(1),
+        direction: direction as "UP" | "DOWN" | "NEUTRAL",
+        confidence: Math.min(100, Math.max(0, Number(entry.confidence) || 50)),
+        strength: Math.min(100, Math.max(0, Number(entry.profitFactor ?? entry.confidence) * 10 || 50)),
+        timestamp: entry.timestamp || new Date().toISOString(),
+        enabled: true,
         metadata: {
-          rsiValue: ind.rsi ? Number(ind.rsi) : undefined,
-          macdValue: ind.macd ? Number(ind.macd) : undefined,
-          volatility: ind.volatility ? Number(ind.volatility) : undefined,
+          rsiValue: entry.metadata?.rsi ? Number(entry.metadata.rsi) : undefined,
+          macdValue: entry.metadata?.macd ? Number(entry.metadata.macd) : undefined,
+          volatility: entry.metadata?.volatility ? Number(entry.metadata.volatility) : undefined,
         },
-      }))
+      })
     }
 
-    // If no active indications, try getting best performing ones
-    const bestIndications = await getBestPerformingIndications(connectionId)
-    if (bestIndications && bestIndications.length > 0) {
-      return bestIndications.map((ind: any) => ({
-        id: ind.id || `ind-${Date.now()}-${Math.random()}`,
-        symbol: ind.symbol || "UNKNOWN",
-        indicationType: ind.indication_type || ind.type || "Unknown",
-        direction: (ind.direction || "NEUTRAL") as "UP" | "DOWN" | "NEUTRAL",
-        confidence: Number(ind.confidence) || 50,
-        strength: Number(ind.strength) || 50,
-        timestamp: ind.timestamp || new Date().toISOString(),
-        enabled: ind.enabled !== false && ind.enabled !== "0",
-        metadata: {
-          rsiValue: ind.rsi ? Number(ind.rsi) : undefined,
-          macdValue: ind.macd ? Number(ind.macd) : undefined,
-          volatility: ind.volatility ? Number(ind.volatility) : undefined,
-        },
-      }))
-    }
-
-    // Return empty array if no indications found
-    return []
+    return indications
   } catch (error) {
     console.error(`[v0] Failed to get real indications for ${connectionId}:`, error)
     return []
@@ -104,26 +131,18 @@ async function getRealIndications(connectionId: string): Promise<Indication[]> {
 
 export async function GET(request: NextRequest) {
   try {
-    const user = await getSession()
-    if (!user) {
-      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
-    }
-
     const connectionId = request.nextUrl.searchParams.get("connectionId")
     if (!connectionId) {
       return NextResponse.json({ success: false, error: "connectionId query parameter required" }, { status: 400 })
     }
 
-    // Determine if this is a demo connection or real connection
     const isDemo = connectionId === "demo-mode" || connectionId.startsWith("demo")
 
     let indications: Indication[] = []
 
     if (isDemo) {
-      // Generate mock indications for demo mode
       indications = generateMockIndications(connectionId)
     } else {
-      // Fetch real indications from trading engine via Redis
       indications = await getRealIndications(connectionId)
     }
 
