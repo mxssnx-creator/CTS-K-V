@@ -195,7 +195,7 @@ export async function POST(request: NextRequest) {
 
     // Log order creation for audit
     await auditLogger.log({
-      user_id: String(user.id),
+      user_id: "system",
       action: "order_create",
       entity_type: "order",
       entity_id: newOrder.id,
@@ -211,7 +211,7 @@ export async function POST(request: NextRequest) {
     })
 
     console.log(
-      `[v0] [Audit] Order created by ${user.id}: ${symbol} ${side} ${quantity}@${price || "market"}`
+      `[v0] [Audit] Order created: ${symbol} ${side} ${quantity}@${price || "market"}`
     )
 
     existing.push(newOrder)

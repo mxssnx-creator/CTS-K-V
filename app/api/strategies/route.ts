@@ -17,11 +17,6 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const user = await getSession()
-    if (!user) {
-      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
-    }
-
     const { name, description, strategy_type, parameters } = await request.json()
 
     if (!name || !strategy_type) {
@@ -31,7 +26,7 @@ export async function POST(request: NextRequest) {
     const existing = (await getSettings("strategies")) || []
     const newStrategy = {
       id: `strategy:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`,
-      user_id: user.id,
+      user_id: "system",
       name,
       description: description || null,
       strategy_type,

@@ -126,12 +126,6 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
  */
 export async function DELETE(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
-    // Allow development/testing access without auth
-    const user = process.env.NODE_ENV === "development" ? { id: 1, username: "dev" } : await getSession()
-    if (!user) {
-      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
-    }
-
     const { id: positionId } = await params
     const { searchParams } = new URL(request.url)
     const connectionId = searchParams.get("connection_id")

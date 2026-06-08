@@ -104,15 +104,15 @@ function pickFirstNumber(v: unknown, fallback = 0): number {
  */
 async function getRealPresets(connectionId: string): Promise<PresetTemplate[]> {
   try {
-    const rows = await query("SELECT * FROM presets")
+    // No SQL DB — fall through to mock presets
+    const rows: any[] = []
 
     if (!rows || rows.length === 0) {
       return []
     }
 
-    // Active strategies for this connection — used to compute *real* per-preset
-    // stats (win_rate, avg profit factor, success_count).
-    const activeStrategies = (await getActiveStrategies(connectionId).catch(() => [])) as any[]
+    // Active strategies for this connection — used to compute *real* per-preset stats.
+    const activeStrategies: any[] = []
 
     const byPreset = new Map<string, any[]>()
     for (const s of activeStrategies) {
