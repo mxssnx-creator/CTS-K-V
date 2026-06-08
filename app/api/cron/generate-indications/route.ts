@@ -21,6 +21,7 @@ import { NextResponse } from "next/server"
 import { isTruthyFlag, isConnectionInActivePanel } from "@/lib/connection-state-utils"
 import { StrategyCoordinator } from "@/lib/strategy-coordinator"
 import { fetchTopSymbols } from "@/lib/top-symbols"
+import { RealtimeProcessor } from "@/lib/trade-engine/realtime-processor"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -475,6 +476,30 @@ export async function GET() {
           totalMain += r.main
           totalReal += r.real
         }
+      }
+    }
+
+    // ── PSEUDO-POSITION SL/TP + MAX-HOLD AUTO-CLOSE SWEEP ──────────────────
+    // The RealtimeProcessor.processRealtimeUpdates() method is the ONLY path
+    // that checks pseudo-position SL/TP levels and force-closes positions that
+    // have crossed their threshold. In this deployment the engine-manager's
+    // in-process 200ms timer does NOT run (serverless environment), so without
+    // this call SL/TP can NEVER fire — positions accumulate open forever.
+    //
+    // We run one sweep per active connection per cron tick. The sweep is
+    // O(N) in active positions (all price reads are pipelined, single RTT)
+    // and bounded by the number of unique symbols. No lock is needed because
+    // processRealtimeUpdates already has per-position in-flight dedup.
+    //
+    // This is fire-and-forget per the "realtime continuity" principle: a
+    // failed sweep on one connection should not abort cron progress for others.
+    for (const connection of activeConnections) {
+      try {
+        const proc = new RealtimeProcessor(connection.id)
+        await proc.processRealtimeUpdates()
+      } catch (rtErr) {
+        // Non-fatal — SL/TP sweep failure should never abort indication generation.
+        console.warn(`[v0] [Cron] RealtimeProcessor sweep failed for ${connection.id}:`, rtErr instanceof Error ? rtErr.message : String(rtErr))
       }
     }
 
