@@ -287,18 +287,12 @@ export class RealtimeProcessor {
       // racing against a tick), it will fall back to a fresh fetch
       // exactly once for that pair.
 
-      // Process positions with bounded concurrency — uncapped Promise.all on
-      // hundreds of open positions causes a simultaneous closePosition /
-      // recordTrade flood that saturates the event loop and can OOM the process.
-      // Cap at 8 in-flight operations per symbol per cycle.
-      const RT_POSITION_CONCURRENCY = 8
-      for (let pi = 0; pi < positions.length; pi += RT_POSITION_CONCURRENCY) {
-        await Promise.all(
-          positions
-            .slice(pi, pi + RT_POSITION_CONCURRENCY)
-            .map((position) => this.processPosition(position, prehistoricReady)),
-        )
-      }
+      // Process all positions for this symbol in parallel. Each call
+      // carries the position hash through so the manager skips a second
+      // HGETALL.
+      await Promise.all(
+        positions.map((position) => this.processPosition(position, prehistoricReady)),
+      )
 
       // Surface the per-symbol pseudo-update counters so the dashboard
       // can verify Phase 2 is firing inside each shared-pipeline cycle.

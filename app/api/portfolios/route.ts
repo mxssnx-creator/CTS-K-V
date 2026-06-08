@@ -1,13 +1,20 @@
 import { type NextRequest, NextResponse } from "next/server"
+import { getSession } from "@/lib/auth"
 import { getSettings, setSettings } from "@/lib/redis-db"
 
 export async function GET(request: NextRequest) {
   try {
+    const user = await getSession()
+    if (!user) {
+      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
+    }
+
     const allPortfolios = (await getSettings("portfolios")) || []
+    const userPortfolios = allPortfolios.filter((p: any) => p.user_id === user.id)
 
     return NextResponse.json({
       success: true,
-      data: allPortfolios,
+      data: userPortfolios,
     })
   } catch (error) {
     console.error("[v0] Get portfolios error:", error)
@@ -17,6 +24,11 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
+    const user = await getSession()
+    if (!user) {
+      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
+    }
+
     const { name, description, initial_value } = await request.json()
 
     if (!name) {
@@ -26,7 +38,7 @@ export async function POST(request: NextRequest) {
     const existing = (await getSettings("portfolios")) || []
     const newPortfolio = {
       id: `portfolio:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`,
-      user_id: "system",
+      user_id: user.id,
       name,
       description: description || null,
       initial_value: initial_value || 0,

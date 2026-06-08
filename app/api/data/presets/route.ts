@@ -1,4 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
+import { getSession } from "@/lib/auth"
+import { query } from "@/lib/db"
+import { getActiveStrategies } from "@/lib/db-helpers"
 
 interface PresetTemplate {
   id: string
@@ -96,12 +99,15 @@ function pickFirstNumber(v: unknown, fallback = 0): number {
 }
 
 /**
- * Real-mode preset loader: returns curated preset templates.
- * The SQL preset table no longer exists — engine uses Redis-native storage.
+ * Real-mode preset loader: reads the shared preset *templates* from the DB shim
+ * (Redis-backed) and enriches each one with per-connection stats derived from
+ * that connection's active strategies. We do NOT fabricate numbers — if the
+ * trading engine has not produced any strategies for this connection + preset
+ * yet, the stats are zeroed and `enabled` reflects the preset's is_active flag.
  */
 async function getRealPresets(connectionId: string): Promise<PresetTemplate[]> {
   try {
-    const rows: any[] = [] // SQL preset table removed — engine uses Redis
+    const rows = await query("SELECT * FROM presets")
 
     if (!rows || rows.length === 0) {
       return []
@@ -109,7 +115,7 @@ async function getRealPresets(connectionId: string): Promise<PresetTemplate[]> {
 
     // Active strategies for this connection — used to compute *real* per-preset
     // stats (win_rate, avg profit factor, success_count).
-    const activeStrategies = [] as any[]
+    const activeStrategies = (await getActiveStrategies(connectionId).catch(() => [])) as any[]
 
     const byPreset = new Map<string, any[]>()
     for (const s of activeStrategies) {
@@ -176,6 +182,11 @@ async function getRealPresets(connectionId: string): Promise<PresetTemplate[]> {
 
 export async function GET(request: NextRequest) {
   try {
+    const user = await getSession()
+    if (!user) {
+      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
+    }
+
     const connectionId = request.nextUrl.searchParams.get("connectionId")
     if (!connectionId) {
       return NextResponse.json(

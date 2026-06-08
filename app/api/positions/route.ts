@@ -1,4 +1,5 @@
 import { type NextRequest, NextResponse } from "next/server"
+import { getSession } from "@/lib/auth"
 import { getRedisClient, initRedis } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 
@@ -11,17 +12,22 @@ export const dynamic = "force-dynamic"
 export async function GET(request: NextRequest) {
   const startTime = Date.now()
   try {
+    // Allow development/testing access without auth
+    const user = process.env.NODE_ENV === "development" ? { id: 1, username: "dev" } : await getSession()
+    if (!user) {
+      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
+    }
+
     await initRedis()
     const { searchParams } = new URL(request.url)
-    // Accept both snake_case (connection_id) and camelCase (connectionId) for compatibility
-    const connectionId = searchParams.get("connection_id") || searchParams.get("connectionId")
+    const connectionId = searchParams.get("connection_id")
     const status = searchParams.get("status") || "all"
     const symbol = searchParams.get("symbol")
     const limit = Math.min(parseInt(searchParams.get("limit") || "100"), 1000)
     const offset = parseInt(searchParams.get("offset") || "0")
 
     if (!connectionId) {
-      return NextResponse.json({ success: false, error: "connection_id or connectionId required" }, { status: 400 })
+      return NextResponse.json({ success: false, error: "connection_id required" }, { status: 400 })
     }
 
     const client = getRedisClient()
@@ -106,12 +112,17 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const startTime = Date.now()
   try {
+    // Allow development/testing access without auth
+    const user = process.env.NODE_ENV === "development" ? { id: 1, username: "dev" } : await getSession()
+    if (!user) {
+      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
+    }
+
     await initRedis()
     const body = await request.json()
     
     const {
-      connection_id: _connection_id,
-      connectionId: _connectionId,
+      connection_id,
       symbol,
       position_type,
       entry_price,
@@ -123,8 +134,6 @@ export async function POST(request: NextRequest) {
       side,
       trade_mode,
     } = body
-    // Accept both snake_case and camelCase
-    const connection_id = _connection_id ?? _connectionId
 
     // Validate required fields
     if (!connection_id || !symbol || !position_type || !entry_price || !quantity) {

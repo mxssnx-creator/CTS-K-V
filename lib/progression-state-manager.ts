@@ -619,15 +619,11 @@ return {
         client.expire(key, 7 * 24 * 60 * 60),
       ]).catch(() => { /* non-critical */ })
 
-      // Log only every 25 trades to avoid flooding during bulk-close events
-      // (e.g. hundreds of open pseudo-positions closing on engine restart).
-      if (newTotalTrades % 25 === 0 && newTotalTrades > 0) {
-        console.log(
-          `[v0] [Progression] Trades milestone ${newTotalTrades}: ` +
-            `${newSuccessfulTrades} wins (${tradeSuccessRate.toFixed(1)}%) | ` +
-            `last profit ${profit.toFixed(2)}`,
-        )
-      }
+      console.log(
+        `[v0] [Progression] Trade recorded: ${successful ? "✓ Win" : "✗ Loss"} | ` +
+          `Profit: ${profit.toFixed(2)} | Trades: ${newSuccessfulTrades}/${newTotalTrades} | ` +
+          `Success Rate: ${tradeSuccessRate.toFixed(1)}%`,
+      )
     } catch (error) {
       console.error(`[v0] Failed to record trade for ${connectionId}:`, error)
     }
@@ -1064,19 +1060,11 @@ return {
           const sessionNumber = parseInt(existing.session_number || "1", 10)
           const epoch = Number(existing.epoch) || now
 
-          // Light attach: update activity timestamps, keep the same unique session/epoch.
-          // Reset trade counters so a bulk position-close on re-entry (e.g. all open pseudo
-          // positions closing on restart) does not produce a misleadingly high success_rate
-          // (old successful_trades from the prior run remains in the hash while
-          // total_trades would start near zero, giving >100% success rate).
+          // Light attach: update activity timestamps, keep the same unique session/epoch
           await client.hset(key, {
             last_update: nowIso,
             last_visited: nowIso,
             engine_started: "true",
-            total_trades: "0",
-            successful_trades: "0",
-            total_profit: "0",
-            trade_success_rate: "0",
           }).catch(() => {})
 
           await client.expire(key, 7 * 24 * 60 * 60).catch(() => {})

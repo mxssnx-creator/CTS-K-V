@@ -382,11 +382,8 @@ export class StrategyCoordinator {
     // Live Sets default is now per-exchange (see setExchangeMaxLive).
     // This is a placeholder; the real value is set during init.
     maxLiveSets: 500,
-    // Safety ceiling: prevents unbounded Real Set allocation that OOM-kills the
-    // server on 8GB machines (observed: 2400+ sets × concurrent symbols → SIGKILL).
-    // Operator can override via app_settings.maxRealSets; coordinator applies
-    // min(operatorValue, REAL_SETS_SAFETY_CEILING) at eval time (line ~2345).
-    maxRealSets: 12000,
+    // Strategies (Real Sets) are now unlimited by default — no hard cap.
+    maxRealSets: Infinity,
     pruneStrategy: "hybrid",
   }
 
@@ -689,7 +686,7 @@ export class StrategyCoordinator {
     },
     real: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default ������������� operator-tunable
+      minProfitFactor: 1.0,   // spec default ����������� operator-tunable
       confidence: 0.65,       // advisory only
       description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
@@ -2345,12 +2342,7 @@ export class StrategyCoordinator {
     // above any realistic per-symbol Set count so normal multi-symbol runs
     // are unaffected — it exists purely to keep the process from being killed.
     const REAL_SETS_SAFETY_CEILING = 12000
-    // Use Math.min to hard-enforce the ceiling even when the operator has set
-    // maxRealSets explicitly — Infinity default no longer bypasses this guard.
-    const realSetsCap = Math.min(
-      Number.isFinite(this.config.maxRealSets ?? NaN) ? (this.config.maxRealSets as number) : REAL_SETS_SAFETY_CEILING,
-      REAL_SETS_SAFETY_CEILING
-    )
+    const realSetsCap = this.config.maxRealSets ?? REAL_SETS_SAFETY_CEILING
     const realSets = realPostHedge.slice(0, realSetsCap)
     if (realPostHedge.length > realSetsCap) {
       console.warn(

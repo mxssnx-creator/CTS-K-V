@@ -58,29 +58,19 @@ const initialFilters: AdvancedFiltersInd = {
 }
 
 export default function IndicationsPage() {
-  const { selectedConnectionId, activeConnections } = useExchange()
+  const { selectedConnectionId } = useExchange()
   const [indications, setIndications] = useState<Indication[]>([])
   const [isDemo, setIsDemo] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
   const [filters, setFilters] = useState<AdvancedFiltersInd>(initialFilters)
 
-  // Resolve the connection to use — wait for the context to hydrate before falling
-  // back to the first active connection. Never fall back to "demo-mode" so we don't
-  // show stale demo data while the real connection is loading.
-  const resolvedConnectionId =
-    selectedConnectionId ||
-    activeConnections?.[0]?.id ||
-    null
-
   // Load indications on mount and when connection changes
   useEffect(() => {
-    // Wait until we have a real connection ID — avoids a demo-mode fetch on cold mount
-    if (!resolvedConnectionId) return
-
     const loadIndications = async () => {
       setIsLoading(true)
       try {
-        const connectionToUse = resolvedConnectionId
+        // Determine which connection to use (fallback to demo if none selected)
+        const connectionToUse = selectedConnectionId || "demo-mode"
 
         const response = await fetch(`/api/data/indications?connectionId=${encodeURIComponent(connectionToUse)}`)
         if (!response.ok) {
