@@ -1771,6 +1771,17 @@ export async function executeLivePosition(
     // `processSimulatedPositions` sweep walking Redis market_data
     // and force-closing on SL/TP cross or max-hold-time expiry.
     if (!isLiveTradeEnabled) {
+      // Simulation dedup: same one-position-per-direction-per-symbol rule as
+      // the live dedup lock. Without this check a new simulated position was
+      // being created on every realtime cycle (~1 s), producing hundreds of
+      // open pseudo-positions that were never closed.
+      const existingSim = await findOpenLivePositionByDir(
+        connectionId,
+        realPosition.symbol,
+        realPosition.direction,
+      )
+      if (existingSim) return existingSim
+
       // Fetch the current market price so simulated positions open at a
       // real price (not 0). This mirrors the live path's Step 2 but runs
       // here before the simulation early-return so SL/TP cross-checks and
@@ -3575,7 +3586,7 @@ async function checkAndForceCloseOnSltpCross(
  *   (d) drop bucket from net targets         → close all in bucket
  *
  * Reconciliation reuses the existing `closeLivePosition` and
- * `executeLivePosition` paths — no new exchange-call surface.
+ * `executeLivePosition` paths ��� no new exchange-call surface.
  */
 
 /**
