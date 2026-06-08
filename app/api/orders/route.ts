@@ -1,5 +1,4 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { getSession } from "@/lib/auth"
 import { getSettings, setSettings } from "@/lib/redis-db"
 import { auditLogger } from "@/lib/audit-logger"
 import { apiErrorHandler, ApiError } from "@/lib/api-error-handler"
@@ -162,7 +161,7 @@ export async function POST(request: NextRequest) {
     // Order validation
     const validation = validateOrder({ quantity, price, order_type, side })
     if (!validation.valid) {
-      console.warn(`Order validation failed for user ${user.id}: ${validation.error}`)
+      console.warn(`Order validation failed: ${validation.error}`)
       return NextResponse.json(
         { success: false, error: validation.error, category: API_CATEGORY },
         { status: 400 }
@@ -180,7 +179,7 @@ export async function POST(request: NextRequest) {
     const existing = (await getSettings("orders")) || []
     const newOrder = {
       id: `order:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`,
-      user_id: String(user.id),
+      user_id: "system",
       connection_id,
       symbol: symbol.toUpperCase(),
       order_type: order_type.toLowerCase(),
@@ -196,7 +195,7 @@ export async function POST(request: NextRequest) {
 
     // Log order creation for audit
     await auditLogger.log({
-      user_id: String(user.id),
+      user_id: "system",
       action: "order_create",
       entity_type: "order",
       entity_id: newOrder.id,
@@ -212,7 +211,7 @@ export async function POST(request: NextRequest) {
     })
 
     console.log(
-      `[v0] [Audit] Order created by ${user.id}: ${symbol} ${side} ${quantity}@${price || "market"}`
+      `[v0] [Audit] Order created: ${symbol} ${side} ${quantity}@${price || "market"}`
     )
 
     existing.push(newOrder)

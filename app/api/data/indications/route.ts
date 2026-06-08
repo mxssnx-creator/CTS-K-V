@@ -86,7 +86,9 @@ async function getRealIndications(connectionId: string): Promise<Indication[]> {
       Promise.all(configKeys.map((k) => client.get(k).catch(() => null))),
       Promise.all(
         configKeys.map((k) =>
-          client.lindex(`${k}:results`, 0).catch(() => null)
+          (client.lrange(`${k}:results`, 0, 0) as Promise<string[]>)
+            .then((arr) => arr?.[0] ?? null)
+            .catch(() => null)
         )
       ),
     ])
