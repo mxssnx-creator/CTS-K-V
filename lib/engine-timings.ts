@@ -134,6 +134,10 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   // the live exchange-positions cadence (~200 ms). Combined with the
   // `liveSyncPauseMs` post-cycle breath this gives ~5 close-path sweeps
   // per second while still letting each sweep finish cleanly.
+  // MUST stay at 200 ms — this is the start-to-start cadence for
+  // syncWithExchange (Loop C). 5 sweeps/sec is required to detect
+  // BingX-filled close orders within one realtime tick.
+  // Raising above 1000 ms risks stale position state and double-close.
   liveSyncIntervalMs:          200,
   liveSyncPauseMs:              50,
   heartbeatIntervalMs:       1_000,
@@ -162,10 +166,11 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
 export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; max: number }> = {
   cronSyncIntervalSeconds:   { min: 5,           max: 60                  },
   // Lower bound 100 ms — anything faster than the exchange's own price
-  // tick is wasted REST calls. Upper bound retained at 60 s for
-  // operators who explicitly want a quiet REST footprint on paper-only
-  // setups.
-  liveSyncIntervalMs:        { min: 100,         max: 60_000              },
+  // tick is wasted REST calls. Upper bound capped at 1000 ms (1 sweep/sec)
+  // — raising above this causes fill/close detection to lag by >1 tick,
+  // producing stale position state and double-close races.
+  // Default 200 ms = 5 sweeps/sec. Do not raise without explicit intent.
+  liveSyncIntervalMs:        { min: 100,         max: 1_000               },
   liveSyncPauseMs:           { min: 10,          max: 200                 },
   heartbeatIntervalMs:       { min: 250,         max: 30_000              },
   strategyFlowMinIntervalMs: { min: 250,         max: 60_000              },

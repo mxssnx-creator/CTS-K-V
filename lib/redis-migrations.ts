@@ -1257,7 +1257,7 @@ const migrations: Migration[] = [
       // getAllConnections() calls initRedis() internally. Since we are already
       // INSIDE initRedis() running migrations, that creates a circular wait that
       // deadlocks the entire server (event loop blocked, all routes timeout).
-      // Use client.keys() directly ����� exactly as migrations 020-024 do.
+      // Use client.keys() directly ������� exactly as migrations 020-024 do.
       const idSet025 = new Set<string>()
       try {
         const connKeys025 = (await client.keys("connection:*")) || []
@@ -1504,6 +1504,13 @@ const migrations: Migration[] = [
       // values that already exist in the hash.
 
       const TIMING_DEFAULTS_027: Record<string, string> = {
+        // Live-sync start-to-start cadence for syncWithExchange (Loop C).
+        // Kept at 200 ms so close/fill detection fires 5 times/sec.
+        // This value must never be raised above 1000 ms — doing so would
+        // allow BingX-filled close orders to remain open in Redis for >1 s,
+        // causing incorrect PnL and double-close attempts.
+        live_sync_interval_ms:           "200",
+        live_sync_pause_ms:              "50",
         live_positions_cycle_pause_ms:   "300",
         realtime_cycle_pause_ms:         "200",
         realtime_interval_ms:            "300",
@@ -1539,6 +1546,92 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "26")
+    },
+  },
+  {
+    name: "028-pin-live-sync-interval-and-min-step",
+    version: 28,
+    up: async (client: any) => {
+      await client.set("_schema_version", "28")
+
+      // ── 1. Pin live_sync_interval_ms = 200 in settings:system ────────────
+      //
+      // Migration v27 omitted `live_sync_interval_ms` from its seed block,
+      // so instances that already ran v27 have no stored value — they fall
+      // back to the DEFAULT_ENGINE_TIMINGS constant (200 ms), which is correct,
+      // but the value is invisible to the settings UI and would revert to
+      // whatever the constant is if the code changes. Pinning it explicitly
+      // at 200 ms:
+      //   • Makes the value visible and auditable in Settings → System → Timings
+      //   • Survives DB flushes
+      //   • Documents the intent: LIVE_SYNC_INTERVAL_MS must stay at 200 ms
+      //     (5 sweeps/sec) so fill/close detection is timely
+      //
+      // IDEMPOTENT: only writes if the key is absent or empty.
+      const sys028 = (await client.hgetall("settings:system").catch(() => null)) as
+        | Record<string, string>
+        | null
+      const haveSys028 = sys028 || {}
+
+      const sysWrites028: Record<string, string> = {}
+      const SYS_PINS_028: Record<string, string> = {
+        live_sync_interval_ms:  "200",   // MUST stay 200 — do not raise
+        live_sync_pause_ms:     "50",
+      }
+      for (const [k, v] of Object.entries(SYS_PINS_028)) {
+        if (!haveSys028[k]) sysWrites028[k] = v
+      }
+      if (Object.keys(sysWrites028).length > 0) {
+        await client.hset("settings:system", sysWrites028)
+      }
+
+      // ── 2. Seed minStep default (5) for all connections ──────────────────
+      //
+      // minStep (range 3-30, default 5) was added to the per-connection
+      // strategy settings in the same session as this migration. Backfill
+      // the default into connection_settings:{id} for every existing
+      // connection so the engine reads the correct floor immediately without
+      // requiring an operator save through the UI.
+      //
+      // Uses client.keys("connection:*") to enumerate connections — same
+      // safe pattern as migrations v23/v26 (no getAllConnections deadlock risk).
+      //
+      // IDEMPOTENT: hgetall + conditional-hset, never clobbers operator values.
+      let connKeys028: string[] = []
+      try {
+        const raw = await client.keys("connection:*")
+        // Filter out sub-keys: only keep bare "connection:{id}" (no extra colons
+        // beyond the first), e.g. "connection:bingx-x01", not
+        // "connection:bingx-x01:settings".
+        connKeys028 = (raw as string[]).filter((k: string) => {
+          const parts = k.split(":")
+          return parts.length === 2
+        })
+      } catch {
+        connKeys028 = []
+      }
+
+      let seeded028 = 0
+      for (const connKey of connKeys028) {
+        const connId = connKey.split(":")[1]
+        const settingsKey = `connection_settings:${connId}`
+        const existing028 = (await client.hgetall(settingsKey).catch(() => null)) as
+          | Record<string, string>
+          | null
+        const have028 = existing028 || {}
+        if (!have028["minStep"]) {
+          await client.hset(settingsKey, { minStep: "5" })
+          seeded028++
+        }
+      }
+
+      console.log(
+        `[v0] Migration 028: pinned live_sync_interval_ms=200 in settings:system; ` +
+        `seeded minStep=5 into ${seeded028}/${connKeys028.length} connection_settings hashes`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "27")
     },
   },
 ]
