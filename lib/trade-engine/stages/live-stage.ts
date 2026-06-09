@@ -842,13 +842,23 @@ async function sweepOrphanProtectionOrders(
     // scoped to the correct position direction (hedge-mode guard above),
     // AND either carries an explicit reduce-only flag (one-way mode) OR has a
     // stop/TP order type (hedge mode where the flag is absent).
-    if (!sameSide(o)) continue
-    if (!matchesPositionSide(o)) continue
-    if (!isReduceOnly(o) && !isProtectionType(o)) continue
-    const id =
-      o?.id ?? o?.orderId ?? o?.orderID ?? o?.clientOrderId ?? o?.client_oid
-    if (id == null || String(id).length === 0) continue
-    const ok = await cancelProtectionOrder(connector, symbol, String(id), "OrphanSweep")
+    const sideOk = sameSide(o)
+    const psOk   = matchesPositionSide(o)
+    const typeOk = isReduceOnly(o) || isProtectionType(o)
+    const ordId  = o?.id ?? o?.orderId ?? o?.orderID ?? o?.clientOrderId ?? o?.client_oid
+    const orderType  = o?.type ?? o?.orderType ?? "?"
+    const orderPs    = o?.positionSide ?? o?.position_side ?? "?"
+    const orderSide  = o?.side ?? o?.orderSide ?? "?"
+    const orderRo    = o?.reduceOnly ?? o?.reduce_only ?? o?.closePosition ?? o?.isReduceOnly ?? false
+    console.log(
+      `${LOG_PREFIX} [sweep-inspect] ${symbol} ordId=${ordId} side=${orderSide} ps=${orderPs} type=${orderType} ro=${orderRo}` +
+      ` | sideOk=${sideOk} psOk=${psOk} typeOk=${typeOk} → ${sideOk && psOk && typeOk ? "CANCEL" : "skip"}`,
+    )
+    if (!sideOk) continue
+    if (!psOk) continue
+    if (!typeOk) continue
+    if (ordId == null || String(ordId).length === 0) continue
+    const ok = await cancelProtectionOrder(connector, symbol, String(ordId), "OrphanSweep")
     if (ok) result.cancelled++
   }
 
@@ -888,10 +898,16 @@ async function cancelProtectionOrder(
     if (
       errStr.includes("not found") ||
       errStr.includes("not exist") ||
+      errStr.includes("order does not exist") ||
       errStr.includes("already") ||
       errStr.includes("filled") ||
       errStr.includes("cancelled") ||
-      errStr.includes("canceled")
+      errStr.includes("canceled") ||
+      // BingX-specific already-gone codes in the error message:
+      //   101400 = "Order not exist" (filled or externally cancelled SL/TP)
+      //   101500 = "Order not found" (expired conditional order)
+      errStr.includes("code=101400") ||
+      errStr.includes("code=101500")
     ) {
       console.log(`${LOG_PREFIX} ${label} already gone: ${orderId} (${res?.error})`)
       return true
@@ -2063,7 +2079,7 @@ export async function executeLivePosition(
       )
     }
 
-    // ── Step 3: Volume calculation ─────────────────────────────────────────
+    // ── Step 3: Volume calculation ──────────────��──────────────────────────
     // POLICY: minimum volume is ALWAYS enforced �� we never reject a live
     // order for "qty too small". If the calculator returns null or a
     // non-positive quantity (e.g. balance fetch failed, NaN math) we
@@ -2879,6 +2895,24 @@ export async function executeLivePosition(
 
     if (livePosition.status === "filled") livePosition.status = "open"
 
+    // ── ENTRY SUMMARY — one log line showing the complete entry state ────────
+    // Operator can grep "[ENTRY]" to see every live position that went through
+    // the full pipeline and understand volume / leverage / protection in context.
+    {
+      const { desiredSl: sumSl, desiredTp: sumTp } = computeDesiredProtectionPrices(livePosition)
+      console.log(
+        `${LOG_PREFIX} [ENTRY] ${realPosition.symbol} ${realPosition.direction?.toUpperCase()} ` +
+        `qty=${livePosition.executedQuantity?.toFixed(6) ?? "?"} ` +
+        `@ ${livePosition.averageExecutionPrice?.toFixed(6) ?? "?"} ` +
+        `notional=$${livePosition.volumeUsd?.toFixed(2) ?? "?"} ` +
+        `lev=${livePosition.leverage ?? "?"}x ` +
+        `orderId=${livePosition.orderId ?? "?"} ` +
+        `SL=${sumSl > 0 ? sumSl.toFixed(6) : "none"} (id=${livePosition.stopLossOrderId ?? "—"}) ` +
+        `TP=${sumTp > 0 ? sumTp.toFixed(6) : "none"} (id=${livePosition.takeProfitOrderId ?? "—"}) ` +
+        `status=${livePosition.status}`
+      )
+    }
+
     await savePosition(livePosition)
 
     // Only count this as a real "position created" when the entry
@@ -3107,13 +3141,26 @@ export async function closeLivePosition(
       const isAlreadyClosedError = (msg: string): boolean => {
         const m = String(msg || "").toLowerCase()
         return (
+          // Generic patterns (all venues)
           m.includes("position not found") ||
           m.includes("no open position") ||
           m.includes("nothing to close") ||
           m.includes("size is zero") ||
           m.includes("already closed") ||
           m.includes("position is zero") ||
-          m.includes("position does not exist")
+          m.includes("position does not exist") ||
+          // BingX-specific already-closed codes/messages:
+          //   101205 = "No position to close" (position was closed by SL/TP)
+          //   101400 = "Order not exist" (also can appear if the position data
+          //            was already purged from the exchange)
+          m.includes("no position to close") ||
+          m.includes("code=101205") ||
+          m.includes("101205") ||
+          // Bybit
+          m.includes("no open position to close") ||
+          // OKX
+          m.includes("position not available") ||
+          m.includes("netting quantity is not correct")
         )
       }
       // Retryable failures are bounded by a sense of "this is a transient
