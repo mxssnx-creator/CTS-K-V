@@ -1073,7 +1073,10 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async cancelOrder(symbol: string, orderId: string): Promise<{ success: boolean; error?: string }> {
     try {
-      // Sync server time before any signed request
+      // Sync server time before any signed request.
+      // The throttle inside syncServerTime (60 s) means concurrent cancel
+      // calls don't pile up on re-sync — the first triggers a real HTTP
+      // call, subsequent ones within the window return immediately.
       await this.syncServerTime()
 
       this.log(`Cancelling order ${orderId} for ${symbol}`)
@@ -1084,26 +1087,47 @@ export class BingXConnector extends BaseExchangeConnector {
       const endpoint = isSpot ? "/openApi/spot/v1/trade/cancel" : "/openApi/swap/v2/trade/order"
       const method = isSpot ? "POST" : "DELETE"
       const bingxSymbol = this.toBingXSymbol(symbol)
+      const baseUrl = this.getBaseUrl()
 
-      const params = {
-        symbol: bingxSymbol,
-        orderId,
-        timestamp: this.getTimestamp(),
+      const buildUrl = () => {
+        const params = { symbol: bingxSymbol, orderId, timestamp: this.getTimestamp() }
+        const { signature, queryString: signedQs } = this.signParams(params)
+        return `${baseUrl}${endpoint}?${signedQs}&signature=${signature}`
       }
 
-      const { signature, queryString: signedQs } = this.signParams(params)
-      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
+      const doRequest = (url: string) =>
+        this.rateLimitedFetch(url, {
+          method,
+          headers: { "X-BX-APIKEY": this.credentials.apiKey },
+        })
 
-      const response = await this.rateLimitedFetch(url, {
-        method,
-        headers: { "X-BX-APIKEY": this.credentials.apiKey },
-      })
+      let response = await doRequest(buildUrl())
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
 
-      const data = await this.safeJson(response)
+      let data = await this.safeJson(response)
+
+      // ── Timestamp-mismatch retry (code 100421 / 109400-timestamp) ──────
+      // The serial stuck-placed loop can span 20-30s; by the time the 3rd+
+      // position calls cancelOrder the cached offset may have drifted just
+      // past BingX's ±1000ms window and produces code 100421.  Re-sync once
+      // and retry — same pattern as getBalance.
+      if (!this.isBingXSuccess(data.code)) {
+        const isTimestampErr =
+          String(data.code) === "100421" ||
+          (String(data.code) === "109400" &&
+            String(data.msg ?? "").toLowerCase().includes("timestamp"))
+        if (isTimestampErr) {
+          this.lastTimeSync = 0
+          this.syncPromise = null
+          await this.syncServerTime()
+          const retryResponse = await doRequest(buildUrl())
+          if (!retryResponse.ok) throw new Error(`HTTP ${retryResponse.status}: ${retryResponse.statusText}`)
+          data = await this.safeJson(retryResponse)
+        }
+      }
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)

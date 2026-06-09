@@ -3016,12 +3016,15 @@ export async function closeLivePosition(
             `${LOG_PREFIX} [v0] Attempting exchange close ${position.symbol} ${position.direction} (attempt ${attempt + 1}/${maxRetries})`,
           )
 
-          // Per-attempt hard timeout. Healthy venues return in 100-400 ms;
-          // 2 s leaves headroom for the slow paths but bounds worst-case
-          // wall-clock so the close API and reconcile loops keep moving.
+          // Per-attempt hard timeout.  BingX swap close = getPositions (~800ms)
+          // + market-close order (~800ms) ≈ 1.6s on the Vercel→BingX link.
+          // The previous 2s left almost no margin and caused consistent
+          // timeouts under any load.  8s is still a firm bound that keeps the
+          // loop moving while tolerating one round of network jitter or a
+          // single timestamp-retry re-sync inside cancelOrder.
           const closePromise = exchangeConnector.closePosition(position.symbol, position.direction)
           const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error("Exchange close timeout after 2s")), 2000),
+            setTimeout(() => reject(new Error("Exchange close timeout after 8s")), 8000),
           )
           const r = (await Promise.race([closePromise, timeoutPromise])) as
             | { success?: boolean; error?: string }
@@ -4752,6 +4755,11 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // calling getOrder() per leg. `null` ⇒ skip verification this tick.
     const liveOrderIdsSync = await fetchLiveOrderIdSet(exchangeConnector)
 
+    // Positions tagged as stuck-in-placed are collected here and
+    // processed in a parallel batch AFTER the main loop so they don't
+    // block protection-order updates for healthy positions.
+    const stuckPositions: Array<{ position: LivePosition; placedAgeMs: number; STUCK_PLACED_MAX_MS: number }> = []
+
     for (const position of openPositions) {
       try {
         const mapKey = `${normSym(position.symbol)}|${position.direction}`
@@ -4933,58 +4941,16 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
         //     executedQty>0 + status≠placed)
         // Cancel the dangling entry order after STUCK_PLACED_MAX_MS and
         // mark the position rejected so it leaves the open index.
+        // ── Stuck-in-placed: tag candidate, process in parallel batch below ──
+        // Only TAG here and `continue`. The actual cancel+close runs in a
+        // Promise.allSettled batch after the for loop so that N stuck
+        // positions don't serialize for EXCHANGE_TIMEOUT_CANCEL_ORDER_MS × N
+        // and block protection-order updates for all healthy positions.
         if (position.status === "placed" && (position.executedQuantity ?? 0) === 0) {
           const STUCK_PLACED_MAX_MS = 5 * 60_000 // 5 minutes
           const placedAgeMs = Date.now() - (position.createdAt || position.updatedAt || Date.now())
           if (placedAgeMs > STUCK_PLACED_MAX_MS) {
-            console.warn(
-              `${LOG_PREFIX} [stuck-placed] ${position.symbol} (id=${position.id}) has been 'placed' for ${Math.round(placedAgeMs / 1000)}s — cancelling entry order and rejecting position`,
-            )
-            await logProgressionEvent(
-              connectionId,
-              "live_trading",
-              "warning",
-              `Entry order stuck in 'placed' state for ${position.symbol} — cancelling`,
-              {
-                positionId: position.id,
-                orderId: position.orderId,
-                placedAgeMs,
-                stuckLimitMs: STUCK_PLACED_MAX_MS,
-              },
-            )
-            // Best-effort cancel of the entry order (bounded timeout).
-            if (position.orderId && exchangeConnector?.cancelOrder) {
-              try {
-                await withTimeout(
-                  exchangeConnector.cancelOrder(position.symbol, position.orderId) as Promise<any>,
-                  EXCHANGE_TIMEOUT_CANCEL_ORDER_MS,
-                  `stuck-placed cancelOrder(${position.symbol} ${position.orderId})`,
-                )
-              } catch (cancelErr) {
-                console.warn(
-                  `${LOG_PREFIX} [stuck-placed] cancel entry order failed for ${position.id}:`,
-                  cancelErr instanceof Error ? cancelErr.message : String(cancelErr),
-                )
-              }
-            }
-            // Mark position rejected and remove from open index. We use
-            // closeLivePosition with exitPrice=entryPrice so the existing
-            // terminal-state pipeline handles archive/lock/metrics — same
-            // path as every other close branch.
-            try {
-              await closeLivePosition(
-                connectionId,
-                position.id,
-                position.entryPrice || 0,
-                exchangeConnector,
-                "stuck_in_placed",
-              )
-            } catch (closeErr) {
-              console.warn(
-                `${LOG_PREFIX} [stuck-placed] closeLivePosition failed for ${position.id}:`,
-                closeErr instanceof Error ? closeErr.message : String(closeErr),
-              )
-            }
+            stuckPositions.push({ position, placedAgeMs, STUCK_PLACED_MAX_MS })
             continue
           }
         }
@@ -5080,6 +5046,64 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
     // appears but [sync-done] does not for the same tick, something
     // mid-loop is rejecting before the closing brace — which used to be
     // invisible.
+    // ── Parallel stuck-placed cleanup ────────────────────────────────
+    // Run all cancel+close operations concurrently so 6+ stuck positions
+    // complete in ~one RTT window instead of EXCHANGE_TIMEOUT_CANCEL_ORDER_MS × N.
+    if (stuckPositions.length > 0) {
+      console.warn(
+        `${LOG_PREFIX} [stuck-placed] Processing ${stuckPositions.length} stuck-in-placed position(s) in parallel`,
+      )
+      await Promise.allSettled(
+        stuckPositions.map(async ({ position, placedAgeMs, STUCK_PLACED_MAX_MS }) => {
+          console.warn(
+            `${LOG_PREFIX} [stuck-placed] ${position.symbol} (id=${position.id}) has been 'placed' for ${Math.round(placedAgeMs / 1000)}s — cancelling entry order and rejecting position`,
+          )
+          await logProgressionEvent(
+            connectionId,
+            "live_trading",
+            "warning",
+            `Entry order stuck in 'placed' state for ${position.symbol} — cancelling`,
+            {
+              positionId: position.id,
+              orderId: position.orderId,
+              placedAgeMs,
+              stuckLimitMs: STUCK_PLACED_MAX_MS,
+            },
+          )
+          // Best-effort cancel of the entry order (bounded timeout).
+          if (position.orderId && exchangeConnector?.cancelOrder) {
+            try {
+              await withTimeout(
+                exchangeConnector.cancelOrder(position.symbol, position.orderId) as Promise<any>,
+                EXCHANGE_TIMEOUT_CANCEL_ORDER_MS,
+                `stuck-placed cancelOrder(${position.symbol} ${position.orderId})`,
+              )
+            } catch (cancelErr) {
+              console.warn(
+                `${LOG_PREFIX} [stuck-placed] cancel entry order failed for ${position.id}:`,
+                cancelErr instanceof Error ? cancelErr.message : String(cancelErr),
+              )
+            }
+          }
+          // Mark position rejected and remove from open index.
+          try {
+            await closeLivePosition(
+              connectionId,
+              position.id,
+              position.entryPrice || 0,
+              exchangeConnector,
+              "stuck_in_placed",
+            )
+          } catch (closeErr) {
+            console.warn(
+              `${LOG_PREFIX} [stuck-placed] closeLivePosition failed for ${position.id}:`,
+              closeErr instanceof Error ? closeErr.message : String(closeErr),
+            )
+          }
+        }),
+      )
+    }
+
     const syncMs = Date.now() - syncStartMs
     console.log(
       `${LOG_PREFIX} [sync-done] conn=${connectionId} took=${syncMs}ms processed=${openPositions.length} adopted=${adoptedCount}`,
