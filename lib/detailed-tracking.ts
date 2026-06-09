@@ -489,8 +489,9 @@ export async function getStrategyTracking(
   // ratios are stable instead of oscillating with per-cycle snapshots:
   //   strategies_{stage}_total      = Sets the stage OUTPUT (promoted)
   //   strategies_{stage}_evaluated  = Sets that ENTERED the stage (input)
-  // base = 100% entry point; main = Main output / Main input (Base→Main
-  // survival); real = Real output / Real input (Main→Real survival).
+  // base = 100% (pipeline entry; every Base set that exists passed by definition)
+  // main = Main output / Main input (Base→Main survival; expected ~1%)
+  // real = Real output / Real input (Main→Real survival)
   // Each clamped to [0,100].
   const baseOutput    = Number(prog.strategies_base_total     || "0")
   const baseInput     = Number(prog.strategies_base_evaluated  || "0")
@@ -500,15 +501,13 @@ export async function getStrategyTracking(
   const realInput     = Number(prog.strategies_real_evaluated  || "0")
   const pct = (num: number, den: number): number =>
     den > 0 ? Math.max(0, Math.min(100, Number(((num / den) * 100).toFixed(1)))) : 0
-  // base  = mainInput / baseOutput  — what % of base sets were promoted into
-  //         Main evaluation. Expected ~1%: only the top-PF sets per symbol
-  //         cycle advance; the vast majority of created base sets do not.
+  // base  = 100% when Base sets exist (pipeline entry → always pass).
   // main  = mainOutput / mainInput  — survival through the Main PF filter.
   // real  = realOutput / realInput  — survival through the Real strict filter.
   const stageEvalPercent = {
-    base: pct(mainInput, baseOutput),   // % of base sets promoted into Main
-    main: pct(mainOutput, mainInput),   // % of Main-entered sets that passed
-    real: pct(realOutput, realInput),   // % of Real-entered sets that passed
+    base: baseOutput > 0 ? 100 : 0,          // Base is the entry point: 100% when any exist
+    main: pct(mainOutput, mainInput),        // % of Main-entered sets that passed
+    real: pct(realOutput, realInput),        // % of Real-entered sets that passed
   }
 
   return {

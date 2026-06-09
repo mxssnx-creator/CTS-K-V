@@ -1702,7 +1702,7 @@ export async function GET(
     // history table without round-tripping to the exchange.
     const tradeHistory = closedPositionsForHistory.slice(0, 500)
 
-    // ── PERFORMANCE TIERS ��─────────────────────────────────────────────────────
+    // ── PERFORMANCE TIERS ���─────────────────────────────────────────────────────
     // Per-stage (base / main / real / live) performance summary derived from
     // strategy_detail hashes (base/main/real from cross-symbol aggregation,
     // live from closed-archive realised P&L). Each tier holds the fields the
@@ -1852,8 +1852,8 @@ export async function GET(
     // endpoint exposes the same values without a second full Redis round-trip.
     //   strategies_{stage}_total     = Sets the stage OUTPUT (promoted)
     //   strategies_{stage}_evaluated = Sets that ENTERED the stage (input)
-    // base = 100% (pipeline entry; every emitted Set passed by definition)
-    // main = Main output / Main input  (Base→Main filter survival)
+    // base = 100% (pipeline entry; every Base set that exists passed by definition)
+    // main = Main output / Main input  (Base→Main filter survival; expected ~1%)
     // real = Real output / Real input  (Main→Real filter survival)
     const _pct = (num: number, den: number): number =>
       den > 0 ? Math.max(0, Math.min(100, Number(((num / den) * 100).toFixed(1)))) : 0
@@ -1862,15 +1862,13 @@ export async function GET(
     const _mainInput  = Number(progHash.strategies_main_evaluated || "0")
     const _realOutput = Number(progHash.strategies_real_total     || "0")
     const _realInput  = Number(progHash.strategies_real_evaluated || "0")
-    // base  = mainInput / baseOutput  — what % of base sets were promoted into
-    //         Main evaluation. Expected ~1%: only the top-PF sets per symbol
-    //         cycle advance; the vast majority of created base sets do not.
+    // base  = 100% when Base sets exist (pipeline entry → always pass).
     // main  = mainOutput / mainInput  — survival through the Main PF filter.
     // real  = realOutput / realInput  — survival through the Real strict filter.
     const stageEvalPercent = {
-      base: _pct(_mainInput, _baseOutput),   // % of base sets promoted into Main
-      main: _pct(_mainOutput, _mainInput),   // % of Main-entered sets that passed
-      real: _pct(_realOutput, _realInput),   // % of Real-entered sets that passed
+      base: _baseOutput > 0 ? 100 : 0,      // Base is the entry point: 100% when any exist
+      main: _pct(_mainOutput, _mainInput),  // % of Main-entered sets that passed
+      real: _pct(_realOutput, _realInput),  // % of Real-entered sets that passed
     }
 
     // ── REAL AVERAGES ────────────────────────────────────────────────────────
@@ -2348,7 +2346,7 @@ export async function GET(
       // pipeline (see lib/trade-engine/stages/live-stage.ts). Every stage of
       // the pipeline increments one of these so the UI can show a real-time
       // picture of exchange-level activity.
-      // ── OPEN POSITIONS & ACCUMULATED VOLUME ───────��─────────────────────
+      // ── OPEN POSITIONS & ACCUMULATED VOLUME ───────���─────────────────────
       // Snapshot of every "currently holding exposure" layer of the
       // mirroring pipeline. CRITICAL semantics — pseudo/real/live are
       // NOT independent pools: they represent the SAME trading signal

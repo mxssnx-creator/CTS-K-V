@@ -846,14 +846,6 @@ async function sweepOrphanProtectionOrders(
     const psOk   = matchesPositionSide(o)
     const typeOk = isReduceOnly(o) || isProtectionType(o)
     const ordId  = o?.id ?? o?.orderId ?? o?.orderID ?? o?.clientOrderId ?? o?.client_oid
-    const orderType  = o?.type ?? o?.orderType ?? "?"
-    const orderPs    = o?.positionSide ?? o?.position_side ?? "?"
-    const orderSide  = o?.side ?? o?.orderSide ?? "?"
-    const orderRo    = o?.reduceOnly ?? o?.reduce_only ?? o?.closePosition ?? o?.isReduceOnly ?? false
-    console.log(
-      `${LOG_PREFIX} [sweep-inspect] ${symbol} ordId=${ordId} side=${orderSide} ps=${orderPs} type=${orderType} ro=${orderRo}` +
-      ` | sideOk=${sideOk} psOk=${psOk} typeOk=${typeOk} → ${sideOk && psOk && typeOk ? "CANCEL" : "skip"}`,
-    )
     if (!sideOk) continue
     if (!psOk) continue
     if (!typeOk) continue
@@ -1737,7 +1729,7 @@ export async function executeLivePosition(
   }
 
   try {
-    // ── Step 1: Pre-flight validation ──────────────������──────────────────────
+    // ── Step 1: Pre-flight validation ──────────────�������──────────────────────
     if (!realPosition.direction || !realPosition.symbol) {
       livePosition.status = "rejected"
       livePosition.statusReason = `Invalid inputs: symbol=${realPosition.symbol}, direction=${realPosition.direction}`
@@ -3130,7 +3122,7 @@ export async function updateLivePositionFill(
  *      we still mark the Redis record closed so reconcile picks it up
  *      next pass — better than leaking the lock).
  *   3. Compute realized PnL + margin-based ROI (matches exchange ROE).
- *   4. Persist via savePosition() — that helper already handles the
+ *   4. Persist via savePosition() �� that helper already handles the
  *      open-index → closed-archive move idempotently. We do NOT touch
  *      Redis directly any more (which previously left the position in
  *      the open index forever on manual close).
