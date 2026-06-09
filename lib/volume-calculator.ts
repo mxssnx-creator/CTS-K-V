@@ -65,12 +65,16 @@ interface VolumeCalculationResult {
 
 export class VolumeCalculator {
   /**
-   * Universal hard floor: $3 notional covers BingX/Binance/Bybit/OKX minimums
+   * Universal hard floor: $5 notional covers BingX/Binance/Bybit/OKX minimums
    * while remaining conservative for margin constraints. The 101400 auto-correction
    * handler persists exact per-pair minimums to `settings:trading_pair:{symbol}`,
    * so this floor is mainly the safety net for first-time pairs.
+   *
+   * BingX perpetual minimum maintenance margin per position is approximately $5
+   * notional at 10x leverage → $0.50 margin. At $3 notional BingX returns
+   * code=101204 (Insufficient margin) on pairs like XRP, SOL, BNB.
    */
-  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 3
+  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 5
 
   /**
    * Fetch account balance and compute the leverage safety cap.

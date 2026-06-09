@@ -1737,7 +1737,7 @@ export async function executeLivePosition(
   }
 
   try {
-    // ── Step 1: Pre-flight validation ───────────────��──────────────────────
+    // ── Step 1: Pre-flight validation ──────────────����──────────────────────
     if (!realPosition.direction || !realPosition.symbol) {
       livePosition.status = "rejected"
       livePosition.statusReason = `Invalid inputs: symbol=${realPosition.symbol}, direction=${realPosition.direction}`
@@ -2387,8 +2387,72 @@ export async function executeLivePosition(
           console.log(
             `${LOG_PREFIX} Entry succeeded after leverage reduction to ${reducedLev}x for ${realPosition.symbol}`,
           )
+        } else if (isNonRecoverableExchangeError(retryResult)) {
+          // Both the original and the halved-leverage attempt failed with
+          // 101204. Try one last time at leverage=1 with the bare exchange
+          // minimum quantity (lowest possible margin requirement).
+          //   margin = (minQty × price) / 1 = minQty × price ≥ $5
+          // If this also fails the account truly cannot support even the
+          // smallest possible position; record the margin error and cool down.
+          const minQtyForSymbol = currentPrice > 0 ? 5 / currentPrice : 0
+          if (minQtyForSymbol > 0 && minQtyForSymbol !== computedVolume) {
+            console.warn(
+              `${LOG_PREFIX} 101204 at ${reducedLev}x still fails on ${realPosition.symbol} — ` +
+              `trying lev=1 with min notional qty=${minQtyForSymbol.toFixed(8)}`,
+            )
+            try {
+              if (typeof exchangeConnector.setLeverage === "function") {
+                await exchangeConnector.setLeverage(realPosition.symbol, 1)
+              }
+            } catch { /* non-critical */ }
+            placeAttempt += 1
+            const minResult: any = await withLiveOrderLogging(
+              orderTrace,
+              {
+                quantity: minQtyForSymbol,
+                price: currentPrice,
+                leverage: 1,
+                marginType: livePosition.marginType ?? "unknown",
+                orderType: "market",
+                options: { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+                strategySetKey: livePosition.setKey,
+                realPositionId: realPosition.id,
+                attempt: placeAttempt,
+                label: "min-notional-lev1",
+              },
+              async () => {
+                const r = await exchangeConnector.placeOrder(
+                  realPosition.symbol,
+                  exchangeSide,
+                  minQtyForSymbol,
+                  undefined,
+                  "market",
+                  { positionSide: realPosition.direction === "long" ? "LONG" : "SHORT" },
+                )
+                return r
+              },
+            ).then(({ raw }) => raw).catch(() => null)
+            if (minResult?.success && (minResult.orderId || minResult.id)) {
+              livePosition.leverage = 1
+              computedVolume = minQtyForSymbol
+              orderResult = minResult
+              console.log(
+                `${LOG_PREFIX} Entry succeeded at lev=1 min-notional for ${realPosition.symbol}`,
+              )
+            } else {
+              console.warn(
+                `${LOG_PREFIX} 101204 at lev=1 min-notional also failed for ${realPosition.symbol} — recording margin error`,
+              )
+              recordMarginError(connectionId)
+              orderResult = minResult ?? retryResult ?? orderResult
+            }
+          } else {
+            // qty would be the same as before — no point retrying.
+            recordMarginError(connectionId)
+            orderResult = retryResult ?? orderResult
+          }
         } else {
-          // Still failing — record margin error and give up.
+          // Non-margin failure after leverage reduction — give up normally.
           recordMarginError(connectionId)
           orderResult = retryResult ?? orderResult
         }
