@@ -818,11 +818,32 @@ async function sweepOrphanProtectionOrders(
   const sameSide = (o: any): boolean =>
     String(o?.side ?? o?.orderSide ?? "").toLowerCase() === closeSide
 
+  // ── BingX hedge-mode direction isolation ────────────────────────────────
+  // In hedge mode the exchange annotates each order with `positionSide`
+  // ("LONG" or "SHORT"). A sell-side STOP_MARKET for positionSide=SHORT is
+  // the SHORT position's *stop loss* — it is NOT an orphan of the LONG
+  // position we are closing. Without this guard, closing a LONG would sweep
+  // the SHORT's protection orders and leave the SHORT position unprotected.
+  //
+  // When the field is absent ("BOTH" or empty) the account is in one-way
+  // mode and the original side-match is already sufficient.
+  //
+  // closeSide="sell" → we are closing a LONG  → keep only positionSide=LONG
+  // closeSide="buy"  → we are closing a SHORT → keep only positionSide=SHORT
+  const matchesPositionSide = (o: any): boolean => {
+    const ps = String(o?.positionSide ?? o?.position_side ?? "").toUpperCase()
+    if (!ps || ps === "BOTH" || ps === "") return true  // one-way mode or field absent
+    const expectedPs = closeSide === "sell" ? "LONG" : "SHORT"
+    return ps === expectedPs
+  }
+
   for (const o of orders) {
-    // Accept the order as a sweep candidate when it is on the closing side
+    // Accept the order as a sweep candidate when it is on the closing side,
+    // scoped to the correct position direction (hedge-mode guard above),
     // AND either carries an explicit reduce-only flag (one-way mode) OR has a
     // stop/TP order type (hedge mode where the flag is absent).
     if (!sameSide(o)) continue
+    if (!matchesPositionSide(o)) continue
     if (!isReduceOnly(o) && !isProtectionType(o)) continue
     const id =
       o?.id ?? o?.orderId ?? o?.orderID ?? o?.clientOrderId ?? o?.client_oid
@@ -1378,7 +1399,7 @@ async function updateProtectionOrders(
       // expression evaluate to `false` whenever NO order existed — so a
       // position with no stop-loss order was never armed at all.
       //
-      // ── Re-arm cooldown (MIN_REARM_MS) ──────────────────────────────────
+      // ── Re-arm cooldown (MIN_REARM_MS) ───────────────────���──────────────
       // When an order IS present and we're just drift-cancel-replacing, gate
       // on the cooldown to prevent oscillation storms. Missing-order paths
       // (!pos.stopLossOrderId, already cleared by liveness-verify above)
@@ -1494,9 +1515,13 @@ async function updateProtectionOrders(
 
   await Promise.all([slLeg, tpLeg])
 
-  // After (re-)placement record the qty we armed for so the next pass
-  // can detect further drift accurately.
-  if (result.changed) {
+  // Record the qty we armed for only when at least one leg was actually
+  // (re-)placed on the exchange. A liveness-verify clear sets result.changed
+  // but may not result in a successful placement (venue reject, timeout).
+  // Stamping the baseline from a failed placement tells the drift-detector
+  // "this qty is protected" when it is unprotected, suppressing re-arm on
+  // the next tick. We keep result.changed for the pushStep / save path below.
+  if (result.slPlaced || result.tpPlaced) {
     pos.protectionArmedQuantity = effectiveQty
   }
 
@@ -2691,9 +2716,10 @@ export async function executeLivePosition(
       const sideClose: "buy" | "sell" = realPosition.direction === "long" ? "sell" : "buy"
       const { desiredSl: slPrice, desiredTp: tpPrice } =
         computeDesiredProtectionPrices(livePosition)
-      // Ultrathink guard: if a concurrent reconcile/sync already armed for this exact live order volume, do not create second control order
-      if (livePosition.stopLossOrderId && slPrice > 0) { /* already has SL for this live order - skip duplicate */ }
-      if (livePosition.takeProfitOrderId && tpPrice > 0) { /* already has TP for this live order - skip duplicate */ }
+      // Duplicate-prevention is handled inside the Promise.all below:
+      // each leg resolves to the existing orderId when an order is already
+      // present (`!livePosition.stopLossOrderId` guard on the ternary),
+      // so no separate guard block is needed here.
 
       // DO NOT pre-stamp the desired prices onto livePosition before the
       // exchange confirms placement. The original code set
@@ -3013,16 +3039,36 @@ export async function closeLivePosition(
 
     const position: LivePosition = JSON.parse(data as string)
 
-    // ── 1+2. RACE: cancel orphan SL/TP IN PARALLEL with close ──────────
+    // ── Ownership guard ────────────────────────────────────────────────
+    // Derived FIRST — before building any cancellation promises — so we
+    // can gate the SL/TP cancel on ownership. Without this gate, a position
+    // adopted/reconciled from the exchange (no system orderId) would have
+    // its operator-placed protection orders cancelled while the close call
+    // itself is correctly skipped, leaving the position on the exchange
+    // completely unprotected.
+    //
+    // Only issue exchange calls when the system has a verified orderId —
+    // proof that WE placed the entry order. Without an orderId the position
+    // was simulated, the entry order failed silently, or the slot was
+    // allocated but never confirmed.
+    //
+    // Fallback: if `orderId` is missing but `exchangePositionId` exists
+    // (reconciled/adopted position), use it to close via exchange-side
+    // position ID. Without EITHER, skip all exchange operations.
+    const hasSystemOrderId = !!(position.orderId || position.exchangeData?.exchangePositionId)
+
+    // ── 1+2. RACE: cancel owned SL/TP IN PARALLEL with close ───────────
     // The old sequential pattern (cancel → await → close) added 200-400 ms
     // of avoidable latency on every close. The cancellations are best-effort
-    // cleanup of protection orders that will be reconciled away anyway, and
-    // the close itself is reduce-only so a stale SL trigger between cancel
-    // and close can only ever reduce the same position twice (the second
-    // attempt no-ops because the position is gone). We therefore fire all
-    // three calls together and await them as a group.
+    // cleanup and the close is reduce-only so a race can only ever attempt to
+    // reduce the position twice (the second attempt no-ops when the position
+    // is gone). We fire all three calls together and await them as a group.
+    //
+    // Gated on `hasSystemOrderId`: only cancel SL/TP that belong to a
+    // position we placed. For operator-adopted positions the existing manual
+    // protection stays intact on the exchange.
     const cancellationPromises: Promise<boolean>[] = []
-    if (exchangeConnector) {
+    if (exchangeConnector && hasSystemOrderId) {
       if (position.stopLossOrderId) {
         cancellationPromises.push(
           cancelProtectionOrder(exchangeConnector, position.symbol, position.stopLossOrderId, "StopLoss"),
@@ -3035,40 +3081,10 @@ export async function closeLivePosition(
       }
     }
 
-    // ── 2. Issue the close on the exchange with retry logic ────────────
-    //
-    // Critical classification rule: every connector returns
-    //   { success: false, error: "<reason>" }
-    // when the position has ALREADY been closed (typically because an SL
-    // or TP order on the exchange fired between our last reconcile tick
-    // and this close request). Known venue strings include:
-    //   ��� "Position not found"                  (BingX, OKX)
-    //   • "No open position to close"           (Bybit)
-    //   • "Position size is zero or invalid"    (BingX)
-    //   • "Position size is zero — nothing to close" (Bybit)
-    //   • "nothing to close" / "position is zero" / "already closed"
-    // These are NOT failures from our perspective — the exchange-side
-    // state already matches what we're trying to achieve. The previous
-    // implementation treated them as hard failures, burned both retries
-    // (4+ seconds per close), then logged "FAILED to close on exchange"
-    // and skipped the closed-counter increment. The operator therefore
-    // saw closes that "didn't happen" — when in fact the exchange close
-    // had completed via an SL/TP fill seconds earlier.
+    // Close-result state — set by the branches below.
     let exchangeCloseSuccess = false
     let exchangeCloseReason: "ok" | "already_closed" | "failed" | "skipped" = "skipped"
 
-    // ── Ownership guard ────────────────────────────────────────────────
-    // Only issue a closePosition call when the system has a verified
-    // orderId for this position — proof that WE placed the entry order.
-    // Without an orderId the position was either simulated (no exchange
-    // call made), the entry order failed silently, or the slot was
-    // allocated but never confirmed.
-    //
-    // Fallback: if `orderId` is missing but `exchangePositionId` exists
-    // (reconciled/adopted position), use it to close via exchange-side
-    // position ID. Without EITHER, skip exchange close — the position
-    // may be external/manual.
-    const hasSystemOrderId = !!(position.orderId || position.exchangeData?.exchangePositionId)
     if (!hasSystemOrderId && exchangeConnector) {
       exchangeCloseReason = "skipped"
       await logProgressionEvent(
