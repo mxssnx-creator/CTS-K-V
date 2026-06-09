@@ -574,20 +574,12 @@ export class BingXConnector extends BaseExchangeConnector {
 
       this.log("Successfully retrieved account data")
 
-      // Parse balance data - BingX returns data.data as the array directly
-      this.log(`[Debug] Full response data: ${JSON.stringify(data).substring(0, 500)}`)
-      
-      // data.data IS the balance array, not data.data.balance
+      // data.data IS the balance array
       const balanceData = Array.isArray(data.data) ? data.data : []
-      
+
       if (!Array.isArray(balanceData)) {
         this.logError(`Invalid balance data format: ${JSON.stringify(balanceData).substring(0, 200)}`)
         throw new Error("Invalid balance data format from API")
-      }
-
-      this.log(`[Debug] Received ${balanceData.length} balance entries`)
-      if (balanceData.length > 0) {
-        this.log(`[Debug] First balance entry: ${JSON.stringify(balanceData[0]).substring(0, 300)}`)
       }
 
       // Extract USDT balance - BingX returns balance as a string number
@@ -595,24 +587,18 @@ export class BingXConnector extends BaseExchangeConnector {
       // For PERPETUAL: use 'balance' field (this is the total balance in wallet)
       const usdtEntry = balanceData.find((b: any) => b.asset === "USDT")
       const usdtBalance = usdtEntry ? Number.parseFloat(usdtEntry.balance || "0") : 0
-      
-      this.log(`[Debug] USDT entry found: ${!!usdtEntry}`)
-      this.log(`[Debug] USDT balance value: ${usdtBalance}`)
 
-      // Get BTC price from market data
-      // BingX spot ticker returns: { code: 0, data: { symbol, lastPrice, priceChangePercent, ... } }
+      // Get BTC price from market data (for display only — silent failure OK)
       let btcPrice = 0
       try {
         const priceResponse = await fetch("https://open-api.bingx.com/openApi/spot/v1/ticker/24hr?symbol=BTC-USDT")
         if (priceResponse.ok) {
           const priceData = await priceResponse.json()
-          // The 24hr ticker returns data as an array or object; lastPrice is the current price
           const ticker = Array.isArray(priceData.data) ? priceData.data[0] : priceData.data
           btcPrice = Number.parseFloat(ticker?.lastPrice || ticker?.closePrice || ticker?.price || "0")
-          this.log(`[Debug] BTC/USDT price fetched: $${btcPrice.toFixed(2)}`)
         }
-      } catch (e) {
-        this.log(`[Debug] Could not fetch BTC price: ${e}`)
+      } catch {
+        // BTC price is for display only — silent failure is fine
       }
 
       // Map all balances with proper field extraction
