@@ -37,20 +37,40 @@ import { safeParseResponse } from "@/lib/safe-response-parser"
  * - Hedge position mode
  */
 export class BingXConnector extends BaseExchangeConnector {
-  private timeOffset: number = 0 // milliseconds to adjust local time
-  private lastTimeSync: number = 0
-  // Re-sync every 60 s (down from 300 s). In serverless environments each
-  // request may be a fresh module instance so lastTimeSync resets to 0 and
-  // the first sync always fires — the interval only matters within a single
-  // long-lived instance (e.g. development server).
+  // ── Static (process-wide) time-sync state ────────────────────────────────
+  //
+  // Each test-endpoint call creates a fresh BingXConnector instance, which
+  // previously reset timeOffset=0 and lastTimeSync=0 on every request — so
+  // every test fired a syncServerTime() round-trip AND used offset=0 for the
+  // first signed request, consistently producing 100421 errors before the sync
+  // resolved.
+  //
+  // Sharing the offset and last-sync timestamp statically means:
+  //   1. The first successful sync populates the cache for all subsequent
+  //      instances — they skip the round-trip and use the cached offset.
+  //   2. Instances created within the 60 s TTL get a pre-warmed offset and
+  //      send the correct timestamp on the very first request.
+  //   3. The sync promise is also shared so multiple concurrent instances
+  //      (e.g. a burst of dashboard polls) coalesce onto one network call.
+  private static sharedTimeOffset: number = 0
+  private static sharedLastSync:   number = 0
+  private static sharedSyncPromise: Promise<void> | null = null
+  private static lastSyncFailLogTs: number = 0
+
+  // Instance accessors delegate to the static shared state so the rest of
+  // the class can use `this.timeOffset` / `this.lastTimeSync` / etc. without
+  // knowing about the static indirection.
+  private get  timeOffset(): number               { return BingXConnector.sharedTimeOffset }
+  private set  timeOffset(v: number)              { BingXConnector.sharedTimeOffset = v }
+  private get  lastTimeSync(): number             { return BingXConnector.sharedLastSync }
+  private set  lastTimeSync(v: number)            { BingXConnector.sharedLastSync = v }
+  private get  syncPromise(): Promise<void> | null { return BingXConnector.sharedSyncPromise }
+  private set  syncPromise(v: Promise<void> | null) { BingXConnector.sharedSyncPromise = v }
+
+  // Re-sync every 60 s. Because the state is now static, this interval is
+  // effectively process-wide — the first instance to exceed it triggers a
+  // fresh sync and all others reuse the result.
   private timeSyncIntervalMs: number = 60_000
-  // Serialise the initial sync: if multiple signed requests fire concurrently
-  // before the first syncServerTime() resolves, they all await the SAME
-  // promise instead of each reading timeOffset=0 (stale) and all failing
-  // with "timestamp is invalid". Without this, up to N concurrent calls can
-  // all use offset=0 and all fail before any of their individual syncs
-  // complete — producing one 109400 error per call per cold start.
-  private syncPromise: Promise<void> | null = null
   // recvWindow (ms) attached to every signed request. BingX validates
   // `serverTime - timestamp <= recvWindow` (default ~5000ms, max 60000ms). On
   // the Vercel→BingX link RTT routinely measured 800-1136ms, so one-way transit
@@ -69,9 +89,6 @@ export class BingXConnector extends BaseExchangeConnector {
   // ~2s behind our best estimate of server time, we trade harmless lateness
   // (absorbed by the 60s recvWindow) for the elimination of fatal earliness.
   private timestampLagMs: number = 2_000
-  // Cross-instance throttle for the "Failed to sync" log so a network blip
-  // across many connector instances doesn't flood output.
-  private static lastSyncFailLogTs = 0
 
   constructor(credentials: ExchangeCredentials, exchange: string = "bingx") {
     super(credentials, exchange)
