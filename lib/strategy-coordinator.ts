@@ -200,7 +200,7 @@ export interface StrategySet {
    *      Base→Main filters reject it.
    *   2. evaluateRealSets uses `successRate`/`profitFactor` to TUNE
    *      `entries[].sizeMultiplier` and `leverage` per variant — the
-   *      "Real stage … accumulation for pos cnts sets … relying to
+   *      "Real stage �� accumulation for pos cnts sets … relying to
    *      their base sets configs independent" path.
    */
   prevPos?: {
@@ -2246,7 +2246,7 @@ export class StrategyCoordinator {
         // valid_real until that position is closed — even if its PF/DDT
         // temporarily dips below threshold this cycle. Without this exemption
         // a transient metric wobble drops the Set from realQualifying →
-        // realSorted → netted → realPostHedge, so it is never persisted or
+        // realSorted �� netted → realPostHedge, so it is never persisted or
         // dispatched, orphaning the live position from its Real-stage owner
         // (reconcile/sync can no longer map it to a Set). This mirrors the
         // exemption already applied at the min-pos gate above.
@@ -3449,7 +3449,14 @@ export class StrategyCoordinator {
                 } else if (liveResult.status === "rejected") {
                   rejected++
                 } else if (liveResult.status === "error") {
-                  errored++
+                  // 101204 (Insufficient margin) and other recoverable margin/rejection
+                  // errors are counted as "rejected" not "errored" for accurate stats.
+                  // Only truly exceptional errors (circuit breaker, API down, etc.) count as errored.
+                  if ((liveResult as any).errorCode === "101204" || (liveResult as any).code === "101204") {
+                    rejected++
+                  } else {
+                    errored++
+                  }
                 }
               } catch (err) {
                 errored++
