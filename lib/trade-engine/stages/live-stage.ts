@@ -773,13 +773,37 @@ async function sweepOrphanProtectionOrders(
   // protection leg for a position in `closeSide`'s opposite direction.
   // We accept any flavour of the reduce-only flag the connectors emit:
   // `reduceOnly`, `reduce_only`, `closePosition`, `isReduceOnly`.
+  //
+  // BingX HEDGE-MODE SPECIAL CASE:
+  // In hedge mode (the default on BingX Perpetuals) the exchange does NOT
+  // set `reduceOnly=true` on SL/TP orders — the position-reduction semantic
+  // is instead conveyed by `positionSide` ("LONG" / "SHORT"). Without the
+  // explicit flag, the original `isReduceOnly` check always returns false and
+  // orphan protection orders are NEVER swept, leaving stale SL/TP orders on
+  // the exchange indefinitely where they fire against the next entry.
+  //
+  // Fix: additionally treat any order as a protection candidate when its
+  // `type` is a known stop/TP order type AND it is on the closing side.
+  // These types are exchange-level SL/TP market trigger orders regardless of
+  // the hedge/one-way mode and cannot be non-protection regular orders on the
+  // closing side with these types.
+  const PROTECTION_ORDER_TYPES = new Set([
+    "STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT",
+    "stop_market", "take_profit_market", "stop", "take_profit",
+  ])
   const isReduceOnly = (o: any): boolean =>
     !!(o?.reduceOnly ?? o?.reduce_only ?? o?.closePosition ?? o?.isReduceOnly)
+  const isProtectionType = (o: any): boolean =>
+    PROTECTION_ORDER_TYPES.has(String(o?.type ?? o?.orderType ?? ""))
   const sameSide = (o: any): boolean =>
     String(o?.side ?? o?.orderSide ?? "").toLowerCase() === closeSide
 
   for (const o of orders) {
-    if (!isReduceOnly(o) || !sameSide(o)) continue
+    // Accept the order as a sweep candidate when it is on the closing side
+    // AND either carries an explicit reduce-only flag (one-way mode) OR has a
+    // stop/TP order type (hedge mode where the flag is absent).
+    if (!sameSide(o)) continue
+    if (!isReduceOnly(o) && !isProtectionType(o)) continue
     const id =
       o?.id ?? o?.orderId ?? o?.orderID ?? o?.clientOrderId ?? o?.client_oid
     if (id == null || String(id).length === 0) continue
@@ -1021,11 +1045,25 @@ async function fetchLiveOrderIdSet(connector: any): Promise<Set<string> | null> 
     if (!Array.isArray(orders)) return null
     const set = new Set<string>()
     for (const o of orders) {
-      const cands = [o?.id, o?.orderId, o?.orderID, o?.clientOrderId, o?.client_oid]
-      for (const c of cands) {
-        if (c == null) continue
-        const s = String(c)
-        if (s.length > 0) set.add(s)
+      // Prefer exchange-assigned numeric IDs over operator-supplied client IDs.
+      // Using `clientOrderId`/`client_oid` as a fallback is safe only when no
+      // real numeric ID is present on the order — otherwise a future client-ID
+      // echo from the connector could mask a genuinely-missing real orderId and
+      // suppress liveness-based re-arming of a gone SL/TP order.
+      const realId = o?.id ?? o?.orderId ?? o?.orderID
+      if (realId != null && String(realId).length > 0) {
+        set.add(String(realId))
+        // Also add the secondary form so both "1234" and "orderId:1234" styles
+        // that different connectors might store on the position are matched.
+        if (o?.orderId != null && String(o.orderId) !== String(realId)) set.add(String(o.orderId))
+        if (o?.id     != null && String(o.id)      !== String(realId)) set.add(String(o.id))
+      } else {
+        // No real numeric ID — fall back to the client-supplied fields.
+        const fallback = o?.clientOrderId ?? o?.client_oid
+        if (fallback != null) {
+          const s = String(fallback)
+          if (s.length > 0) set.add(s)
+        }
       }
     }
     return set
@@ -3830,7 +3868,7 @@ export async function reconcileLivePositions(
     // `null` means "skip verification this tick"; the next tick retries.
     const liveOrderIds = await fetchLiveOrderIdSet(exchangeConnector)
 
-    // ── Per-position worker (parallelisable) ─────────��───────────────
+    // ── Per-position worker (parallelisable) ─────────���───────────────
     // Each iteration is independent at the venue + Redis layer:
     //   • Redis writes are scoped to `live:positions:{conn}:{id}` and
     //     the per-symbol-direction lock key — no two positions share
@@ -5157,8 +5195,38 @@ export async function recalculateAndApplySLTP(
   await initRedis()
   const client = getRedisClient()
 
+  // ── Bug-1 fix: acquire live_sync_lock BEFORE the read-modify-write ────────
+  // Without this lock, `recalculateAndApplySLTP` (called from
+  // `syncLiveFromPseudo` in the 200 ms engine loop) races against
+  // `reconcileLivePositions` / `syncWithExchange`, both of which also hold
+  // this lock while calling `updateProtectionOrders` for the same position.
+  // The race produces two concurrent `placeStopOrder` calls → two SL or two
+  // TP reduce-only orders on the exchange. The later `savePosition` then
+  // overwrites the in-memory position, losing the order-IDs written by the
+  // other caller. Holding the lock here serialises all three callers.
+  //
+  // If the lock is already held (main loop is mid-reconcile), we retry once
+  // after 100 ms so operator-triggered overrides still apply promptly in the
+  // gap between ticks rather than silently no-opping.
+  const LOCK_KEY = `live_sync_lock:${connectionId}`
+  const LOCK_TTL = 5 // seconds — far shorter than the 30 s reconcile TTL
+  let lockAcquired = false
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const setResult = await (client.set(LOCK_KEY, "recalcSLTP", { NX: true, EX: LOCK_TTL }) as any)
+    if (setResult === "OK") { lockAcquired = true; break }
+    if (attempt === 0) await new Promise(r => setTimeout(r, 100))
+  }
+  if (!lockAcquired) {
+    // Lock still held after one retry — skip this tick; the main sync loop
+    // will re-arm orders correctly on its next pass.
+    console.warn(`${LOG_PREFIX} recalculateAndApplySLTP: lock busy for ${connectionId}, skipping tick`)
+    return null
+  }
+
   try {
     const key = `live:position:${livePositionId}`
+    // Re-read the position AFTER acquiring the lock so we see any writes the
+    // previous lock-holder (reconcile / sync) just committed to Redis.
     const data = await client.get(key)
     if (!data) return null
 
@@ -5208,7 +5276,16 @@ export async function recalculateAndApplySLTP(
       )
     }
 
-    await updateProtectionOrders(exchangeConnector, position, "manual_recalc")
+    // ── Bug-3 fix: fetch live order IDs and pass to updateProtectionOrders ───
+    // Without `liveOrderIds` the liveness-verification block in
+    // `updateProtectionOrders` is skipped entirely (guarded by
+    // `if (liveOrderIds && …)`). If a SL/TP order silently disappeared on the
+    // exchange (filled early, cancelled, expired), `pos.stopLossOrderId` is
+    // still set, `priceDrifted()` returns false, and the leg is never
+    // re-armed — leaving the position unprotected. Passing liveOrderIds here
+    // ensures the verify step runs on every operator-triggered recalc.
+    const liveOrderIds = await fetchLiveOrderIdSet(exchangeConnector)
+    await updateProtectionOrders(exchangeConnector, position, "manual_recalc", liveOrderIds ?? undefined)
     position.updatedAt = Date.now()
     await savePosition(position)
 
@@ -5239,6 +5316,12 @@ export async function recalculateAndApplySLTP(
   } catch (err) {
     console.error(`${LOG_PREFIX} recalculateAndApplySLTP error:`, err)
     return null
+  } finally {
+    // Always release the lock so the main sync loop is not blocked past our
+    // 5 s TTL. del() is a no-op if we never successfully acquired it.
+    if (lockAcquired) {
+      await client.del(LOCK_KEY).catch(() => {})
+    }
   }
 }
 
