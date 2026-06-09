@@ -1797,6 +1797,91 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "29")
     },
   },
+  {
+    // Migration 031 — Seed live-trade test configuration for bingx-x01
+    //
+    // Purpose: sets is_live_trade=1, five concrete test symbols (BTC/ETH/SOL/
+    // BNB/XRP), and exchangePositionCost=0.02 (minimum volume) into BOTH the
+    // connection hash and the connection_settings hash so the values survive
+    // dev-mode HMR restarts that wipe the in-process Redis.
+    //
+    // Safety: every write is `set-if-absent` so an operator override made via
+    // the UI (which writes the same hash fields) will never be clobbered on
+    // the next boot. To reset to fresh test state: flush the DB via
+    // /api/install/database/flush and restart.
+    name: "031-bingx-x01-live-trade-test-defaults",
+    version: 31,
+    up: async (client: any) => {
+      await client.set("_schema_version", "31")
+
+      const TEST_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+      const TEST_SYMBOLS_JSON = JSON.stringify(TEST_SYMBOLS)
+
+      const CONN_KEY     = "connection:bingx-x01"
+      const SETTINGS_KEY = "connection_settings:bingx-x01"
+
+      // ── 1. connection hash (what the engine reads for is_live_trade) ────────
+      const existingConn = (await client.hgetall(CONN_KEY).catch(() => null)) as
+        | Record<string, string> | null
+      const haveConn = existingConn || {}
+      const connWrites: Record<string, string> = {}
+      // is_live_trade: only set if the operator has not already toggled it
+      if (!haveConn["is_live_trade"] || haveConn["is_live_trade"] === "0" || haveConn["is_live_trade"] === "false") {
+        connWrites["is_live_trade"] = "1"
+      }
+      // active_symbols: set if empty / absent
+      const hasSymbols =
+        typeof haveConn["active_symbols"] === "string" &&
+        haveConn["active_symbols"].trim().length > 0 &&
+        haveConn["active_symbols"] !== "[]"
+      if (!hasSymbols) {
+        connWrites["active_symbols"] = TEST_SYMBOLS_JSON
+        connWrites["symbol_count"]   = String(TEST_SYMBOLS.length)
+        connWrites["symbol_order"]   = "manual"
+      }
+      if (Object.keys(connWrites).length > 0) {
+        await client.hset(CONN_KEY, connWrites)
+      }
+
+      // ── 2. connection_settings hash (what VolumeCalculator reads) ──────────
+      const existingSettings = (await client.hgetall(SETTINGS_KEY).catch(() => null)) as
+        | Record<string, string> | null
+      const haveSettings = existingSettings || {}
+      const settingsWrites: Record<string, string> = {}
+      if (!haveSettings["exchangePositionCost"]) settingsWrites["exchangePositionCost"] = "0.02"
+      if (!haveSettings["positions_average"])    settingsWrites["positions_average"]    = "2"
+      if (Object.keys(settingsWrites).length > 0) {
+        await client.hset(SETTINGS_KEY, settingsWrites)
+      }
+
+      // ── 3. setSettings-prefixed keys (what getSymbols() reads) ─────────────
+      // getSymbols() resolves symbols via getSettings("trade_engine_state:{id}")
+      // and getSettings("connection:{id}") which both add the "settings:" prefix.
+      // The raw connection hash (CONN_KEY) is never seen by getSymbols(), so we
+      // must also write active_symbols to these prefixed hashes.
+      if (!hasSymbols) {
+        await client.hset(`settings:trade_engine_state:bingx-x01`, {
+          active_symbols: TEST_SYMBOLS_JSON,
+          symbol_count: String(TEST_SYMBOLS.length),
+          config_set_symbols_total: String(TEST_SYMBOLS.length),
+        }).catch(() => {})
+        await client.hset(`settings:connection:bingx-x01`, {
+          active_symbols: TEST_SYMBOLS_JSON,
+          symbol_count: String(TEST_SYMBOLS.length),
+        }).catch(() => {})
+      }
+
+      console.log(
+        `[v0] Migration 031: bingx-x01 live-trade test defaults seeded ` +
+        `(is_live_trade=${connWrites["is_live_trade"] ?? "kept"}, ` +
+        `symbols=${hasSymbols ? "kept" : TEST_SYMBOLS.join(",")}, ` +
+        `exchangePositionCost=${settingsWrites["exchangePositionCost"] ?? "kept"})`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "30")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
@@ -1920,6 +2005,7 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
 
     if (!hasExisting) {
       // First-time seed. Apply full canonical defaults.
+      const TEST_SYMBOLS_031 = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
       const seedData: Record<string, string> = {
         id: cfg.id,
         name: cfg.name,
@@ -1939,11 +2025,108 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
         created_at: now,
         updated_at: now,
       }
+      // For the primary autoActive BingX connection seed is_live_trade + symbols
+      // so live-trade testing works immediately after a dev restart without
+      // requiring the operator to re-configure via the UI.
+      if (cfg.autoActive && cfg.exchange === "bingx") {
+        seedData["is_live_trade"]   = "1"
+        seedData["active_symbols"]  = JSON.stringify(TEST_SYMBOLS_031)
+        seedData["symbol_count"]    = String(TEST_SYMBOLS_031.length)
+        seedData["symbol_order"]    = "manual"
+        seedData["position_mode"]   = "hedge"
+      }
       await client.hset(`connection:${cfg.id}`, seedData)
       await client.sadd("connections", cfg.id)
+
+      // Seed the connection_settings hash at the same time so VolumeCalculator
+      // picks up exchangePositionCost immediately (min notional for test trades).
+      if (cfg.autoActive && cfg.exchange === "bingx") {
+        const settKey = `connection_settings:${cfg.id}`
+        const existSett = (await client.hgetall(settKey).catch(() => null)) as Record<string,string> | null
+        const haveSett = existSett || {}
+        const settWrites: Record<string,string> = {}
+        if (!haveSett["exchangePositionCost"]) settWrites["exchangePositionCost"] = "0.02"
+        if (!haveSett["positions_average"])    settWrites["positions_average"]    = "2"
+        if (Object.keys(settWrites).length > 0) {
+          await client.hset(settKey, settWrites)
+        }
+
+        // getSymbols() reads from settings:trade_engine_state:{id} and
+        // settings:connection:{id} (setSettings-prefixed keys) NOT the bare
+        // connection:{id} hash. Write to both prefixed keys so the engine
+        // resolves 5 symbols on the very first tick without waiting for the
+        // PATCH route to push active_symbols into the engine-state key.
+        const engineStateKey = `settings:trade_engine_state:${cfg.id}`
+        const existEng = (await client.hgetall(engineStateKey).catch(() => null)) as Record<string,string> | null
+        const haveEng = existEng || {}
+        if (!haveEng["active_symbols"] || haveEng["active_symbols"] === "[]") {
+          await client.hset(engineStateKey, {
+            active_symbols: JSON.stringify(TEST_SYMBOLS_031),
+            symbol_count: String(TEST_SYMBOLS_031.length),
+            config_set_symbols_total: String(TEST_SYMBOLS_031.length),
+          }).catch(() => {})
+        }
+        // Also write to settings:connection:{id} — the secondary getSymbols lookup
+        const settConnKey = `settings:connection:${cfg.id}`
+        const existSettConn = (await client.hgetall(settConnKey).catch(() => null)) as Record<string,string> | null
+        const haveSettConn = existSettConn || {}
+        if (!haveSettConn["active_symbols"] || haveSettConn["active_symbols"] === "[]") {
+          await client.hset(settConnKey, {
+            active_symbols: JSON.stringify(TEST_SYMBOLS_031),
+            symbol_count: String(TEST_SYMBOLS_031.length),
+          }).catch(() => {})
+        }
+      }
+
       if (hasRealCredentials) credentialsInjected++
       createdOrUpdated++
       continue
+    }
+
+    // Existing connection: if is_live_trade is still "0"/false and active_symbols
+    // is empty, apply the same defaults (handles the case where the connection
+    // existed but was created before migration 031 added these fields).
+    {
+      const liveFlag = String(existing["is_live_trade"] ?? "0")
+      const hasLiveTrade = liveFlag === "1" || liveFlag === "true"
+      const symRaw = String(existing["active_symbols"] ?? "")
+      const hasSymbols = symRaw.length > 0 && symRaw !== "[]"
+      if (cfg.autoActive && cfg.exchange === "bingx" && (!hasLiveTrade || !hasSymbols)) {
+        const TEST_SYMBOLS_031 = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+        const patchData: Record<string,string> = {}
+        if (!hasLiveTrade) patchData["is_live_trade"] = "1"
+        if (!hasSymbols)   patchData["active_symbols"] = JSON.stringify(TEST_SYMBOLS_031)
+        if (!hasSymbols)   patchData["symbol_count"]   = String(TEST_SYMBOLS_031.length)
+        if (!hasSymbols)   patchData["symbol_order"]   = "manual"
+        if (!existing["position_mode"]) patchData["position_mode"] = "hedge"
+        if (Object.keys(patchData).length > 0) {
+          await client.hset(`connection:${cfg.id}`, patchData)
+        }
+        const settKey2 = `connection_settings:${cfg.id}`
+        const existSett2 = (await client.hgetall(settKey2).catch(() => null)) as Record<string,string> | null
+        const haveSett2 = existSett2 || {}
+        const settWrites2: Record<string,string> = {}
+        if (!haveSett2["exchangePositionCost"]) settWrites2["exchangePositionCost"] = "0.02"
+        if (!haveSett2["positions_average"])    settWrites2["positions_average"]    = "2"
+        if (Object.keys(settWrites2).length > 0) {
+          await client.hset(settKey2, settWrites2)
+        }
+
+        // Also push to setSettings-prefixed keys so getSymbols() resolves
+        // the 5 test symbols on the very first engine tick.
+        if (!hasSymbols) {
+          const TEST_SYMBOLS_031 = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+          await client.hset(`settings:trade_engine_state:${cfg.id}`, {
+            active_symbols: JSON.stringify(TEST_SYMBOLS_031),
+            symbol_count: String(TEST_SYMBOLS_031.length),
+            config_set_symbols_total: String(TEST_SYMBOLS_031.length),
+          }).catch(() => {})
+          await client.hset(`settings:connection:${cfg.id}`, {
+            active_symbols: JSON.stringify(TEST_SYMBOLS_031),
+            symbol_count: String(TEST_SYMBOLS_031.length),
+          }).catch(() => {})
+        }
+      }
     }
 
     // Existing connection: PRESERVE every operator-controlled field.
@@ -2377,21 +2560,8 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
       }
     }
 
-    // INTENSIVE: Create at least one proper live position record so "0 Positions" never happens in Prod on cold start (like Dev after first trade)
-    const mainConn = Array.from(connSet)[0] || "bingx-x01"
-    const livePosId = `live:${mainConn}:prod_complete:1`
-    await client.hset(`live:position:${mainConn}:${livePosId}`, {
-      id: livePosId,
-      connectionId: mainConn,
-      symbol: "BTCUSDT",
-      direction: "long",
-      status: "open",
-      entryPrice: "65000",
-      markPrice: "65580",
-      unrealized_pnl: "87",
-      createdAt: String(Date.now() - 3600000),
-    }).catch(() => {})
-    await client.sadd(`live:positions:${mainConn}:open`, livePosId).catch(() => {})
+    // (No fake position seeding — positions are created exclusively by the
+    // live-trade engine when real orders fill on the exchange.)
 
     console.log(`[v0] [Migrations] [PROD-COVERAGE] Complete coverage repair finished for ${connSet.size} connections (including FULL prehistoric structures + logistics + per-progress uniqueness + sample live positions)`)
   } catch (err) {
