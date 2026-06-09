@@ -471,8 +471,8 @@ export class VolumeCalculator {
       // reach volume calculations.
       //
       // Two downstream safety nets still apply after this:
-      //   1. resolveBalanceAndLeverage caps to the balance-based bracket.
-      //   2. The live-stage 101204 auto-halve retry handles per-symbol limits.
+      //   1. setLeverage(symbol, X) on the connector — venue clamps to per-symbol bracket.
+      //   2. The live-stage 101204 auto-halve retry handles margin rejections.
       const connection = await getConnection(connectionId).catch(() => null)
       const exchangeMax   = getMaxLeverageForExchange(connection?.exchange)
       const useMaximal    = settings.useMaximalLeverage === true ||
