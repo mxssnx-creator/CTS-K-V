@@ -210,16 +210,12 @@ async function generateIndicationsForConnection(
     const rangePercent = close > 0 ? (range / close) * 100 : 0
     const now          = Date.now()
 
-    // Store real market data in Redis for future cycles
-    await client.hset(`market_data:${symbol}`, {
-      close:  String(close),
-      open:   String(open),
-      high:   String(high),
-      low:    String(low),
-      symbol,
-      updated_at: String(now),
-    }).catch(() => {})
-    await client.expire(`market_data:${symbol}`, 3600).catch(() => {})
+    // ── PIPELINED WRITES ───────────────────────────────────────────────────────
+    // All Redis writes for this cron cycle (market data + indications + cycle
+    // counters + progression hset) are batched into a single pipeline so the
+    // round-trip overhead is 1 RTT regardless of how many indication types fired.
+    // The emulator's multi() Proxy correctly sequences all commands.
+    const pipeline = client.multi()
 
     // ── Indications ────────────────────────────────────────────────────────────
     // Each type has a distinct signal condition and fires at a different rate:
@@ -294,91 +290,98 @@ async function generateIndicationsForConnection(
 
     const progKey = `progression:${connectionId}`
 
-    // Write indication counts to progression hash — only for types that actually fired
-    for (const ind of indications) {
-      await client.hincrby(progKey, `indications_${ind.type}_count`, 1)
-      // Also write flat counter key for backward compat
-      await client.incr(`indications:${connectionId}:${ind.type}:count`).catch(() => {})
-      await client.expire(`indications:${connectionId}:${ind.type}:count`, 86400).catch(() => {})
-
-      // Store latest value for the dialog type breakdowns
-      await client.hset(`indications:${connectionId}:${ind.type}:latest`, {
-        symbol,
-        value: String(ind.value),
-        confidence: String(ind.confidence.toFixed(4)),
-        profitFactor: String(ind.profitFactor.toFixed(4)),
-        timestamp: String(now),
-      }).catch(() => {})
-      await client.expire(`indications:${connectionId}:${ind.type}:latest`, 3600).catch(() => {})
-    }
-
     result.indications = indications.length
-    // This cron route is the ACTUAL realtime driver in this deployment — the
-    // engine-manager realtime loop that the comment below once referred to does
-    // not run here (verified: 0 RealtimeProgression markers vs. hundreds of cron
-    // cycles). So the cumulative `indications_count` and the realtime cycle
-    // counters MUST be written here, otherwise the dashboard's total-indications
-    // tile and realtime-progression tiles are permanently stuck at 0. The
-    // earlier "authoritative in engine-manager" note created a coordination gap
-    // where NO writer ever advanced these fields.
-    if (indications.length > 0) {
-      await client.hincrby(progKey, "indications_count", indications.length)
-      await client.hincrby(progKey, "indication_live_cycle_count", 1)
-    }
-    await client.hincrby(progKey, "indication_cycle_count", 1)
-    // NOTE: Do NOT write realtime_cycle_count here.
-    // The engine's startIndicationProcessor tick (engine-manager.ts) already writes
-    // `hincrby realtime_cycle_count 1` on every cycle. Writing it here too causes
-    // double-counting when both the engine AND the cron are running concurrently
-    // (the normal dev/production state), making the counter appear to advance at
-    // 2× the real cadence. The cron's indication_cycle_count alone is sufficient
-    // to show the cron's liveness on the dashboard.
 
-    // ── Strategy generation (proportional to indications that fired) ──────────
-    // Base: 1 set per indication type that fired this cycle (varies 1-5 based on market)
-    // Main: ~50-70% of Base pass the minPF>=1.2 filter (varies with market quality)
-    // Real: ~30-50% of Main pass the minPF>=1.4 + confidence>=0.65 filter (stricter)
-    // Ratios are intentionally non-uniform to reflect real filter cascade behaviour.
+    // ── Strategy counts (computed locally, no extra Redis reads) ─────────────
+    // Base: 1 set per indication type that fired this cycle (varies 1-5)
+    // Main: ~50-70% of Base pass the minPF>=1.2 filter
+    // Real: ~30-50% of Main pass the minPF>=1.4 + confidence>=0.65 filter
     //
-    // IMPORTANT: these synthetic counts are ONLY written to the strategy_cycle_count
-    // cycle counter and the backward-compat standalone keys — NOT to
-    // strategies_base_total / strategies_main_total / strategies_real_total (the
-    // cumulative hincrby fields in the progression hash). Those fields are written
-    // exclusively by StrategyCoordinator.executeStrategyFlow (the real pipeline)
-    // to avoid double-counting when the prod isProd block below also runs the real
-    // pipeline and writes the authoritative values via the same hincrby keys.
-    const baseGenerated  = indications.length
-    const mainPassRate   = 0.45 + Math.min(0.30, momentum * 10)   // 45-75%; better market = more pass
-    const realPassRate   = 0.25 + Math.min(0.25, volFactor * 5)   // 25-50%; tighter filter
-    const mainGenerated  = Math.max(0, Math.floor(baseGenerated * mainPassRate))
-    const realGenerated  = Math.max(0, Math.floor(mainGenerated * realPassRate))
-
-    // Only the cycle counter is written here — NOT the cumulative stage totals.
-    await client.hincrby(progKey, "strategy_cycle_count", 1)
-
-    // ── Cycle completion accounting ─────────────────────────────────────
-    // `cycles_completed` / `successful_cycles` were only ever written by
-    // ProgressionStateManager.incrementCycle, which runs inside the
-    // engine-manager realtime loop. That loop does not execute in this
-    // deployment, so the dashboard's "cycles completed" and success-rate
-    // tiles were frozen at 0 / a random placeholder. Since this cron is the
-    // real driver, record real completion here: a cycle that produced at
-    // least one indication is a success, otherwise it is a no-data failure.
+    // IMPORTANT: only the cycle counter is written here — NOT the cumulative
+    // stage totals (strategies_base_total etc.). Those are written exclusively
+    // by StrategyCoordinator.executeStrategyFlow to prevent double-counting.
+    const baseGenerated = indications.length
+    const mainPassRate  = 0.45 + Math.min(0.30, momentum * 10)
+    const realPassRate  = 0.25 + Math.min(0.25, volFactor * 5)
+    const mainGenerated = Math.max(0, Math.floor(baseGenerated * mainPassRate))
+    const realGenerated = Math.max(0, Math.floor(mainGenerated * realPassRate))
     const cycleSucceeded = indications.length > 0
-    await Promise.all([
-      client.hincrby(progKey, "cycles_completed", 1),
-      cycleSucceeded
-        ? client.hincrby(progKey, "successful_cycles", 1)
-        : client.hincrby(progKey, "failed_cycles", 1),
+
+    // ── Single-pipeline writes — 1 RTT for the entire cron cycle ────────────
+    // market_data, all per-indication counters + latest hashes, progression
+    // counters, cycle-completion accounting and final progression snapshot are
+    // all queued into one multi()/exec() so N indication types + M counter
+    // fields collapse to a single round-trip.
+    //
+    // NOTE: Do NOT write realtime_cycle_count here — the engine-manager's
+    // startIndicationProcessor tick is authoritative for that field. Writing it
+    // here too causes double-counting when both run concurrently.
+
+    // market_data writes
+    pipeline.hset(`market_data:${symbol}`, {
+      close:  String(close),
+      open:   String(open),
+      high:   String(high),
+      low:    String(low),
+      symbol,
+      updated_at: String(now),
+    })
+    pipeline.expire(`market_data:${symbol}`, 3600)
+
+    // per-indication writes (up to 5 × 4 ops = up to 20 ops, all pipelined)
+    for (const ind of indications) {
+      pipeline.hincrby(progKey, `indications_${ind.type}_count`, 1)
+      pipeline.incr(`indications:${connectionId}:${ind.type}:count`)
+      pipeline.expire(`indications:${connectionId}:${ind.type}:count`, 86400)
+      pipeline.hset(`indications:${connectionId}:${ind.type}:latest`, {
+        symbol,
+        value:        String(ind.value),
+        confidence:   String(ind.confidence.toFixed(4)),
+        profitFactor: String(ind.profitFactor.toFixed(4)),
+        timestamp:    String(now),
+      })
+      pipeline.expire(`indications:${connectionId}:${ind.type}:latest`, 3600)
+    }
+
+    // cumulative indication counters — only when indications fired
+    // This cron route is the ACTUAL realtime driver in this deployment (the
+    // engine-manager realtime loop does not run in serverless). These writes
+    // are what keeps total-indications and realtime-progression tiles alive.
+    if (indications.length > 0) {
+      pipeline.hincrby(progKey, "indications_count", indications.length)
+      pipeline.hincrby(progKey, "indication_live_cycle_count", 1)
+    }
+    pipeline.hincrby(progKey, "indication_cycle_count", 1)
+    pipeline.hincrby(progKey, "strategy_cycle_count", 1)
+
+    // cycle completion accounting
+    pipeline.hincrby(progKey, "cycles_completed", 1)
+    if (cycleSucceeded) {
+      pipeline.hincrby(progKey, "successful_cycles", 1)
+    } else {
+      pipeline.hincrby(progKey, "failed_cycles", 1)
+    }
+
+    // Execute all writes in a single round-trip
+    await pipeline.exec().catch(() => {})
+
+    // ── Post-exec: compute success rate from fresh counters (2 hgets) ───────
+    // Two reads after the pipeline ensures we see the incremented values.
+    // Parallelised via Promise.all so they share one RTT.
+    const [completedRaw, succeededRaw, startedAtRaw] = await Promise.all([
+      client.hget(progKey, "cycles_completed").catch(() => "0"),
+      client.hget(progKey, "successful_cycles").catch(() => "0"),
+      client.hget(progKey, "started_at").catch(() => ""),
     ])
-    const completed = parseInt((await client.hget(progKey, "cycles_completed").catch(() => "0")) || "0", 10)
-    const succeeded = parseInt((await client.hget(progKey, "successful_cycles").catch(() => "0")) || "0", 10)
+    const completed      = parseInt((completedRaw as string) || "0", 10)
+    const succeeded      = parseInt((succeededRaw as string) || "0", 10)
     const realSuccessRate = completed > 0 ? (succeeded / completed) * 100 : 100
+
     await client.hset(progKey, {
       cycle_success_rate: String(realSuccessRate.toFixed(1)),
-      last_update: new Date().toISOString(),
-      last_symbol: symbol,
-      started_at: (await client.hget(progKey, "started_at").catch(() => "")) || String(Date.now()),
+      last_update:        new Date().toISOString(),
+      last_symbol:        symbol,
+      started_at:         (startedAtRaw as string) || String(Date.now()),
     })
     await client.expire(progKey, 7 * 24 * 60 * 60)
 
@@ -469,8 +472,17 @@ export async function GET() {
       }
 
       for (let c = 0; c < cyclesPerCron; c++) {
-        for (const symbol of symbolsToProcess) {
-          const r = await generateIndicationsForConnection(connection.id, symbol, client, exchangeName)
+        // Process all symbols for this cycle concurrently.
+        // Each call touches distinct market_data:{symbol} and
+        // indications:{conn}:{type}:latest keys so there is no key collision.
+        // The progression:{conn} hincrby writes are atomic per-key operations so
+        // concurrent increments are safe (the Redis emulator serialises them).
+        const cycleResults = await Promise.all(
+          symbolsToProcess.map(symbol =>
+            generateIndicationsForConnection(connection.id, symbol, client, exchangeName)
+          )
+        )
+        for (const r of cycleResults) {
           totalIndications += r.indications
           totalBase += r.base
           totalMain += r.main

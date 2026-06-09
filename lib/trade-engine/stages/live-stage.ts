@@ -23,6 +23,7 @@
  */
 
 import { getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
+import { nanoid } from "@/lib/trade-engine/pseudo-position-manager"
 import { getVenueMinQty } from "@/lib/exchange-min-qty"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { VolumeCalculator } from "@/lib/volume-calculator"
@@ -175,7 +176,7 @@ async function tryAcquireLock(connId: string, symbol: string, direction: string)
   const { getRedisClient } = await import("@/lib/redis-db")
   const client = getRedisClient()
   const key = `live:lock:${connId}:${symbol}:${direction}`
-  const token = `tok:${Date.now()}:${Math.random().toString(36).slice(2,8)}`
+  const token = `tok:${Date.now()}:${nanoid(8)}`
   try {
     // Atomic SET key token NX EX 300 — the ONLY correct dedup primitive.
     // `NX` guarantees exclusivity (a second concurrent entry on the same
@@ -1458,7 +1459,7 @@ export async function executeLivePosition(
   // silently rather than counting it as a margin/balance failure.
   if (isCircuitBreakerActive(realPosition.symbol)) {
     const cbSkipped: LivePosition = {
-      id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+      id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${nanoid(8)}`,
       connectionId,
       symbol: realPosition.symbol,
       direction: realPosition.direction,
@@ -1510,7 +1511,7 @@ export async function executeLivePosition(
     const stepIdx = Math.min(failures - 1, MARGIN_COOLDOWN_STEPS_MS.length - 1)
     const cooldownSec = Math.round((MARGIN_COOLDOWN_STEPS_MS[stepIdx] ?? MARGIN_COOLDOWN_MAX_MS) / 1000)
     const skipped: LivePosition = {
-      id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+      id: `live:${connectionId}:${realPosition.symbol}:${realPosition.direction}:${Date.now()}:${nanoid(8)}`,
       connectionId,
       symbol: realPosition.symbol,
       direction: realPosition.direction,
@@ -4622,7 +4623,7 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
               const marginType: "cross" | "isolated" =
                 String(exPos.marginType ?? "isolated").toLowerCase().includes("cross") ? "cross" : "isolated"
 
-              const adoptedId = `live:${connectionId}:adopted:${sym}:${direction}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`
+              const adoptedId = `live:${connectionId}:adopted:${sym}:${direction}:${Date.now()}:${nanoid(8)}`
               const adopted: LivePosition = {
                 id: adoptedId,
                 connectionId,

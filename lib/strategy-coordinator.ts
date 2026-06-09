@@ -19,7 +19,7 @@
 import { initRedis, getSettings, setSettings, getRedisClient } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { PositionThresholdManager } from "@/lib/position-threshold-manager"
-import { PseudoPositionManager } from "@/lib/trade-engine/pseudo-position-manager"
+import { PseudoPositionManager, nanoid } from "@/lib/trade-engine/pseudo-position-manager"
 import {
   compact,
   loadCompactionConfig,
@@ -686,7 +686,7 @@ export class StrategyCoordinator {
     },
     real: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default ��������������� operator-tunable
+      minProfitFactor: 1.0,   // spec default ����������������� operator-tunable
       confidence: 0.65,       // advisory only
       description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
@@ -3299,7 +3299,7 @@ export class StrategyCoordinator {
                 const liveResult = await executeLivePosition(
                   this.connectionId,
                   {
-                    id: `real:${this.connectionId}:${set.setKey}:${symbol}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`,
+                    id: `real:${this.connectionId}:${set.setKey}:${symbol}:${Date.now()}:${nanoid(8)}`,
                     connectionId: this.connectionId,
                     symbol,
                     direction: set.direction,
