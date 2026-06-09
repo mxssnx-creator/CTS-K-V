@@ -88,6 +88,11 @@ interface LivePosition {
   takeProfitPrice?: number
   stopLossOrderId?: string
   takeProfitOrderId?: string
+  // Epoch-ms timestamps of the last successful SL/TP placement on the venue.
+  // Used by the MIN_REARM_MS cooldown to prevent repeated cancel-replace
+  // storms when a position's price oscillates at the 0.25% drift boundary.
+  stopLossLastArmedAt?: number
+  takeProfitLastArmedAt?: number
   assignedStopLoss?: number
   assignedTakeProfit?: number
   protectionArmedQuantity?: number
@@ -329,6 +334,16 @@ async function accumulateIntoLivePosition(connId: string, existing: LivePosition
     // ── Re-arm protection orders for the new, larger size ───────────────
     // The existing SL/TP cover the pre-merge quantity; updateProtectionOrders
     // re-sizes them to the accumulated executedQuantity.
+    //
+    // Cooldown bypass: after an accumulation the position qty has definitively
+    // changed — the old SL/TP orders cover fewer contracts than the live
+    // exchange position. We MUST re-arm immediately regardless of when the
+    // previous re-arm fired. Clear the per-leg timestamps so the cooldown
+    // gate in `updateProtectionOrders` does not suppress this mandatory
+    // cancel-replace. The timestamps are re-stamped by `updateProtectionOrders`
+    // on success, so the 30 s cooldown clock restarts from the new placement.
+    existing.stopLossLastArmedAt = undefined
+    existing.takeProfitLastArmedAt = undefined
     try {
       await updateProtectionOrders(connector, existing, "accumulate_rearm", null)
       await savePosition(existing)
@@ -1140,6 +1155,24 @@ function priceDrifted(current: number | undefined, desired: number): boolean {
  * decide whether to persist the position).
  */
 
+// ── Per-position re-arm cooldown ────────────────────────────────────────────
+// The 200–300 ms reconcile loop calls `updateProtectionOrders` for every open
+// position on every tick. The "drift-based" cancel-replace logic is correct, but
+// at 3–5 Hz a mark price oscillating at the 0.25% boundary produces repeated
+// cancel-replace storms that exhaust rate limits and generate confusing audit
+// logs. The cooldown gate adds a minimum quiet period between cancel-replaces
+// driven by *price or qty drift* (not missing-order re-arms — those always fire
+// immediately because arming a missing order is never a no-op).
+//
+// 30 s is chosen to be:
+//   • long enough to absorb a normal oscillation window (BTC 0.5% range
+//     typically resolves within ~5–15 s on a 1-min candle)
+//   • short enough that a genuine operator override or large fill-size change
+//     is reflected on the exchange within one operator-perceptible minute.
+// Missing-order re-arms (stopLossOrderId = undefined after liveness-verify)
+// bypass the cooldown entirely and always place immediately.
+const MIN_REARM_MS = 30_000
+
 // ── System-close-only flag, micro-cached ─────────────────────────────
 //
 // Reconcile fans out across every live position; without this cache
@@ -1339,8 +1372,19 @@ async function updateProtectionOrders(
       // which (because `||` binds tighter than `?:`) made the whole
       // expression evaluate to `false` whenever NO order existed — so a
       // position with no stop-loss order was never armed at all.
+      //
+      // ── Re-arm cooldown (MIN_REARM_MS) ──────────────────────────────────
+      // When an order IS present and we're just drift-cancel-replacing, gate
+      // on the cooldown to prevent oscillation storms. Missing-order paths
+      // (!pos.stopLossOrderId, already cleared by liveness-verify above)
+      // always bypass the cooldown — arming a missing order is never a no-op.
       desiredSl > 0 &&
-      (!pos.stopLossOrderId || priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted)
+      (
+        !pos.stopLossOrderId
+          ? true  // no order at all → arm immediately regardless of cooldown
+          : (priceDrifted(pos.stopLossPrice, desiredSl) || qtyDrifted) &&
+            Date.now() - (pos.stopLossLastArmedAt ?? 0) >= MIN_REARM_MS
+      )
     ) {
       // Cancel-then-replace race: if a cancel fails we must NOT place
       // a new SL — the old one is still armed on the exchange, and
@@ -1376,6 +1420,7 @@ async function updateProtectionOrders(
         if (id) {
           pos.stopLossOrderId = id
           pos.stopLossPrice = desiredSl
+          pos.stopLossLastArmedAt = Date.now()
           result.changed = true
           result.slPlaced = true
         } else {
@@ -1399,8 +1444,15 @@ async function updateProtectionOrders(
       // nothing live covers it (or the level/qty drifted). Same precedence
       // fix — the old `||`-grouped ternary collapsed to `false` when no TP
       // order existed, leaving positions without a take-profit entirely.
+      //
+      // ── Re-arm cooldown (MIN_REARM_MS) — mirror of SL leg ───────────────
       desiredTp > 0 &&
-      (!pos.takeProfitOrderId || priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted)
+      (
+        !pos.takeProfitOrderId
+          ? true  // no order at all → arm immediately
+          : (priceDrifted(pos.takeProfitPrice, desiredTp) || qtyDrifted) &&
+            Date.now() - (pos.takeProfitLastArmedAt ?? 0) >= MIN_REARM_MS
+      )
     ) {
       let oldGone = true
       if (pos.takeProfitOrderId) {
@@ -1424,6 +1476,7 @@ async function updateProtectionOrders(
         if (id) {
           pos.takeProfitOrderId = id
           pos.takeProfitPrice = desiredTp
+          pos.takeProfitLastArmedAt = Date.now()
           result.changed = true
           result.tpPlaced = true
         } else {
@@ -2612,7 +2665,7 @@ export async function executeLivePosition(
       })
     }
 
-    // ── Step 7: Place Stop Loss and Take Profit orders ─────────────────────
+    // ── Step 7: Place Stop Loss and Take Profit orders ─��───────────────────
     //
     // Single source of truth for SL/TP price derivation:
     // `computeDesiredProtectionPrices()` is also what the accumulation
@@ -2715,6 +2768,11 @@ export async function executeLivePosition(
       // and never retry the failed legs because qtyDrifted is false.
       if (slOrderId || tpOrderId) {
         livePosition.protectionArmedQuantity = livePosition.executedQuantity
+        // Prime the cooldown so the first 30 s of reconcile ticks cannot
+        // drift-cancel-replace orders we just placed milliseconds ago.
+        const nowMs = Date.now()
+        if (slOrderId) livePosition.stopLossLastArmedAt = nowMs
+        if (tpOrderId) livePosition.takeProfitLastArmedAt = nowMs
       }
 
       // Step record + progression log carry BOTH the assigned percent
@@ -5465,6 +5523,10 @@ export async function syncLiveFromPseudo(
             if (fill > 0) {
               const liveSide: "long" | "short" =
                 livePos.direction === "short" ? "short" : "long"
+              // Distance from fill to the trailing stop expressed as a
+              // percentage of the fill price (always positive regardless of
+              // direction — the trailing machine ensures trailingStopPrice
+              // is below fill for longs and above fill for shorts).
               const distPct =
                 liveSide === "long"
                   ? ((fill - trailingStopPrice) / fill) * 100
@@ -5474,6 +5536,36 @@ export async function syncLiveFromPseudo(
               }
             }
           }
+
+          // ── Per-tick no-op guard ──────────────────────────────────────────
+          // syncLiveFromPseudo fires on EVERY realtime cycle (200–300 ms) but
+          // the trailing stop price only ratchets once per strategy cycle
+          // (~5 s). Calling recalculateAndApplySLTP on no-change ticks
+          // acquires the live_sync_lock, fetches open orders, and calls
+          // updateProtectionOrders — all no-ops at the exchange layer, but
+          // still ~50–150 ms of lock contention per position per tick.
+          //
+          // Skip the call when BOTH:
+          //   • the computed slPct is within ±0.25% of the currently stored
+          //     stopLoss pct (same 0.25% tolerance as priceDrifted — a
+          //     change smaller than this cannot affect the exchange order)
+          //   • the tpPct is within ±0.25% of the currently stored takeProfit
+          //     pct (or both are undefined/NaN)
+          // Always call when the live position has a missing order (id = undefined)
+          // even if percentages are unchanged — the order may have been silently
+          // filled or cancelled on the venue and needs re-arming.
+          const currentSlPct = typeof livePos.stopLoss === "number" ? livePos.stopLoss : undefined
+          const currentTpPct = typeof livePos.takeProfit === "number" ? livePos.takeProfit : undefined
+          const ordersMissing = !livePos.stopLossOrderId || !livePos.takeProfitOrderId
+          const slDeltaPct = currentSlPct !== undefined && effectiveSlPct !== undefined
+            ? Math.abs(effectiveSlPct - currentSlPct) / Math.max(currentSlPct, 0.001)
+            : 1  // undefined → treat as changed
+          const tpDeltaPct = currentTpPct !== undefined && tpPct !== undefined
+            ? Math.abs(tpPct - currentTpPct) / Math.max(currentTpPct, 0.001)
+            : (tpPct !== undefined ? 1 : 0)  // tpPct newly defined → changed; both undefined → no change
+          const nothingChanged = !ordersMissing && slDeltaPct < 0.0025 && tpDeltaPct < 0.0025
+          if (nothingChanged) continue
+
           await recalculateAndApplySLTP(connectionId, livePos.id, exchangeConnector, {
             stopLossPct: effectiveSlPct,
             takeProfitPct: tpPct,
