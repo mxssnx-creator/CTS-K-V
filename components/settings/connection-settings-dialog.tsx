@@ -174,6 +174,10 @@ export function ConnectionSettingsDialog({
   const [symbolInput, setSymbolInput] = useState("")
   const [exchangeSymbols, setExchangeSymbols] = useState<string[]>([])
   const [loadingSymbols, setLoadingSymbols] = useState(false)
+  // The symbols the engine is currently running with (from active_symbols).
+  // Shown as a read-only preview so the operator knows what takes effect
+  // before and after saving.
+  const [activeSymbols, setActiveSymbols] = useState<string[]>([])
 
   // ── Indications & Strategies state (per channel) ────────────────
   const [indMain,   setIndMain]   = useState<ChannelProfile>(DEFAULT_INDICATION_PROFILE)
@@ -212,7 +216,10 @@ export function ConnectionSettingsDialog({
           volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
           positionMode: (settings.position_mode || conn.position_mode || "one_way") as "one_way" | "hedge",
           leveragePercentage: Number(settings.leveragePercentage) || 100,
-          useMaximalLeverage: settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true",
+          // Default to true when not set — the engine uses maximal leverage by
+          // default. The `=== false` path only fires when the operator
+          // explicitly disabled it in a prior save.
+          useMaximalLeverage: settings.useMaximalLeverage !== false && settings.useMaximalLeverage !== "false",
           useSystemCloseOnly: settings.use_system_close_only === true || settings.useSystemCloseOnly === true,
         })
         setSymbolsCfg(prev => ({
@@ -221,6 +228,19 @@ export function ConnectionSettingsDialog({
           symbolOrder: (settings.symbol_order as SymbolOrder) || prev.symbolOrder,
           symbolCount: Number(settings.symbol_count) || prev.symbolCount,
         }))
+        // Capture the engine's currently-active symbols for display in the
+        // Symbols tab so the operator sees what the engine is running before
+        // they change anything.
+        const rawActive = conn.active_symbols || settings.active_symbols
+        const parsedActive: string[] = (() => {
+          if (Array.isArray(rawActive)) return rawActive.filter(Boolean)
+          if (typeof rawActive === "string" && rawActive.startsWith("[")) {
+            try { return JSON.parse(rawActive).filter(Boolean) } catch { /* fall through */ }
+          }
+          if (typeof rawActive === "string" && rawActive.length > 0) return [rawActive]
+          return []
+        })()
+        setActiveSymbols(parsedActive)
         // Merge saved strategy channels with per-field defaults so older
         // saves (pre-slider, with missing or out-of-range fields) never feed
         // undefined into .toFixed() or NaN into Slider's value prop.
@@ -316,7 +336,7 @@ export function ConnectionSettingsDialog({
               if (Number.isFinite(nested) && nested >= 1) return snap(nested)
               return DEFAULT_COORDINATION_SETTINGS.realEvalPosCount
             })(),
-            // ── PF rolling-window hydrate (5-200 step 5) ���───────────
+            // ── PF rolling-window hydrate (5-200 step 5) ����───────────
             // Same dual-path (flat top-level preferred for engine reads,
             // nested fallback). Snap to the 5-step grid the slider uses.
             prevPosWindow: (() => {
@@ -361,6 +381,15 @@ export function ConnectionSettingsDialog({
   }, [connectionId, exchange])
 
   useEffect(() => { if (open) loadAll() }, [open, loadAll])
+
+  // Auto-populate exchange symbol suggestions whenever the dialog opens or
+  // the symbol order changes. This ensures the "Suggested" panel is always
+  // pre-populated without requiring the operator to click "Refresh listings".
+  useEffect(() => {
+    if (!open) return
+    refreshExchangeSymbols()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, exchangeKey, symbolsCfg.symbolOrder])
 
   // ─────────────────────���───────────────────────────────────────────
   // EXCHANGE SYMBOLS REFRESH
@@ -456,7 +485,27 @@ export function ConnectionSettingsDialog({
       if (!settingsRes.ok) throw new Error("Settings save failed")
       if (!indRes.ok)      throw new Error("Indications save failed")
 
-      toast.success("Settings saved", { description: `Updated ${connectionName}` })
+      // Re-read active_symbols from the updated settings response so the
+      // toast can show what the engine will actually run next cycle.
+      let resolvedDesc = `Updated ${connectionName}`
+      try {
+        const saved = await settingsRes.clone().json().catch(() => ({})) as Record<string, unknown>
+        const settingsData = (saved.settings || {}) as Record<string, unknown>
+        const rawResolved = settingsData.active_symbols || settingsData.symbols
+        const resolvedList: string[] = (() => {
+          if (Array.isArray(rawResolved)) return (rawResolved as string[]).filter(Boolean)
+          if (typeof rawResolved === "string" && rawResolved.startsWith("[")) {
+            try { return (JSON.parse(rawResolved) as string[]).filter(Boolean) } catch { /* fall through */ }
+          }
+          return []
+        })()
+        if (resolvedList.length > 0) {
+          resolvedDesc = `Symbols: ${resolvedList.join(", ")}`
+          setActiveSymbols(resolvedList)
+        }
+      } catch { /* non-fatal — description falls back to connection name */ }
+
+      toast.success("Settings saved", { description: resolvedDesc })
       window.dispatchEvent(new CustomEvent("connection-settings-updated", { detail: { connectionId } }))
       onOpenChange(false)
     } catch (err) {
@@ -683,6 +732,22 @@ export function ConnectionSettingsDialog({
                 <TabsContent value="symbols" className="mt-0 space-y-5">
                   <SectionHeading icon={Database} title="Symbol Selection" subtitle="Choose how the engine ranks and picks symbols from the exchange." />
 
+                  {/* Currently-active symbols — read-only status banner */}
+                  {activeSymbols.length > 0 && (
+                    <div className="rounded-md border border-border bg-muted/40 px-3 py-2 space-y-1">
+                      <div className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium">
+                        Currently active on engine
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {activeSymbols.map((s) => (
+                          <Badge key={s} variant="outline" className="text-[10px] font-mono">
+                            {s}
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="grid grid-cols-2 gap-3">
                     <div className="space-y-1.5">
                       <Label className="text-xs">Order from Exchange</Label>
@@ -716,12 +781,29 @@ export function ConnectionSettingsDialog({
                     </div>
                   </div>
 
+                  {/* Auto-resolve notice when not in manual mode */}
+                  {symbolsCfg.symbolOrder !== "manual" && (
+                    <div className="rounded-md border border-primary/20 bg-primary/5 px-3 py-2 text-[11px] text-muted-foreground">
+                      <span className="font-medium text-foreground">Auto-assign:</span>{" "}
+                      On save, the engine will fetch the top <span className="font-mono font-medium">{symbolsCfg.symbolCount}</span> symbols
+                      by <span className="font-medium">{orderLabel[symbolsCfg.symbolOrder]}</span> from the exchange and apply them.
+                      {availableSymbols.length > 0 && (
+                        <span className="ml-1">
+                          Likely: <span className="font-mono">{availableSymbols.slice(0, symbolsCfg.symbolCount).join(", ")}</span>
+                        </span>
+                      )}
+                    </div>
+                  )}
+
                   <Separator />
 
-                  {/* Symbol chips */}
+                  {/* Symbol chips — manual override list */}
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
-                      <Label className="text-xs">Selected Symbols ({symbolsCfg.symbols.length})</Label>
+                      <Label className="text-xs">
+                        {symbolsCfg.symbolOrder === "manual" ? "Symbols" : "Manual Override"}{" "}
+                        ({symbolsCfg.symbols.length})
+                      </Label>
                       <Button
                         type="button"
                         size="sm" variant="outline"
@@ -737,7 +819,9 @@ export function ConnectionSettingsDialog({
                     <div className="flex flex-wrap gap-1.5 min-h-[2.5rem] rounded-md border border-dashed p-2">
                       {symbolsCfg.symbols.length === 0 && (
                         <span className="text-[11px] text-muted-foreground italic">
-                          No symbols selected — engine will use top-{symbolsCfg.symbolCount} from exchange ordering.
+                          {symbolsCfg.symbolOrder === "manual"
+                            ? "No symbols — add at least one below or switch to auto-assign."
+                            : `No manual override — engine will auto-assign top-${symbolsCfg.symbolCount} on save.`}
                         </span>
                       )}
                       {symbolsCfg.symbols.map((s) => (
@@ -950,7 +1034,7 @@ function IndicationProfileEditor({
   )
 }
 
-// ── Stage accent colours ───────────────────────���─────────────────────
+// ── Stage accent colours ─���─────────────────────���─────────────────────
 const STAGE_ACCENT: Record<StrategyType, { border: string; bg: string; dot: string; label: string }> = {
   base: {
     border: "border-orange-300/40",

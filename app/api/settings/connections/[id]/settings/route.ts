@@ -14,18 +14,62 @@ export async function GET(
   try {
     const { id } = await params
     await initRedis()
-    const connection = await getConnection(id)
+    const client = getRedisClient()
+
+    const [connection, trades, positions, connSettingsHash] = await Promise.all([
+      getConnection(id),
+      RedisTrades.getTradesByConnection(id).catch(() => []),
+      RedisPositions.getPositionsByConnection(id).catch(() => []),
+      // The PATCH route mirrors flat fields (symbol_order, symbol_count,
+      // leveragePercentage, useMaximalLeverage, etc.) into the separate
+      // `connection_settings:{id}` Redis hash so the engine can read them
+      // cheaply. The connection.connection_settings JSON blob only carries
+      // the nested coordination/strategy structure saved before this hash
+      // mirror existed. We must merge both sources so the dialog can hydrate
+      // all saved values on open.
+      client.hgetall(`connection_settings:${id}`).catch(() => null),
+    ])
 
     if (!connection) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 })
     }
 
-    const trades = await RedisTrades.getTradesByConnection(id)
-    const positions = await RedisPositions.getPositionsByConnection(id)
-
-    const settings = typeof connection.connection_settings === "string"
-      ? JSON.parse(connection.connection_settings)
+    // Base: parse the nested JSON blob stored on the connection object.
+    const jsonSettings = typeof connection.connection_settings === "string"
+      ? (() => { try { return JSON.parse(connection.connection_settings) } catch { return {} } })()
       : connection.connection_settings || {}
+
+    // Overlay the flat hash fields on top of the JSON blob. The hash is the
+    // authoritative source for any field the PATCH has mirrored there
+    // (prevPosMinCount, leveragePercentage, symbol_order, etc.) because the
+    // PATCH always writes both stores. Fields that were only ever saved in the
+    // JSON blob (coordination_settings, strategies, profitFactorMin) are
+    // carried by the JSON blob and not overwritten by the hash overlay.
+    const hashSettings: Record<string, unknown> = {}
+    if (connSettingsHash && typeof connSettingsHash === "object") {
+      for (const [k, v] of Object.entries(connSettingsHash as Record<string, string>)) {
+        // Parse numeric strings back to numbers for fields the dialog expects.
+        if ([
+          "symbol_count", "symbolCount", "leveragePercentage",
+          "prevPosMinCount", "prevPosWindow", "mainEvalPosCount",
+          "realEvalPosCount", "minStep",
+        ].includes(k)) {
+          const n = Number(v)
+          hashSettings[k] = Number.isFinite(n) ? n : v
+        } else if (k === "useMaximalLeverage") {
+          // Store as boolean so the dialog's `settings.useMaximalLeverage === true` check works.
+          hashSettings[k] = v === "true"
+        } else if (k === "symbols" || k === "active_symbols") {
+          // Symbols are stored as JSON strings in the hash.
+          try { hashSettings[k] = JSON.parse(v) } catch { hashSettings[k] = v }
+        } else {
+          hashSettings[k] = v
+        }
+      }
+    }
+
+    // Merge: hash fields override JSON blob fields (hash is more recent).
+    const settings = { ...jsonSettings, ...hashSettings }
 
     return NextResponse.json({
       connection,
@@ -147,6 +191,7 @@ export async function PATCH(
     // are stringified because the emulator hash stores strings.
     try {
       const flatKnobs: Record<string, string> = {}
+      // ── Strategy coordination knobs ─────────────────────────────────────
       const knobKeys = [
         "prevPosMinCount",
         "prevPosWindow",
@@ -157,6 +202,46 @@ export async function PATCH(
       for (const k of knobKeys) {
         const v = (merged as Record<string, unknown>)[k]
         if (typeof v === "number" && Number.isFinite(v)) flatKnobs[k] = String(v)
+      }
+
+      // ── Symbol selection fields ─────────────────────────────────────────
+      // Mirror symbol_order, symbol_count, and the resolved symbols list so
+      // the GET route can always read them from the hash regardless of whether
+      // they were also written to the connection JSON blob.
+      {
+        const order = (merged as Record<string, unknown>).symbol_order
+        if (typeof order === "string" && order.length > 0) flatKnobs.symbol_order = order
+
+        const count = Number((merged as Record<string, unknown>).symbol_count)
+        if (Number.isFinite(count) && count > 0) flatKnobs.symbol_count = String(Math.floor(count))
+
+        const syms = (merged as Record<string, unknown>).symbols
+        if (Array.isArray(syms) && syms.length > 0) {
+          flatKnobs.symbols = JSON.stringify(syms)
+        }
+      }
+
+      // ── Position / margin mode ──────────────────────────────────────────
+      {
+        const pm = (merged as Record<string, unknown>).position_mode
+        if (typeof pm === "string") flatKnobs.position_mode = pm
+
+        const mm = (merged as Record<string, unknown>).margin_mode
+        if (typeof mm === "string") flatKnobs.margin_mode = mm
+
+        const vt = (merged as Record<string, unknown>).volume_type
+        if (typeof vt === "string") flatKnobs.volume_type = vt
+      }
+
+      // ── System close flag ───────────────────────────────────────────────
+      {
+        const sco =
+          (merged as Record<string, unknown>).useSystemCloseOnly ??
+          (merged as Record<string, unknown>).use_system_close_only
+        if (typeof sco === "boolean") {
+          flatKnobs.useSystemCloseOnly  = sco ? "true" : "false"
+          flatKnobs.use_system_close_only = sco ? "true" : "false"
+        }
       }
 
       // ── Per-connection leverage mirror ──────────────────────────────────
