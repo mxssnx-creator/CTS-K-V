@@ -316,7 +316,7 @@ export function ConnectionSettingsDialog({
               if (Number.isFinite(nested) && nested >= 1) return snap(nested)
               return DEFAULT_COORDINATION_SETTINGS.realEvalPosCount
             })(),
-            // ── PF rolling-window hydrate (5-200 step 5) ��───────────
+            // ── PF rolling-window hydrate (5-200 step 5) ���───────────
             // Same dual-path (flat top-level preferred for engine reads,
             // nested fallback). Snap to the 5-step grid the slider uses.
             prevPosWindow: (() => {
@@ -620,8 +620,8 @@ export function ConnectionSettingsDialog({
                       </Select>
                     </div>
 
-                    <div className="space-y-1.5">
-                      <Label className="text-xs">Leverage</Label>
+                    <div className={`space-y-1.5 ${overview.useMaximalLeverage ? "opacity-50 pointer-events-none" : ""}`}>
+                      <Label className="text-xs">Leverage %</Label>
                       <NumberField
                         label=""
                         suffix="%"
@@ -630,24 +630,23 @@ export function ConnectionSettingsDialog({
                         step={1}
                         value={overview.leveragePercentage}
                         onChange={(v) => setOverview(p => ({ ...p, leveragePercentage: v }))}
-                        disabled={true}
+                        disabled={overview.useMaximalLeverage}
                       />
                     </div>
                   </div>
 
-                  {/* Maximal leverage is always on — operator policy. The toggle is
-                      shown as locked so the UI makes the setting visible and
-                      auditable, but cannot be turned off from here. */}
-                  <div className="flex items-center justify-between rounded-md border border-border p-3 mt-3 opacity-70">
+                  <div className="flex items-center justify-between rounded-md border border-border p-3 mt-3">
                     <div className="space-y-0.5">
                       <Label className="text-xs font-medium">Use Maximal Leverage</Label>
                       <p className="text-[11px] text-muted-foreground">
-                        {"Always on — engine uses the exchange's maximum supported leverage."}
+                        {overview.useMaximalLeverage
+                          ? "On — engine uses the exchange's maximum supported leverage."
+                          : "Off — engine uses Leverage % of exchange max."}
                       </p>
                     </div>
                     <Switch
-                      checked={true}
-                      disabled={true}
+                      checked={overview.useMaximalLeverage}
+                      onCheckedChange={(v) => setOverview(p => ({ ...p, useMaximalLeverage: v }))}
                     />
                   </div>
 
@@ -951,7 +950,7 @@ function IndicationProfileEditor({
   )
 }
 
-// ── Stage accent colours ─────────────────────────────────────────────
+// ── Stage accent colours ───────────────────────���─────────────────────
 const STAGE_ACCENT: Record<StrategyType, { border: string; bg: string; dot: string; label: string }> = {
   base: {
     border: "border-orange-300/40",

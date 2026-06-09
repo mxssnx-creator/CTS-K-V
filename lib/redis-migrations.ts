@@ -1634,6 +1634,81 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "27")
     },
   },
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Migration 029 — Seed useMaximalLeverage + leveragePercentage into app_settings
+  //
+  // Prior to this migration:
+  //   • all three seed locations (settings-storage, production-seeder,
+  //     app/api/settings GET) defaulted `default_leverage: 10` and did not
+  //     write `useMaximalLeverage` or `leveragePercentage` at all.
+  //   • volume-calculator.ts had a comment "no longer consulted" and ignored
+  //     these settings, always falling back to exchange-max.
+  //   • The Settings UI had all three leverage controls locked/disabled.
+  //
+  // This migration:
+  //   1. Sets `useMaximalLeverage=true` and `leveragePercentage=100` in the
+  //      canonical `app_settings` hash (idempotent — skips if already set).
+  //   2. Clears the stale `default_leverage=10` value from `app_settings`
+  //      to avoid confusion (the engine never reads this field at order time).
+  //   3. Seeds the same pair into every `connection_settings:{id}` hash that
+  //      was not already written by migration 026.
+  // ──────────────────────────────────────────────────────────────────────────
+  {
+    name: "029-leverage-policy-defaults-in-app-settings",
+    version: 29,
+    up: async (client: any) => {
+      await client.set("_schema_version", "29")
+
+      // 1. app_settings — seed leverage policy fields
+      const appSettings029 = (await client.hgetall("app_settings").catch(() => null)) as
+        | Record<string, string>
+        | null
+      const have029app = appSettings029 || {}
+      const appWrites029: Record<string, string> = {}
+      if (!have029app["useMaximalLeverage"]) appWrites029["useMaximalLeverage"] = "true"
+      if (!have029app["leveragePercentage"])  appWrites029["leveragePercentage"]  = "100"
+      // Remove the misleading legacy default_leverage=10 if it was never
+      // operator-set to something meaningful (0 means "use predefinition").
+      if (have029app["default_leverage"] === "10") appWrites029["default_leverage"] = "0"
+      if (Object.keys(appWrites029).length > 0) {
+        await client.hset("app_settings", appWrites029)
+      }
+
+      // 2. connection_settings hashes — seed per-connection defaults
+      let connKeys029: string[] = []
+      try {
+        const raw = await client.smembers("connections")
+        connKeys029 = (raw as string[]).filter((k: string) => typeof k === "string" && k.length > 0)
+      } catch {
+        connKeys029 = []
+      }
+
+      let seeded029 = 0
+      for (const connId of connKeys029) {
+        const settingsKey = `connection_settings:${connId}`
+        const existing029 = (await client.hgetall(settingsKey).catch(() => null)) as
+          | Record<string, string>
+          | null
+        const have029conn = existing029 || {}
+        const writes029: Record<string, string> = {}
+        if (!have029conn["useMaximalLeverage"]) writes029["useMaximalLeverage"] = "true"
+        if (!have029conn["leveragePercentage"])  writes029["leveragePercentage"]  = "100"
+        if (Object.keys(writes029).length > 0) {
+          await client.hset(settingsKey, writes029)
+          seeded029++
+        }
+      }
+
+      console.log(
+        `[v0] Migration 029: seeded useMaximalLeverage/leveragePercentage into app_settings` +
+        ` and ${seeded029}/${connKeys029.length} connection_settings hashes`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "28")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{

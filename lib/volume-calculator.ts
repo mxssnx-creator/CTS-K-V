@@ -431,14 +431,27 @@ export class VolumeCalculator {
         return Number.isFinite(raw) && raw > 0 ? raw : 2
       })()
 
-      // Operator policy: always use the exchange's maximum supported leverage.
-      // `useMaximalLeverage` and `leveragePercentage` are no longer consulted
-      // here — the predefinition lookup in `getMaxLeverageForExchange` is the
-      // single source of truth. The two downstream safety nets still apply:
+      // Resolve effective leverage:
+      //   useMaximalLeverage (default true)  → exchange predefinition max
+      //   useMaximalLeverage false            → maxLeverage × (leveragePercentage / 100)
+      //
+      // Both settings can be set per-connection (connection_settings:{id} hash
+      // overlaid on top of app_settings above). This makes the Settings UI
+      // controls ("Leverage %", "Max Leverage", "Use Maximal Leverage") actually
+      // reach volume calculations.
+      //
+      // Two downstream safety nets still apply after this:
       //   1. resolveBalanceAndLeverage caps to the balance-based bracket.
       //   2. The live-stage 101204 auto-halve retry handles per-symbol limits.
       const connection = await getConnection(connectionId).catch(() => null)
-      const rawLeverage = getMaxLeverageForExchange(connection?.exchange)
+      const exchangeMax   = getMaxLeverageForExchange(connection?.exchange)
+      const useMaximal    = settings.useMaximalLeverage === true ||
+                            settings.useMaximalLeverage === "true" ||
+                            settings.useMaximalLeverage === undefined  // default on
+      const levPct        = Math.max(1, Math.min(100, parseFloat(String(settings.leveragePercentage ?? "100"))))
+      const rawLeverage   = useMaximal
+        ? exchangeMax
+        : Math.max(1, Math.round(exchangeMax * (levPct / 100)))
 
       // Delegate balance-fetch + leverage-cap to the helper method so the
       // logic lives in its own clean scope (no let mutation, no TDZ risk).

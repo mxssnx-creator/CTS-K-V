@@ -210,7 +210,11 @@ export class BybitAPI implements ExchangeAPI {
       ...order,
       marginMode: this.config.marginMode || "cross",
       hedgingMode: this.config.hedgingMode || "single",
-      leverage: this.config.leverage || 10,
+      // Use per-connection maxLeverage when caller did not supply leverage,
+      // falling back to config.leverage (operator-set), then to the safe
+      // default of 125 (Bybit perp cap). The old fallback of 10 prevented
+      // max-leverage positions from being opened via this shim path.
+      leverage: this.config.leverage || this.config.maxLeverage || 125,
       connectionMethod: this.activeConnectionMethod,
     }
 

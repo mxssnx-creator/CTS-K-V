@@ -5,6 +5,7 @@
  */
 
 import { getRedisClient, initRedis } from "@/lib/redis-db"
+import { getMaxLeverageForExchange } from "@/lib/leverage-policy"
 import type { MainPosition } from "./main-stage"
 
 const LOG_PREFIX = "[v0] [RealPositionStage]"
@@ -63,6 +64,14 @@ export async function evaluateToRealPositions(
 ): Promise<RealPosition[]> {
   await initRedis()
   const client = getRedisClient()
+
+  // Resolve the exchange's maximum supported leverage once for this call so
+  // real positions carry a realistic leverage signal instead of the
+  // hardcoded cap of 10. Live-stage still overrides this with venueMax at
+  // order time, but having the correct value here means UI tiles (leverage,
+  // notional) are accurate before the position is actually submitted.
+  const { getMaxLeverageForConnection } = await import("@/lib/leverage-policy")
+  const resolvedMaxLeverage = await getMaxLeverageForConnection(connectionId).catch(() => 10)
   const realPositions: RealPosition[] = []
 
   const minScore = config?.minEvaluationScore || 0.7
@@ -141,7 +150,8 @@ export async function evaluateToRealPositions(
             // Pass the computed evaluationScore so the position record is not
             // stored with the placeholder 0 that was previously left unset.
             evaluationScore,
-          }
+          },
+          resolvedMaxLeverage,
         )
 
         realPositions.push(realPosition)
@@ -217,7 +227,11 @@ function createRealPosition(
     consistency: number
     accountRisk: number
     evaluationScore: number
-  }
+  },
+  // Exchange maximum leverage resolved by the caller — used as the clamp
+  // ceiling instead of the previous hardcoded 10. Live-stage still applies
+  // venueMax at order time; this just makes the stored signal realistic.
+  maxLeverageForExchange: number = 10,
 ): RealPosition {
   const riskPercentage = 0.02 // 2% risk per trade
   const riskAmount = accountBalance * riskPercentage
@@ -243,10 +257,16 @@ function createRealPosition(
       ? mainPos.entryPrice + rewardDistance
       : mainPos.entryPrice - rewardDistance
 
-  // Leverage: how many units of riskAmount fit inside the stop distance
-  // margin. Clamped to [1, 10].
+  // Leverage: how many units of riskAmount fit inside the stop distance margin.
+  // Clamped to [1, maxLeverageForExchange] — the exchange's actual maximum so
+  // the stored signal is realistic. Live-stage still applies venueMax again at
+  // order time (its own override block), so this is a best-estimate for display
+  // and coordination; it can never exceed what the exchange allows.
   const stopMargin = mainPos.entryPrice * Math.max(0.001, 1 - mainPos.riskScore)
-  const leverage = Math.min(Math.max(1, Math.round(riskAmount / stopMargin)), 10)
+  const leverage = Math.min(
+    Math.max(1, Math.round(riskAmount / stopMargin)),
+    Math.max(1, maxLeverageForExchange),
+  )
 
   return {
     id: `real:${connectionId}:${mainPos.symbol}:${mainPos.direction}:${Date.now()}`,
