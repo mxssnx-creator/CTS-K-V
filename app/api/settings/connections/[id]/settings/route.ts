@@ -53,11 +53,27 @@ export async function GET(
           "symbol_count", "symbolCount", "leveragePercentage",
           "prevPosMinCount", "prevPosWindow", "mainEvalPosCount",
           "realEvalPosCount", "minStep",
+          // Axis max-window values
+          "axisPrevMaxWindow", "axisLastMaxWindow", "axisContMaxWindow", "axisPauseMaxWindow",
+          // Block strategy tuning
+          "blockVolumeRatio", "blockMaxStack",
+          // PF / DDT / stage thresholds
+          "baseProfitFactor", "mainProfitFactor", "realProfitFactor", "liveProfitFactor",
+          "maxDrawdownTimeMainHours", "maxDrawdownTimeRealHours", "maxDrawdownTimeLiveHours",
+          "stageMinPosCountBase", "stageMinPosCountMain", "stageMinPosCountReal",
         ].includes(k)) {
           const n = Number(v)
           hashSettings[k] = Number.isFinite(n) ? n : v
-        } else if (k === "useMaximalLeverage") {
-          // Store as boolean so the dialog's `settings.useMaximalLeverage === true` check works.
+        } else if ([
+          "useMaximalLeverage",
+          "useSystemCloseOnly", "use_system_close_only",
+          // Coordination variant toggles
+          "variantTrailingEnabled", "variantBlockEnabled",
+          "variantDcaEnabled", "variantPauseEnabled",
+          // Axis enable flags
+          "axisPrevEnabled", "axisLastEnabled", "axisContEnabled", "axisPauseEnabled",
+        ].includes(k)) {
+          // Store as boolean so dialog toggle/checkbox checks work correctly.
           hashSettings[k] = v === "true"
         } else if (k === "symbols" || k === "active_symbols") {
           // Symbols are stored as JSON strings in the hash.
@@ -241,6 +257,63 @@ export async function PATCH(
         if (typeof sco === "boolean") {
           flatKnobs.useSystemCloseOnly  = sco ? "true" : "false"
           flatKnobs.use_system_close_only = sco ? "true" : "false"
+        }
+      }
+
+      // ── Strategy coordination variant / axis / block flattening ─────────
+      // The dialog sends the full CoordinationSettings object nested under
+      // `coordination_settings`. The strategy coordinator's
+      // `loadCoordinationSettings()` reads FLAT scalar keys from the
+      // `connection_settings:{id}` hash (axisPrevEnabled,
+      // variantBlockEnabled, blockVolumeRatio, etc.). Without flattening
+      // here the engine ALWAYS uses its coded defaults (all variants on,
+      // all axes off, blockVolumeRatio=1.0) regardless of what the
+      // operator sets in the Connection Settings dialog.
+      {
+        const coord = (merged as Record<string, unknown>).coordination_settings as
+          | Record<string, unknown>
+          | undefined
+        if (coord && typeof coord === "object") {
+          // Variant toggles:  variants.{trailing,block,dca,pause}
+          //   → flat key variantTrailingEnabled, variantBlockEnabled, …
+          const variantsObj = coord.variants as Record<string, unknown> | undefined
+          if (variantsObj && typeof variantsObj === "object") {
+            for (const [vk, vv] of Object.entries(variantsObj)) {
+              if (typeof vv === "boolean") {
+                const cap = vk.charAt(0).toUpperCase() + vk.slice(1)
+                flatKnobs[`variant${cap}Enabled`] = vv ? "true" : "false"
+              }
+            }
+          }
+
+          // Axis toggles:  axes.{prev,last,cont,pause}.{enabled,maxWindow}
+          //   → flat keys axis{Prev,Last,Cont,Pause}Enabled and …MaxWindow
+          const axesObj = coord.axes as Record<string, Record<string, unknown>> | undefined
+          if (axesObj && typeof axesObj === "object") {
+            for (const [axisKey, axisVal] of Object.entries(axesObj)) {
+              if (axisVal && typeof axisVal === "object") {
+                const cap = axisKey.charAt(0).toUpperCase() + axisKey.slice(1)
+                if (typeof axisVal.enabled === "boolean") {
+                  flatKnobs[`axis${cap}Enabled`] = axisVal.enabled ? "true" : "false"
+                }
+                const mw = Number(axisVal.maxWindow)
+                if (Number.isFinite(mw) && mw >= 0) {
+                  flatKnobs[`axis${cap}MaxWindow`] = String(mw)
+                }
+              }
+            }
+          }
+
+          // Block-strategy tuning knobs (blockVolumeRatio 0.25-3.0, blockMaxStack 2-8).
+          // Previously never written to the hash — engine always used 1.0/3.
+          const bvr = Number(coord.blockVolumeRatio)
+          if (Number.isFinite(bvr) && bvr > 0) {
+            flatKnobs.blockVolumeRatio = String(Math.max(0.25, Math.min(3.0, bvr)))
+          }
+          const bms = Number(coord.blockMaxStack)
+          if (Number.isFinite(bms) && bms >= 2) {
+            flatKnobs.blockMaxStack = String(Math.min(8, Math.max(2, Math.floor(bms))))
+          }
         }
       }
 

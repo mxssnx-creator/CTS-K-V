@@ -1709,6 +1709,94 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "28")
     },
   },
+  {
+    // ── v30: Seed coordination variant / axis / block defaults ──────────────
+    // The strategy coordinator's `loadCoordinationSettings()` now reads from
+    // `connection_settings:{id}` (per-connection hash) with fallback to global
+    // `app_settings`. Existing hashes have no coordination fields, so the first
+    // cycle after upgrade would fall back to global which may also be absent.
+    // Seed spec defaults idempotently (never clobbers operator-set values):
+    //   variants:  trailing=true, block=true, dca=false, pause=true
+    //   axes:      all disabled by default, maxWindow seeded to spec defaults
+    //   block knobs: blockVolumeRatio=1.0, blockMaxStack=3
+    //
+    // Also seeds app_settings so global fallback works the same way.
+    name: "030-coordination-variant-axis-block-defaults",
+    version: 30,
+    up: async (client: any) => {
+      await client.set("_schema_version", "30")
+
+      const COORD_DEFAULTS: Record<string, string> = {
+        // Variant toggles
+        variantTrailingEnabled: "true",
+        variantBlockEnabled:    "true",
+        variantDcaEnabled:      "false",  // off by spec default
+        variantPauseEnabled:    "true",
+        // Axis toggles — disabled by default (operator must opt-in)
+        axisPrevEnabled:   "false",
+        axisPrevMaxWindow: "12",
+        axisLastEnabled:   "false",
+        axisLastMaxWindow: "4",
+        axisContEnabled:   "false",
+        axisContMaxWindow: "8",
+        axisPauseEnabled:  "false",
+        axisPauseMaxWindow: "8",
+        // Block strategy tuning
+        blockVolumeRatio: "1.0",
+        blockMaxStack:    "3",
+      }
+
+      // ── 1. app_settings global fallback ─────────────────────────────────
+      const appS030 = (await client.hgetall("app_settings").catch(() => null)) as
+        | Record<string, string>
+        | null
+      const haveApp030 = appS030 || {}
+      const appWrites030: Record<string, string> = {}
+      for (const [k, def] of Object.entries(COORD_DEFAULTS)) {
+        if (!haveApp030[k]) appWrites030[k] = def
+      }
+      if (Object.keys(appWrites030).length > 0) {
+        await client.hset("app_settings", appWrites030)
+      }
+
+      // ── 2. Per-connection hashes ─────────────────────────────────────────
+      let connIds030: string[] = []
+      try {
+        const raw = await client.smembers("connections")
+        connIds030 = (raw as string[]).filter(
+          (k: string) => typeof k === "string" && k.length > 0,
+        )
+      } catch {
+        connIds030 = []
+      }
+
+      let seeded030 = 0
+      for (const connId of connIds030) {
+        const hkey = `connection_settings:${connId}`
+        const existing030 = (await client.hgetall(hkey).catch(() => null)) as
+          | Record<string, string>
+          | null
+        const have030 = existing030 || {}
+        const writes030: Record<string, string> = {}
+        for (const [k, def] of Object.entries(COORD_DEFAULTS)) {
+          // Never clobber a field the operator already set.
+          if (!have030[k]) writes030[k] = def
+        }
+        if (Object.keys(writes030).length > 0) {
+          await client.hset(hkey, writes030)
+          seeded030++
+        }
+      }
+
+      console.log(
+        `[v0] Migration 030: seeded coordination defaults into app_settings` +
+        ` and ${seeded030}/${connIds030.length} connection_settings hashes`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "29")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{

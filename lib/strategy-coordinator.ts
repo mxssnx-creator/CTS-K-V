@@ -850,9 +850,16 @@ export class StrategyCoordinator {
   }
 
   /**
-   * Load coordination settings from app settings.
+   * Load coordination settings from app settings with per-connection overlay.
    *
    * Reads axis enable flags, variant toggles, and block strategy settings.
+   * Applies the same resolution hierarchy as loadAppPFThresholds():
+   *   connection_settings:{id} hash  →  global app_settings  →  coded default
+   *
+   * This means the operator's per-connection edits in Connection Settings →
+   * Strategy (Trailing on/off, Block on/off, blockVolumeRatio, axis windows,
+   * etc.) actually reach the engine instead of being silently discarded.
+   *
    * Cached for _coordinationTtlMs (5s).
    */
   private async loadCoordinationSettings(): Promise<void> {
@@ -862,23 +869,69 @@ export class StrategyCoordinator {
 
     try {
       const { getAppSettings } = await import("@/lib/redis-db")
-      const s = (await getAppSettings()) || {}
+      const globalS = (await getAppSettings()) || {}
 
-      this._coordinationSettings.axes.prev.enabled = !!(s as any).axisPrevEnabled
-      this._coordinationSettings.axes.prev.maxWindow = Number((s as any).axisPrevMaxWindow) || 0
-      this._coordinationSettings.axes.last.enabled = !!(s as any).axisLastEnabled
-      this._coordinationSettings.axes.last.maxWindow = Number((s as any).axisLastMaxWindow) || 0
-      this._coordinationSettings.axes.cont.enabled = !!(s as any).axisContEnabled
-      this._coordinationSettings.axes.cont.maxWindow = Number((s as any).axisContMaxWindow) || 0
-      this._coordinationSettings.axes.pause.enabled = !!(s as any).axisPauseEnabled
-      this._coordinationSettings.axes.pause.maxWindow = Number((s as any).axisPauseMaxWindow) || 0
+      // ── Per-connection override of global coordination settings ─────────
+      // The PATCH route flattens CoordinationSettings fields (variantTrailingEnabled,
+      // axisPrevEnabled, blockVolumeRatio, etc.) into `connection_settings:{id}`.
+      // Overlay them on top of global settings so any field the operator did
+      // NOT set per-connection transparently inherits the global value.
+      let connS: Record<string, string> = {}
+      try {
+        connS = ((await getRedisClient().hgetall(`connection_settings:${this.connectionId}`)) ||
+          {}) as Record<string, string>
+      } catch {
+        connS = {}
+      }
+      const s: Record<string, unknown> = { ...(globalS as Record<string, unknown>) }
+      for (const [k, v] of Object.entries(connS)) {
+        if (v !== undefined && v !== null && v !== "") s[k] = v
+      }
 
-      this._coordinationSettings.variants.trailing = !!(s as any).variantTrailingEnabled
-      this._coordinationSettings.variants.block = !!(s as any).variantBlockEnabled
-      this._coordinationSettings.variants.dca = !!(s as any).variantDcaEnabled
-      this._coordinationSettings.variants.pause = !!(s as any).variantPauseEnabled
+      // Boolean helper: accepts "true"/true → true, "false"/false → false,
+      // undefined → supplied default. Mirrors the hash-stored "true"/"false"
+      // strings written by the PATCH route.
+      const bool = (val: unknown, def: boolean): boolean => {
+        if (val === "true"  || val === true)  return true
+        if (val === "false" || val === false) return false
+        return def
+      }
+      const num = (val: unknown, def: number): number => {
+        const n = Number(val)
+        return Number.isFinite(n) ? n : def
+      }
+
+      this._coordinationSettings.axes.prev.enabled   = bool(s.axisPrevEnabled,   false)
+      this._coordinationSettings.axes.prev.maxWindow  = num(s.axisPrevMaxWindow,   0)
+      this._coordinationSettings.axes.last.enabled   = bool(s.axisLastEnabled,   false)
+      this._coordinationSettings.axes.last.maxWindow  = num(s.axisLastMaxWindow,   0)
+      this._coordinationSettings.axes.cont.enabled   = bool(s.axisContEnabled,   false)
+      this._coordinationSettings.axes.cont.maxWindow  = num(s.axisContMaxWindow,   0)
+      this._coordinationSettings.axes.pause.enabled  = bool(s.axisPauseEnabled,  false)
+      this._coordinationSettings.axes.pause.maxWindow = num(s.axisPauseMaxWindow,  0)
+
+      // Variant toggles. Defaults: trailing=true, block=true, dca=false, pause=true
+      // (spec: DCA off by default). The bool() helper only falls back to the
+      // default when the key is genuinely absent — an explicit "false" is honoured.
+      this._coordinationSettings.variants.trailing = bool(s.variantTrailingEnabled, true)
+      this._coordinationSettings.variants.block    = bool(s.variantBlockEnabled,    true)
+      this._coordinationSettings.variants.dca      = bool(s.variantDcaEnabled,      false)
+      this._coordinationSettings.variants.pause    = bool(s.variantPauseEnabled,    true)
+
+      // ── Block-strategy tuning (previously never read from settings) ─────
+      // blockVolumeRatio and blockMaxStack control the Block variant's live
+      // size-stacking formula. Without reading them here the engine always
+      // used the coded defaults (1.0 / 3) regardless of operator changes.
+      const bvr = Number(s.blockVolumeRatio)
+      if (Number.isFinite(bvr) && bvr > 0) {
+        this._coordinationSettings.blockVolumeRatio = Math.max(0.25, Math.min(3.0, bvr))
+      }
+      const bms = Number(s.blockMaxStack)
+      if (Number.isFinite(bms) && bms >= 2) {
+        this._coordinationSettings.blockMaxStack = Math.min(8, Math.max(2, Math.floor(bms)))
+      }
     } catch {
-      // use last-known values
+      // use last-known values on any Redis error
     }
   }
 
