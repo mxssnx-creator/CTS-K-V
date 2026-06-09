@@ -1737,7 +1737,7 @@ export async function executeLivePosition(
   }
 
   try {
-    // ── Step 1: Pre-flight validation ──────────────����──────────────────────
+    // ── Step 1: Pre-flight validation ──────────────�����──────────────────────
     if (!realPosition.direction || !realPosition.symbol) {
       livePosition.status = "rejected"
       livePosition.statusReason = `Invalid inputs: symbol=${realPosition.symbol}, direction=${realPosition.direction}`
@@ -2389,13 +2389,37 @@ export async function executeLivePosition(
           )
         } else if (isNonRecoverableExchangeError(retryResult)) {
           // Both the original and the halved-leverage attempt failed with
-          // 101204. Try one last time at leverage=1 with the bare exchange
-          // minimum quantity (lowest possible margin requirement).
-          //   margin = (minQty × price) / 1 = minQty × price ≥ $5
-          // If this also fails the account truly cannot support even the
-          // smallest possible position; record the margin error and cool down.
-          const minQtyForSymbol = currentPrice > 0 ? 5 / currentPrice : 0
-          if (minQtyForSymbol > 0 && minQtyForSymbol !== computedVolume) {
+          // 101204. Try one last time at leverage=1 with the smallest known
+          // per-symbol quantity (lowest possible margin requirement).
+          //
+          // Prefer the stored exchange minimum from the 101400 handler
+          // (`settings:trading_pair:{sym}` → `min_order_size`). Fall back to
+          // $5/price. At lev=1 the required margin equals the full notional,
+          // so even a tiny qty has the best chance of fitting in the available
+          // free margin.
+          let minQtyForSymbol = currentPrice > 0 ? 5 / currentPrice : 0
+          try {
+            const redisClient = getRedisClient()
+            if (redisClient) {
+              const storedMin = await redisClient.hget(
+                `settings:trading_pair:${realPosition.symbol}`,
+                "min_order_size",
+              )
+              const parsedStoredMin = storedMin ? parseFloat(storedMin) : 0
+              if (parsedStoredMin > 0) {
+                // Use the stored exchange minimum — it is guaranteed to pass
+                // the exchange qty gate; only margin may still fail.
+                minQtyForSymbol = parsedStoredMin
+              }
+            }
+          } catch { /* non-critical; fall back to $5/price */ }
+
+          // Only attempt if the quantity is meaningfully different from what
+          // we already tried (tolerance: 0.1% difference).
+          const quantityDiffPct = computedVolume > 0
+            ? Math.abs(minQtyForSymbol - computedVolume) / computedVolume
+            : 1
+          if (minQtyForSymbol > 0 && quantityDiffPct > 0.001) {
             console.warn(
               `${LOG_PREFIX} 101204 at ${reducedLev}x still fails on ${realPosition.symbol} — ` +
               `trying lev=1 with min notional qty=${minQtyForSymbol.toFixed(8)}`,
