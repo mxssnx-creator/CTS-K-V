@@ -14,6 +14,11 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
           <AppSidebar />
           <main className="flex flex-col flex-1 min-w-0 overflow-y-auto overflow-x-hidden">
             {children}
+            <footer className="mt-auto px-6 py-2 flex justify-end">
+              <span className="text-[11px] font-mono text-muted-foreground/40 select-none tracking-wide">
+                v0.1.1
+              </span>
+            </footer>
           </main>
         </div>
         <Toaster />
