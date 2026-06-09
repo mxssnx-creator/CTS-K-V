@@ -955,11 +955,17 @@ export async function GET(
     // occurred when a single-symbol standalone key was compared against
     // the cross-symbol active sum.
     const activeStratEvaluated: Record<string, number> = { base: 0, main: 0, real: 0 }
+    // Hoisted so the raw hash is accessible in the return block for `strategiesActive`.
+    let stratActiveHash: Record<string, string> | null = null
     try {
-      const [indActiveHash, stratActiveHash] = await Promise.all([
+      const [indActiveHash, _stratActiveHash] = await Promise.all([
         client.hgetall(`indications_active:${connectionId}`).catch(() => null),
         client.hgetall(`strategies_active:${connectionId}`).catch(() => null),
       ])
+      // Persist for outer-scope access (strategiesActive in return object).
+      stratActiveHash = (_stratActiveHash && typeof _stratActiveHash === "object")
+        ? (_stratActiveHash as Record<string, string>)
+        : null
       if (indActiveHash && typeof indActiveHash === "object") {
         for (const [field, val] of Object.entries(indActiveHash)) {
           // field shape: "{symbol}:{type}" — split on the LAST colon so
@@ -1841,6 +1847,67 @@ export async function GET(
     }
 
     // ── METADATA section ─────────────────────────────────────────────��───────
+    // ── STAGE EVAL PERCENT ───────────────────────────────────────────────────
+    // Cascade survival rates: same logic as detailed-tracking.ts so the stats
+    // endpoint exposes the same values without a second full Redis round-trip.
+    //   strategies_{stage}_total     = Sets the stage OUTPUT (promoted)
+    //   strategies_{stage}_evaluated = Sets that ENTERED the stage (input)
+    // base = 100% (pipeline entry; every emitted Set passed by definition)
+    // main = Main output / Main input  (Base→Main filter survival)
+    // real = Real output / Real input  (Main→Real filter survival)
+    const _pct = (num: number, den: number): number =>
+      den > 0 ? Math.max(0, Math.min(100, Number(((num / den) * 100).toFixed(1)))) : 0
+    const _baseOutput = Number(progHash.strategies_base_total     || "0")
+    const _mainOutput = Number(progHash.strategies_main_total     || "0")
+    const _mainInput  = Number(progHash.strategies_main_evaluated || "0")
+    const _realOutput = Number(progHash.strategies_real_total     || "0")
+    const _realInput  = Number(progHash.strategies_real_evaluated || "0")
+    const stageEvalPercent = {
+      base: _baseOutput > 0 ? 100 : 0,
+      main: _pct(_mainOutput, _mainInput),
+      real: _pct(_realOutput, _realInput),
+    }
+
+    // ── REAL AVERAGES ────────────────────────────────────────────────────────
+    // Average real_samples:{id} ring buffer over 5-min window. Falls back to
+    // live snapshot when no in-window samples exist (cold boot / fresh session).
+    const _REAL_AVG_WINDOW_MS = 5 * 60 * 1000
+    const realAverages = await (async () => {
+      try {
+        const raw = (await client
+          .lrange(`real_samples:${connectionId}`, 0, -1)
+          .catch(() => [])) as string[]
+        const cutoff = Date.now() - _REAL_AVG_WINDOW_MS
+        let nSets = 0, nPps = 0, nOpen = 0, count = 0
+        for (const entry of raw) {
+          try {
+            const s = JSON.parse(entry) as { t: number; sets: number; pps: number; open: number }
+            if (!s || typeof s.t !== "number" || s.t < cutoff) continue
+            nSets += Number(s.sets) || 0
+            nPps  += Number(s.pps)  || 0
+            nOpen += Number(s.open) || 0
+            count++
+          } catch { /* skip malformed */ }
+        }
+        if (count === 0) {
+          return {
+            activeSets: stratCounts.real || 0,
+            posPerSet:  0,
+            posOpen:    0,
+            samples:    0,
+          }
+        }
+        return {
+          activeSets: Number((nSets / count).toFixed(2)),
+          posPerSet:  Number((nPps  / count).toFixed(2)),
+          posOpen:    Number((nOpen / count).toFixed(2)),
+          samples:    count,
+        }
+      } catch {
+        return { activeSets: 0, posPerSet: 0, posOpen: 0, samples: 0 }
+      }
+    })()
+
     const phase    = ep?.phase || "unknown"
     const progress = n(ep?.progress)
     const message  = ep?.detail || ep?.message || ""
@@ -2736,6 +2803,25 @@ export async function GET(
             ? `${progHash.epoch}:${progHash.session_number}`
             : "",
       },
+
+      // ── Plan fields: added to surface engine internals to UI ────────────
+      // strategiesActive: raw {symbol}:{stage} hash snapshot from
+      //   strategies_active:{id} — currently-alive count per symbol+stage.
+      //   Consumers can iterate keys to render per-symbol stage badges.
+      strategiesActive: stratActiveHash ?? {},
+
+      // stageEvalPercent: cascade survival rates base/main/real (0-100).
+      //   base = 100 when any Base Sets exist (entry point — by definition all pass).
+      //   main = Main output / Main input (Base→Main filter survival rate).
+      //   real = Real output / Real input  (Main→Real filter survival rate).
+      stageEvalPercent,
+
+      // realAverages: 5-min rolling averages over the real_samples ring buffer.
+      //   activeSets = avg running Real Sets per cycle
+      //   posPerSet  = avg positions per Set (division-by-zero guarded)
+      //   posOpen    = avg open positions
+      //   samples    = number of in-window sample points used
+      realAverages,
 
       // Legacy flat fields kept for backward compat with existing components
       // that still read engine-stats shape directly
