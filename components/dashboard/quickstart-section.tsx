@@ -240,6 +240,12 @@ interface LiveStats {
   // windows
   indLast5m: number
   indLast60m: number
+  // ── Real-stage rolling averages (5-min ring buffer) ──────────────────
+  // Mirrors the values shown in the active-connection-card Historical box.
+  realAverages: { activeSets: number; posPerSet: number; posOpen: number; samples: number } | null
+  // ── Stage cascade eval percentages ───────────────────────────────────
+  // base = mainInput/baseOutput, main = mainOutput/mainInput, real = realOutput/realInput
+  stageEvalPercent: { base: number; main: number; real: number } | null
   // phase
   phase: string
   engineRunning: boolean
@@ -302,6 +308,8 @@ const EMPTY_STATS: LiveStats = {
   apIndications: {},
   apStrategies:  {},
   indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
+  realAverages: null,
+  stageEvalPercent: null,
 }
 
 function fmt(n: number): string {
@@ -580,6 +588,10 @@ export function QuickstartSection() {
         indLast60m:            s.windows?.indications?.last60m    || 0,
         phase:                 s.metadata?.phase || (indCycles > 0 ? "realtime" : "—"),
         engineRunning:         s.metadata?.engineRunning || indCycles > 0,
+        // Real-stage rolling averages and stage cascade eval percentages.
+        // Both arrive from the /stats endpoint already computed.
+        realAverages:     s.realAverages     ?? null,
+        stageEvalPercent: s.stageEvalPercent ?? null,
       })
       // Persist stats to sessionStorage so a page reload can restore the last
       // known values instantly (before the first polling fetch returns).
@@ -1559,6 +1571,35 @@ export function QuickstartSection() {
                     label="Real Pos"
                     value={fmt(stats.realOpen)}
                     sub="active"
+                  />
+                )}
+                {/* ── Real-stage rolling averages ── */}
+                {stats.realAverages && stats.realAverages.activeSets > 0 && (
+                  <MiniStat
+                    label="Avg Sets"
+                    value={stats.realAverages.activeSets.toFixed(1)}
+                    sub="real stage"
+                  />
+                )}
+                {stats.realAverages && stats.realAverages.posPerSet > 0 && (
+                  <MiniStat
+                    label="Avg Pos/Set"
+                    value={stats.realAverages.posPerSet.toFixed(1)}
+                  />
+                )}
+                {stats.realAverages && stats.realAverages.posOpen > 0 && (
+                  <MiniStat
+                    label="Avg Open"
+                    value={stats.realAverages.posOpen.toFixed(1)}
+                    sub="positions"
+                  />
+                )}
+                {/* ── Stage cascade eval percentages ── */}
+                {stats.stageEvalPercent && (
+                  <MiniStat
+                    label="Evals B/M/R"
+                    value={`${stats.stageEvalPercent.base.toFixed(1)}% / ${stats.stageEvalPercent.main.toFixed(0)}% / ${stats.stageEvalPercent.real.toFixed(0)}%`}
+                    sub="stage survival"
                   />
                 )}
               </div>
