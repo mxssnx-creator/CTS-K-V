@@ -243,6 +243,9 @@ interface LiveStats {
   // phase
   phase: string
   engineRunning: boolean
+  // Timestamp (epoch-ms) written by the sessionStorage persistence layer
+  // so the restore path can skip excessively stale snapshots on reload.
+  updatedAt?: number
 }
 
 // One row of the Active Progressing breakdown — sets/trackings/positions.
@@ -578,6 +581,17 @@ export function QuickstartSection() {
         phase:                 s.metadata?.phase || (indCycles > 0 ? "realtime" : "—"),
         engineRunning:         s.metadata?.engineRunning || indCycles > 0,
       })
+      // Persist stats to sessionStorage so a page reload can restore the last
+      // known values instantly (before the first polling fetch returns).
+      // Key is per-connection so switching connections doesn't show stale data.
+      try {
+        if (connectionId) {
+          sessionStorage.setItem(
+            `qs:stats:${connectionId}`,
+            JSON.stringify({ ...stats, updatedAt: Date.now() })
+          )
+        }
+      } catch { /* sessionStorage unavailable */ }
       // NOTE: do NOT auto-set isRunning here — isRunning tracks user-initiated sessions only.
       // engineRunning in stats reflects the server state independently.
     } catch { /* non-critical */ }
@@ -632,7 +646,7 @@ export function QuickstartSection() {
     return () => clearInterval(symbolInterval)
   }, [loadSymbol])
 
-  // ── auto-scroll logs ───────────────────────────────────���────��──────────────
+  // ── auto-scroll logs ────────────────────────────────��──���────��──────────────
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [logs])
@@ -893,6 +907,10 @@ export function QuickstartSection() {
   // render matches SSR (defaults) and React hydrates cleanly. Doing this in an
   // effect — rather than in the useState initialisers — is what prevents the
   // hydration mismatch on the Start button and the cascading radix id drift.
+  //
+  // Also restores the last-known stats from sessionStorage so the dashboard
+  // shows the previous progress immediately on page reload instead of showing
+  // zeros while the first polling fetch is in-flight (~3-5 s).
   useEffect(() => {
     try {
       if (localStorage.getItem("qs:isRunning") === "1") setIsRunning(true)
@@ -903,7 +921,25 @@ export function QuickstartSection() {
         if (Number.isFinite(n)) setSymbolCount(Math.max(1, Math.min(10, n || 10)))
       }
       const ac = localStorage.getItem("qs:activeConnectionId")
-      if (ac) setActiveConnectionId(ac)
+      if (ac) {
+        setActiveConnectionId(ac)
+        // Restore last-known stats for this connection so the UI shows
+        // continuous progress immediately, not zeros, on page reload.
+        try {
+          const cached = sessionStorage.getItem(`qs:stats:${ac}`)
+          if (cached) {
+            const parsed = JSON.parse(cached) as LiveStats
+            // Only hydrate if the snapshot is reasonably fresh (< 10 min).
+            // Stale snapshots are harmless — the first real fetch overwrites
+            // them — but we skip extremely old data to avoid confusing the
+            // operator with hours-old numbers that look "live".
+            const age = Date.now() - (parsed.updatedAt ?? 0)
+            if (age < 10 * 60 * 1000) {
+              setStats(parsed)
+            }
+          }
+        } catch { /* ignore corrupted sessionStorage data */ }
+      }
     } catch { /* localStorage may be unavailable */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])

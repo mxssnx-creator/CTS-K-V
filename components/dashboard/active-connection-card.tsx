@@ -371,6 +371,14 @@ export function ActiveConnectionCard({
         const data = await res.json()
         if (data.success && data.progression) {
           setProgression(data.progression)
+          // Persist so the UI shows last-known progress immediately on reload
+          // instead of blank/zero while the first poll completes.
+          try {
+            sessionStorage.setItem(
+              `acc:progression:${connection.connectionId}`,
+              JSON.stringify({ ...data.progression, _cachedAt: Date.now() })
+            )
+          } catch { /* sessionStorage unavailable */ }
         }
       }
     } catch {
@@ -410,6 +418,23 @@ export function ActiveConnectionCard({
   useEffect(() => {
     phaseRef.current = progression?.phase || "idle"
   }, [progression?.phase])
+
+  // Restore last-known progression from sessionStorage on mount so the card
+  // shows previous progress immediately on page reload instead of blank.
+  useEffect(() => {
+    try {
+      const cached = sessionStorage.getItem(`acc:progression:${connection.connectionId}`)
+      if (cached) {
+        const parsed = JSON.parse(cached)
+        const age = Date.now() - (parsed._cachedAt ?? 0)
+        if (age < 10 * 60 * 1000) {
+          const { _cachedAt: _, ...prog } = parsed
+          setProgression(prog)
+        }
+      }
+    } catch { /* ignore corrupted data */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connection.connectionId])
 
   useEffect(() => {
     fetchProgression()
@@ -1561,7 +1586,7 @@ export function ActiveConnectionCard({
                                 </span>
                                 <span className="text-muted-foreground">
                                   {isLive ? "Hold" : "DDT"} <span className="text-foreground font-medium">
-                                    {avgDDT > 0 ? `${Math.round(avgDDT)}m` : "—"}
+                                    {avgDDT > 0 ? `${Math.round(avgDDT)}m` : "���"}
                                   </span>
                                 </span>
                               </div>
