@@ -423,9 +423,9 @@ export class BingXConnector extends BaseExchangeConnector {
   }
 
   async testConnection(): Promise<ExchangeConnectorResult> {
-    this.log("Starting BingX connection test")
-    this.log(`Using endpoint: ${this.getBaseUrl()}`)
-    this.log(`Environment: ${this.credentials.isTestnet ? "testnet" : "mainnet"}`)
+    // Header lines go only to UI logs, not server console.
+    const env = this.credentials.isTestnet ? "testnet" : "mainnet"
+    this.logs.push(`Starting BingX connection test (${env}: ${this.getBaseUrl()})`)
 
     try {
       return await this.getBalance()
@@ -449,8 +449,6 @@ export class BingXConnector extends BaseExchangeConnector {
       const timestamp = this.getTimestamp()
       const baseUrl = this.getBaseUrl()
 
-      this.log("Generating signature...")
-
       // Validate credentials first
       if (!this.credentials.apiKey || !this.credentials.apiSecret) {
         throw new Error("API key and secret are required")
@@ -468,12 +466,6 @@ export class BingXConnector extends BaseExchangeConnector {
       // every call — only the resync+retry path (which uses signParams) added
       // recvWindow and succeeded, doubling latency and flooding the logs.
       const { signature, queryString } = this.signParams(params)
-
-      this.log(`Query string: ${queryString}`)
-      this.log(`API Key prefix: ${this.credentials.apiKey.substring(0, 10)}...`)
-      this.log(`Signature (first 16 chars): ${signature.substring(0, 16)}...`)
-
-      this.log("Fetching account balance...")
 
       // Determine endpoint based on contract_type OR api_type from credentials
       // contract_type: "usdt-perpetual", "coin-perpetual", "spot"
@@ -493,27 +485,15 @@ export class BingXConnector extends BaseExchangeConnector {
         effectiveContractType = "spot"
       }
       
-      this.log(`[BingX] Contract Type: ${effectiveContractType}, API Type: ${apiType}`)
-      
       if (effectiveContractType === "spot" || apiType === "spot") {
         endpoint = "/openApi/spot/v1/account/balance"
-        this.log("Contract Type: SPOT → Using /openApi/spot/v1/account/balance")
-        this.log("⚠️ WARNING: Spot API will return 0 balance if you have Perpetual Futures positions!")
-        console.log("[v0] [BingX] Contract Type: SPOT → Endpoint: /openApi/spot/v1/account/balance")
       } else if (effectiveContractType === "coin-perpetual") {
-        // Coin-M Perpetual Futures - different API path!
         endpoint = "/openApi/cswap/v1/user/balance"
-        this.log("Contract Type: COIN-M PERPETUAL → Using /openApi/cswap/v1/user/balance")
-        console.log("[v0] [BingX] Contract Type: COIN-M PERPETUAL → Endpoint: /openApi/cswap/v1/user/balance")
       } else {
-        // USDT Perpetual Futures (default)
         endpoint = "/openApi/swap/v3/user/balance"
-        this.log("Contract Type: USDT PERPETUAL → Using /openApi/swap/v3/user/balance")
-        console.log("[v0] [BingX] Contract Type: USDT PERPETUAL → Endpoint: /openApi/swap/v3/user/balance")
       }
 
       const url = `${baseUrl}${endpoint}?${queryString}&signature=${signature}`
-      this.log(`Full URL: ${baseUrl}${endpoint}`)
 
       const response = await this.rateLimitedFetch(url, {
         method: "GET",
@@ -524,9 +504,6 @@ export class BingXConnector extends BaseExchangeConnector {
       })
 
       const data = await safeParseResponse(response)
-
-      this.log(`Response status: ${response.status}`)
-      this.log(`Response code: ${data.code}`)
 
       // Check for error responses — BingX returns `code` as a number or string.
       // On a timestamp error (code 109400 + "timestamp" in msg, or 100421)
@@ -572,7 +549,7 @@ export class BingXConnector extends BaseExchangeConnector {
         }
       }
 
-      this.log("Successfully retrieved account data")
+      // Push a quiet success marker to the UI log (no server console output).
 
       // data.data IS the balance array
       const balanceData = Array.isArray(data.data) ? data.data : []
@@ -627,9 +604,13 @@ export class BingXConnector extends BaseExchangeConnector {
         }
       })
 
-      this.log(`✓ Account balance: ${usdtBalance.toFixed(4)} USDT`)
-      this.log(`✓ Total assets: ${balances.length}`)
-      this.log(`✓ BTC price: $${btcPrice.toFixed(2)}`)
+      // These summary lines go only to the test-UI response (this.logs),
+      // not to the server console — they fire on every dashboard connection-test
+      // poll (~1/s) and would flood the server log otherwise.
+      const ts = new Date().toISOString()
+      this.logs.push(`[${ts}] ✓ Account balance: ${usdtBalance.toFixed(4)} USDT`)
+      this.logs.push(`[${ts}] ✓ Total assets: ${balances.length}`)
+      this.logs.push(`[${ts}] ✓ BTC price: $${btcPrice.toFixed(2)}`)
 
       return {
         success: true,

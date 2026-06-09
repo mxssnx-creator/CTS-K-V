@@ -1257,7 +1257,7 @@ const migrations: Migration[] = [
       // getAllConnections() calls initRedis() internally. Since we are already
       // INSIDE initRedis() running migrations, that creates a circular wait that
       // deadlocks the entire server (event loop blocked, all routes timeout).
-      // Use client.keys() directly ��� exactly as migrations 020-024 do.
+      // Use client.keys() directly ����� exactly as migrations 020-024 do.
       const idSet025 = new Set<string>()
       try {
         const connKeys025 = (await client.keys("connection:*")) || []
@@ -1477,6 +1477,68 @@ const migrations: Migration[] = [
     },
     down: async (client: any) => {
       await client.set("_schema_version", "25")
+    },
+  },
+  {
+    name: "027-engine-timings-defaults-in-settings-system",
+    version: 27,
+    up: async (client: any) => {
+      await client.set("_schema_version", "27")
+
+      // ── Seed engine-timing defaults into `settings:system` ───────────────
+      //
+      // Prior to this migration `settings:system` had no engine-timing keys,
+      // so `getEngineTimings()` fell back to DEFAULT_ENGINE_TIMINGS on every
+      // load.  Seeding the defaults explicitly:
+      //   1. Makes the effective configuration visible and auditable via the
+      //      Settings → System → Engine Timings panel.
+      //   2. Ensures that operator changes persisted through the UI are
+      //      preserved across cold-boots (they already are, but only if the
+      //      key exists — otherwise a flush would reset them invisibly).
+      //   3. Removes the previous livePositionsCyclePauseMs bounds/default
+      //      mismatch confusion: the stored value is 300 ms, the bound max
+      //      is now 500 ms, so `clamp(300, {min:10,max:500}) = 300` (no
+      //      longer silently clamped to 200).
+      //
+      // IDEMPOTENT: hgetall + conditional-hset, never overwrites operator
+      // values that already exist in the hash.
+
+      const TIMING_DEFAULTS_027: Record<string, string> = {
+        live_positions_cycle_pause_ms:   "300",
+        realtime_cycle_pause_ms:         "200",
+        realtime_interval_ms:            "300",
+        prehistoric_interval_ms:         "5000",
+        prehistoric_cycle_pause_ms:      "50",
+        strategy_flow_min_interval_ms:   "5000",
+        strategy_flow_hard_throttle_ms:  "10000",
+        strategy_flow_max_interval_ms:   "30000",
+        lock_extend_interval_ms:         "30000",
+        max_position_hold_ms:            "14400000",
+        progression_buffer_flush_ms:     "5000",
+      }
+
+      const existing027 = (await client.hgetall("settings:system").catch(() => null)) as
+        | Record<string, string>
+        | null
+      const have027 = existing027 || {}
+
+      const toWrite027: Record<string, string> = {}
+      for (const [field, val] of Object.entries(TIMING_DEFAULTS_027)) {
+        if (have027[field] === undefined || have027[field] === null || have027[field] === "") {
+          toWrite027[field] = val
+        }
+      }
+
+      if (Object.keys(toWrite027).length > 0) {
+        await client.hset("settings:system", toWrite027)
+      }
+
+      console.log(
+        `[v0] Migration 027: seeded ${Object.keys(toWrite027).length} engine-timing defaults into settings:system`,
+      )
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "26")
     },
   },
 ]
