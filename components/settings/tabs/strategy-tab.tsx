@@ -242,6 +242,43 @@ export function StrategyTab({ settings, handleSettingChange }: StrategyTabProps)
 
                   <Separator />
 
+                  {/*
+                   * ── Minimal Step (pseudo-position window floor) ────────
+                   * Filters indication config stepsOptions so only window
+                   * sizes >= minStep are generated. Raise to eliminate fast
+                   * noisy short-window configs; lower to test all windows.
+                   */}
+                  <div className="space-y-2">
+                    <h3 className="text-lg font-semibold">Minimal Step</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Minimum pseudo-position step-window size (Steps 3–30).
+                      Only windows ≥ this value are generated. Higher values
+                      filter out fast noisy configs and can reduce losing orders.
+                      Default: 5.
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Min Step Window</Label>
+                    <div className="flex items-center gap-4">
+                      <Slider
+                        min={3}
+                        max={30}
+                        step={1}
+                        value={[settings.minStep ?? 5]}
+                        onValueChange={([value]) => handleSettingChange("minStep", value)}
+                        className="flex-1"
+                      />
+                      <span className="text-sm font-medium w-10 text-right">
+                        {settings.minStep ?? 5}
+                      </span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Steps generated: {[3, 5, 10, 15, 20, 25, 30].filter(s => s >= (settings.minStep ?? 5)).join(", ")}
+                    </p>
+                  </div>
+
+                  <Separator />
+
                   <div className="space-y-4">
                     <h3 className="text-lg font-semibold">Trading Range Configuration</h3>
                     <p className="text-xs text-muted-foreground">

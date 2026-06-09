@@ -192,8 +192,29 @@ export class IndicationConfigManager {
     const configs: IndicationConfig[] = []
     let idCounter = 1
 
+    // Read per-connection minStep from Redis.
+    // Only step-window sizes >= minStep are generated — raising the floor
+    // eliminates fast short-window configs that tend to trigger on noise.
+    let minStep = 5
+    try {
+      await initRedis()
+      const client = getRedisClient()
+      if (client) {
+        const raw = await client.hget(`connection_settings:${this.connectionId}`, "minStep")
+        const parsed = Number(raw)
+        if (Number.isFinite(parsed) && parsed >= 3 && parsed <= 30) {
+          minStep = Math.floor(parsed)
+        }
+      }
+    } catch {
+      // Redis unavailable — fall through to default (5)
+    }
+
     const types = ["SMA", "EMA", "RSI", "MACD"]
-    const stepsOptions = [3, 5, 10, 15, 20]
+    // Full candidate pool 3–30 at practical intervals.
+    // Filter by operator-configured minStep floor.
+    const ALL_STEPS = [3, 5, 10, 15, 20, 25, 30]
+    const stepsOptions = ALL_STEPS.filter(s => s >= minStep)
     const drawdownOptions = [0.05, 0.1, 0.15]
     const activeRatioOptions = [0.6, 0.7, 0.8]
     const lastPartRatioOptions = [0.2, 0.3, 0.4]

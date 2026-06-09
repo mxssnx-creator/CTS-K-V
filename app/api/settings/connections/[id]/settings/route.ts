@@ -152,6 +152,7 @@ export async function PATCH(
         "prevPosWindow",
         "mainEvalPosCount",
         "realEvalPosCount",
+        "minStep",
       ] as const
       for (const k of knobKeys) {
         const v = (merged as Record<string, unknown>)[k]

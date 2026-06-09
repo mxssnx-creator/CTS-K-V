@@ -310,49 +310,20 @@ export function ExchangeTab({
 
             <div className="space-y-4">
               <h3 className="text-lg font-semibold">Leverage Configuration</h3>
-              <p className="text-sm text-muted-foreground">Configure leverage settings and limits</p>
+              <p className="text-sm text-muted-foreground">
+                The engine always uses the exchange&apos;s maximum supported leverage per symbol.
+                This setting cannot be changed — maximal leverage is enforced at the engine level.
+              </p>
 
-              <div className="grid md:grid-cols-2 gap-6">
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <Label>Leverage Percentage</Label>
-                    <span className="text-sm font-medium">{settings.leveragePercentage || 100}%</span>
-                  </div>
-                  <Slider
-                    min={5}
-                    max={100}
-                    step={5}
-                    value={[settings.leveragePercentage || 100]}
-                    onValueChange={([value]) => handleSettingChange("leveragePercentage", value)}
-                  />
-                  <p className="text-xs text-muted-foreground">Percentage of max leverage to use (5-100%)</p>
+              <div className="flex items-center justify-between p-3 border rounded-lg opacity-70 cursor-not-allowed">
+                <div>
+                  <Label className="text-sm font-medium cursor-not-allowed">Use Maximal Leverage</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Always on — engine uses the exchange&apos;s maximum supported leverage per symbol bracket.
+                    The live-stage auto-halve retry handles per-symbol limits (e.g. code 101204).
+                  </p>
                 </div>
-
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <Label>Max Leverage</Label>
-                    <span className="text-sm font-medium">{settings.max_leverage || 125}x</span>
-                  </div>
-                  <Slider
-                    min={1}
-                    max={125}
-                    step={1}
-                    value={[settings.max_leverage || 125]}
-                    onValueChange={([value]) => handleSettingChange("max_leverage", value)}
-                  />
-                  <p className="text-xs text-muted-foreground">Maximum leverage allowed (1-125x)</p>
-                </div>
-
-                <div className="flex items-center justify-between p-3 border rounded-lg">
-                  <div>
-                    <Label>Use Maximal Leverage</Label>
-                    <p className="text-xs text-muted-foreground">Always use maximum available leverage</p>
-                  </div>
-                  <Switch
-                    checked={settings.useMaximalLeverage !== false}
-                    onCheckedChange={(checked) => handleSettingChange("useMaximalLeverage", checked)}
-                  />
-                </div>
+                <Switch checked={true} disabled={true} />
               </div>
             </div>
 

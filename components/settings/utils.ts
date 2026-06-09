@@ -34,6 +34,7 @@ export const initialSettings: Settings = {
   positionCost: 0.1, // Fixed default to 0.1 (representing 0.1%)
   useMaximalLeverage: true,
   min_volume_enforcement: true, // Added missing min_volume_enforcement property
+  minStep: 5, // 3-30 step 1 — minimum pseudo-position step-window size
 
   // Base Strategy
   baseValueRangeMin: 0.5,

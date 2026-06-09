@@ -316,7 +316,7 @@ export function ConnectionSettingsDialog({
               if (Number.isFinite(nested) && nested >= 1) return snap(nested)
               return DEFAULT_COORDINATION_SETTINGS.realEvalPosCount
             })(),
-            // ── PF rolling-window hydrate (5-200 step 5) ────────────
+            // ── PF rolling-window hydrate (5-200 step 5) ��───────────
             // Same dual-path (flat top-level preferred for engine reads,
             // nested fallback). Snap to the 5-step grid the slider uses.
             prevPosWindow: (() => {
@@ -327,6 +327,14 @@ export function ConnectionSettingsDialog({
               const nested = Number((coord as Record<string, unknown>).prevPosWindow)
               if (Number.isFinite(nested) && nested >= 1) return snap(nested)
               return DEFAULT_COORDINATION_SETTINGS.prevPosWindow
+            })(),
+            // ── Minimal Step hydrate (3-30 step 1) ───────────────────
+            minStep: (() => {
+              const flat = Number((settings as Record<string, unknown>).minStep)
+              if (Number.isFinite(flat) && flat >= 3) return Math.min(30, Math.floor(flat))
+              const nested = Number((coord as Record<string, unknown>).minStep)
+              if (Number.isFinite(nested) && nested >= 3) return Math.min(30, Math.floor(nested))
+              return DEFAULT_COORDINATION_SETTINGS.minStep
             })(),
           })
         }
@@ -429,6 +437,7 @@ export function ConnectionSettingsDialog({
         mainEvalPosCount: coordination.mainEvalPosCount,
         realEvalPosCount: coordination.realEvalPosCount,
         prevPosWindow:    coordination.prevPosWindow,
+        minStep:          coordination.minStep ?? 5,
       }
 
       const [settingsRes, indRes] = await Promise.all([

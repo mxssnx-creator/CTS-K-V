@@ -108,6 +108,20 @@ export interface CoordinationSettings {
    * Real promotion). Range 5..50 step 5, default 10.
    */
   realEvalPosCount: number
+
+  /**
+   * ── Minimal Step (pseudo-position window floor) ─────────────────────
+   * Filters the `stepsOptions` array in `IndicationConfigManager` so only
+   * step-window sizes ≥ minStep are generated and evaluated. A lower value
+   * (e.g. 3) includes fast short-window configs that react quickly but
+   * can produce more losing trades on noisy data. Raising the floor (e.g.
+   * 10–15) keeps only longer, smoother windows that typically yield higher
+   * signal quality at the cost of slower response.
+   *
+   * Range 3..30 step 1, default 5.
+   * Backed by `connection_settings:{conn}.minStep`.
+   */
+  minStep: number
 }
 
 /** Spec-aligned defaults — match the constants in strategy-coordinator.ts. */
@@ -130,6 +144,7 @@ export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
   prevPosWindow:    25,
   mainEvalPosCount: 15,
   realEvalPosCount: 10,
+  minStep:           5,
 }
 
 interface StrategyCoordinationSectionProps {
@@ -816,6 +831,67 @@ export function StrategyCoordinationSection({
             </div>
           </div>
 
+        </CardContent>
+      </Card>
+
+      {/* ── Minimal Step card ─────────────────────────────────────────
+          Controls which step-window sizes the indication config manager
+          generates. Only step values ≥ minStep are included in
+          stepsOptions, filtering out fast short-window configs that
+          tend to produce more losing trades on noisy/flat markets. */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <CardTitle className="text-sm">
+                Minimal Step — Pseudo-Position Window Floor
+              </CardTitle>
+              <CardDescription className="text-xs">
+                Minimum step-window size for indication configs (Steps 3–30).
+                Only windows <strong>≥ this value</strong> are generated and
+                evaluated. Raising the floor removes fast short-window configs
+                that react quickly but tend to trigger on noise. Lower = more
+                configs tested; higher = fewer but smoother signals.
+              </CardDescription>
+            </div>
+            <Badge variant="outline" className="text-[10px] tabular-nums">
+              3–30 step 1
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="rounded-lg border border-border/60 p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <Label className="text-sm font-semibold">
+                Min step window size
+              </Label>
+              <Badge variant="secondary" className="text-[10px] tabular-nums">
+                default 5
+              </Badge>
+            </div>
+            <div className="flex items-center gap-3 pt-1">
+              <Slider
+                value={[value.minStep ?? 5]}
+                min={3}
+                max={30}
+                step={1}
+                onValueChange={(v) =>
+                  onChange({ ...value, minStep: v[0] })
+                }
+                className="flex-1"
+              />
+              <span className="text-xs font-semibold tabular-nums w-8 text-right">
+                {value.minStep ?? 5}
+              </span>
+            </div>
+            <p className="text-[11px] text-muted-foreground leading-relaxed pt-1">
+              Steps range from 3 to 30. At default 5 the engine tests
+              [5, 10, 15, 20, 25, 30] window sizes. Setting to 10 drops
+              the two shortest (noisiest) windows. Setting to 3 restores
+              all windows including the fastest. Effective from the next
+              indication config regeneration cycle.
+            </p>
+          </div>
         </CardContent>
       </Card>
     </div>
