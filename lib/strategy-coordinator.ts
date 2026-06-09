@@ -1383,15 +1383,18 @@ export class StrategyCoordinator {
         client.expire(`strategies:${this.connectionId}:base:count`, 86400),
         client.expire(`strategies:${this.connectionId}:base:evaluated`, 86400),
       ]
-      // Total candidates entering Base = variants × indication buckets.
-      // This is the denominator for Base eval% (how many raw combos were
-      // attempted vs how many produced a passing Set).
-      const baseTotalCandidates = variantPasses.length * setMap.size
+      // Base is the pipeline entry point — every Set it produces IS its own
+      // evaluation (it passes by definition of being emitted). The old
+      // denominator `variantPasses.length × setMap.size` counted "raw combos
+      // attempted" which was always ≥ baseSets.length, making Base eval%
+      // appear << 100% and breaking the stageEvalPercent cascade display.
+      // The correct denominator is baseSets.length: same as the numerator,
+      // so Base always evaluates at 100%.
       if (baseSets.length > 0) {
-        writes.push(client.hincrby(redisKey, "strategies_base_total", baseSets.length))
-      }
-      if (baseTotalCandidates > 0) {
-        writes.push(client.hincrby(redisKey, "strategies_base_evaluated", baseTotalCandidates))
+        writes.push(
+          client.hincrby(redisKey, "strategies_base_total",     baseSets.length),
+          client.hincrby(redisKey, "strategies_base_evaluated", baseSets.length),
+        )
       }
 
       // ── ACTIVE-NOW snapshot per (symbol, stage) ───────────────────────
@@ -1874,6 +1877,19 @@ export class StrategyCoordinator {
       if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", mainSets.length))
       if (baseSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_evaluated", baseSets.length))
 
+      // ── ACTIVE-NOW snapshot for Main stage (per symbol, like Base/Real) ───
+      // The stats route reads `strategies_active:{conn}` and aggregates by
+      // stage suffix. Without {symbol}:main fields the `stratCounts.main`
+      // bucket was always 0, making the Main column on the dashboard empty.
+      writes.push(
+        client.hset(`strategies_active:${this.connectionId}`, {
+          [`${symbol}:main`]:           String(mainSets.length),
+          // main:evaluated = Base Sets that entered Main filter (= candidates)
+          [`${symbol}:main:evaluated`]: String(baseSets.length),
+        }),
+        client.expire(`strategies_active:${this.connectionId}`, 600),
+      )
+
       const relatedCreated = mainSets.length - reused
       const activeVariantNames = activeVariants.map((p) => p.name)
       writes.push(
@@ -2253,7 +2269,7 @@ export class StrategyCoordinator {
     let netCancelled = 0
     for (const s of passthrough) {
       const aw = s.axisWindows
-      // ── CRITICAL FIX: Profile-variant Sets always go to hedging ──
+      // ── CRITICAL FIX: Profile-variant Sets always go to hedging ��─
       // Sets in `passthrough` are profile-variant (default/trailing/block/DCA)
       // and MUST participate in hedge netting. Previously, sets without
       // axisWindows were auto-added to netted, bypassing the netting logic.
@@ -3127,6 +3143,15 @@ export class StrategyCoordinator {
         qualifying.length > 0
           ? client.hincrby(redisKey, "strategies_live_total", qualifying.length)
           : Promise.resolve(),
+        // ── ACTIVE-NOW snapshot for Live stage ────────────────────────────
+        // Without {symbol}:live fields the `stratCounts.live` bucket in the
+        // stats route always returned 0, making the Live column empty.
+        client.hset(`strategies_active:${this.connectionId}`, {
+          [`${symbol}:live`]:           String(qualifying.length),
+          // live:evaluated = Real Sets that entered Live selection (= candidates)
+          [`${symbol}:live:evaluated`]: String(realSets.length),
+        }),
+        client.expire(`strategies_active:${this.connectionId}`, 600),
         client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(liveDetailKey, {
           // Legacy per-cycle aggregate fields (last-symbol-wins). Kept

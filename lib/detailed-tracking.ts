@@ -500,13 +500,16 @@ export async function getStrategyTracking(
   const realInput     = Number(prog.strategies_real_evaluated  || "0")
   const pct = (num: number, den: number): number =>
     den > 0 ? Math.max(0, Math.min(100, Number(((num / den) * 100).toFixed(1)))) : 0
-  // Base eval% = sets that passed Base PF gate / total (variant × bucket)
-  // candidates evaluated — expected ~1-5% because most raw indication
-  // combinations are filtered by the base profit-factor threshold.
+  // Base is the pipeline entry point — every Set it emits passed by
+  // definition (it was not filtered away; it IS the output). The
+  // coordinator now writes `strategies_base_evaluated = strategies_base_total`
+  // (same value), so the ratio is always exactly 100 when Base has run.
+  // We short-circuit here as a safety net: even if old Redis data has the
+  // pre-fix inflated denominator, the displayed value is still correct.
   // Main and Real eval% use their own input/output counters (cumulative
   // hincrby) so they reflect the actual stage survival rate, ~50% each.
   const stageEvalPercent = {
-    base: pct(baseOutput, baseInput),
+    base: baseOutput > 0 ? 100 : 0,
     main: pct(mainOutput, mainInput),
     real: pct(realOutput, realInput),
   }
