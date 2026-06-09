@@ -1702,7 +1702,7 @@ export async function GET(
     // history table without round-tripping to the exchange.
     const tradeHistory = closedPositionsForHistory.slice(0, 500)
 
-    // ── PERFORMANCE TIERS ──────────────────────────────────────────────────────
+    // ── PERFORMANCE TIERS ��─────────────────────────────────────────────────────
     // Per-stage (base / main / real / live) performance summary derived from
     // strategy_detail hashes (base/main/real from cross-symbol aggregation,
     // live from closed-archive realised P&L). Each tier holds the fields the
@@ -1862,10 +1862,15 @@ export async function GET(
     const _mainInput  = Number(progHash.strategies_main_evaluated || "0")
     const _realOutput = Number(progHash.strategies_real_total     || "0")
     const _realInput  = Number(progHash.strategies_real_evaluated || "0")
+    // base  = mainInput / baseOutput  — what % of base sets were promoted into
+    //         Main evaluation. Expected ~1%: only the top-PF sets per symbol
+    //         cycle advance; the vast majority of created base sets do not.
+    // main  = mainOutput / mainInput  — survival through the Main PF filter.
+    // real  = realOutput / realInput  — survival through the Real strict filter.
     const stageEvalPercent = {
-      base: _baseOutput > 0 ? 100 : 0,
-      main: _pct(_mainOutput, _mainInput),
-      real: _pct(_realOutput, _realInput),
+      base: _pct(_mainInput, _baseOutput),   // % of base sets promoted into Main
+      main: _pct(_mainOutput, _mainInput),   // % of Main-entered sets that passed
+      real: _pct(_realOutput, _realInput),   // % of Real-entered sets that passed
     }
 
     // ── REAL AVERAGES ────────────────────────────────────────────────────────
