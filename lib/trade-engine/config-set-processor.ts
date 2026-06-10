@@ -627,49 +627,59 @@ export class ConfigSetProcessor {
       }
       await Promise.all(workers)
 
-      // Compute PF only when we actually saw closed positions on both
-      // sides, otherwise the value is meaningless and we leave the field
-      // alone (downstream realtime writers will populate it later).
+      // Always write the PF field so the dashboard's "Historic PF" tile
+      // renders immediately, even when no closed positions exist yet.
+      // If positions exist, compute; otherwise default to 0 so the UI
+      // shows a valid value instead of undefined/blank.
+      let pfStr = "0.0000"
+      let pfSource = "no_closed_positions"
       if (resultCount > 0 && (posSum > 0 || negAbsSum > 0)) {
         const rawPF = negAbsSum > 0 ? posSum / negAbsSum : 9.999 // all-wins ceiling
         const aggregatePF = Math.min(9.999, Math.max(0, rawPF))
-        const pfStr = aggregatePF.toFixed(4)
-        const stageWrites: Promise<any>[] = []
-        for (const stage of ["base", "main", "real"] as const) {
-          const stageKey = `strategy_detail:${this.connectionId}:${stage}`
-          stageWrites.push(
-            client.hset(stageKey, {
-              avg_profit_factor: pfStr,
-              // Mark provenance so anyone debugging the dashboard can tell
-              // this PF was synthesised from prehistoric positions and not
-              // from realtime strategy-coordinator. Cleared on the first
-              // realtime write because that flow doesn't set this field.
-              avg_profit_factor_source: "prehistoric_aggregate",
-              avg_profit_factor_count: String(resultCount),
-              avg_profit_factor_calc_at: new Date().toISOString(),
-            }),
-          )
-          stageWrites.push(client.expire(stageKey, 86400))
-          // Also mirror into the canonical progression hash so the
-          // legacy fallback chain in the /stats route can find it
-          // even if the per-stage detail hash is unreadable for any
-          // reason. Stage-specific keys avoid clobbering the
-          // realtime writer's own writes.
-          stageWrites.push(
-            client.hset(`progression:${this.connectionId}`, {
-              [`strategy_${stage}_avg_profit_factor`]: pfStr,
-            }),
-          )
-        }
-        // Single overall key for the dashboard's "Historic PF" surface.
+        pfStr = aggregatePF.toFixed(4)
+        pfSource = "prehistoric_aggregate"
+      }
+      
+      const stageWrites: Promise<any>[] = []
+      for (const stage of ["base", "main", "real"] as const) {
+        const stageKey = `strategy_detail:${this.connectionId}:${stage}`
         stageWrites.push(
-          client.hset(`prehistoric:${this.connectionId}`, {
-            historic_avg_profit_factor: pfStr,
-            historic_avg_profit_factor_count: String(resultCount),
-            historic_avg_profit_factor_at: new Date().toISOString(),
+          client.hset(stageKey, {
+            avg_profit_factor: pfStr,
+            // Mark provenance so anyone debugging the dashboard can tell
+            // this PF was synthesised from prehistoric positions and not
+            // from realtime strategy-coordinator. Cleared on the first
+            // realtime write because that flow doesn't set this field.
+            avg_profit_factor_source: pfSource,
+            avg_profit_factor_count: String(resultCount),
+            avg_profit_factor_calc_at: new Date().toISOString(),
           }),
         )
-        await Promise.all(stageWrites)
+        stageWrites.push(client.expire(stageKey, 86400))
+        // Also mirror into the canonical progression hash so the
+        // legacy fallback chain in the /stats route can find it
+        // even if the per-stage detail hash is unreadable for any
+        // reason. Stage-specific keys avoid clobbering the
+        // realtime writer's own writes.
+        stageWrites.push(
+          client.hset(`progression:${this.connectionId}`, {
+            [`strategy_${stage}_avg_profit_factor`]: pfStr,
+          }),
+        )
+      }
+      // Single overall key for the dashboard's "Historic PF" surface.
+      // Always written (even with 0.0000 if no closed positions) so the
+      // UI field is never undefined.
+      stageWrites.push(
+        client.hset(`prehistoric:${this.connectionId}`, {
+          historic_avg_profit_factor: pfStr,
+          historic_avg_profit_factor_count: String(resultCount),
+          historic_avg_profit_factor_at: new Date().toISOString(),
+        }),
+      )
+      await Promise.all(stageWrites)
+      
+      if (resultCount > 0) {
         console.log(
           `[v0] [ConfigSetProcessor] Historic PF aggregated: ${pfStr} ` +
           `(across ${resultCount} positions, +${posSum.toFixed(2)}% / ` +
@@ -677,8 +687,8 @@ export class ConfigSetProcessor {
         )
       } else {
         console.log(
-          `[v0] [ConfigSetProcessor] Historic PF skipped — no closed positions ` +
-          `(scan ${Date.now() - tStart}ms)`,
+          `[v0] [ConfigSetProcessor] Historic PF initialized: 0.0000 ` +
+          `(no closed positions yet, scan ${Date.now() - tStart}ms)`,
         )
       }
     } catch (err) {
