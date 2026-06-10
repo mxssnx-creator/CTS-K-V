@@ -167,15 +167,19 @@ async function incrementOrdersBySymbol(connectionId: string, symbol: string, sid
   const client = getRedisClient()
   try {
     const key = `live_orders_by_symbol:${connectionId}`
-    // hset field -> JSON string of { symbol, side, count }
-    const existingRaw = await client.hget(key, symbol).catch(() => null)
-    let existing: { symbol: string; side: string; count: number } = { symbol, side, count: 0 }
-    if (existingRaw) {
-      try { existing = JSON.parse(existingRaw as string) } catch { existing = { symbol, side, count: 0 } }
+    // Field format: `{SYMBOL}:{direction}:{metric}` e.g. "SOLUSDT:long:placed"
+    // This matches the parser in /stats route (field.slice(midColon+1, lastColon) for direction,
+    // field.slice(lastColon+1) for kind). Using hincrby so long and short accumulate independently.
+    const dir = (side === "short" ? "short" : "long")
+    const field = `${symbol}:${dir}:${metric}`
+    if (typeof (client as any).hincrby === "function") {
+      await (client as any).hincrby(key, field, 1)
+    } else {
+      // Fallback: read-modify-write
+      const raw = await client.hget(key, field).catch(() => null)
+      const current = parseInt(String(raw || "0"), 10) || 0
+      await client.hset(key, { [field]: String(current + 1) })
     }
-
-    existing.count = (existing.count || 0) + 1
-    await client.hset(key, symbol, JSON.stringify(existing))
   } catch {
     /* best-effort */
   }

@@ -54,31 +54,14 @@ export async function POST(request: Request) {
       log.push(`Cleared margin cooldowns for base connections`)
     }
 
-    // ── 2. Re-apply base connection enabled flags ─────────────────────
+    // ── 2. Connection enable flags — intentionally NOT touched ────────
+    // AUTO-START DISABLED: reconnect no longer forces is_enabled_dashboard="1".
+    // Connections are enabled/disabled only by explicit user action (dashboard toggle).
+    // This endpoint only clears cooldowns and restarts dropped engines for already-enabled connections.
     const BASE_CONNECTION_IDS = ["bingx-x01"]
     const connIdsToHeal = targetConnectionId ? [targetConnectionId] : BASE_CONNECTION_IDS
-    let healed = 0
-    for (const connId of connIdsToHeal) {
-      try {
-        const connData = await client.hgetall(`connection:${connId}`)
-        if (!connData) continue
-        if (connData.is_enabled_dashboard !== "1") {
-          await client.hset(`connection:${connId}`, {
-            is_enabled_dashboard: "1",
-            is_active_inserted: "1",
-            is_assigned: "1",
-            is_enabled: "1",
-            is_inserted: "1",
-            is_active: "1",
-          })
-          await client.sadd("connections:main:enabled", connId)
-          healed++
-          log.push(`Restored dashboard_enabled=1 for ${connId}`)
-        }
-      } catch (err) {
-        log.push(`Failed to heal ${connId}: ${err instanceof Error ? err.message : String(err)}`)
-      }
-    }
+    const healed = 0
+    log.push(`Connection enable flags preserved as-is (auto-enable disabled)`)
 
     // ── 3. Ensure global engine is running ────────────────────────────
     // If the engine is stopped (e.g. auto-stop after a code hot-reload, or a
