@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server"
 import { query } from "@/lib/db"
+import { fetchTopSymbols } from "@/lib/top-symbols"
 
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -13,6 +14,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     }
 
     const connection = connections[0]
+    const exchange = connection.exchange?.toLowerCase() || "bingx"
 
     // Get cached symbols for this exchange
     const cachedSymbols = await query<any>(
@@ -32,7 +34,25 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
       })
     }
 
-    // Return default symbols if no cache
+    // If no cache, fetch top 5 symbols by 1h volatility and sort with most volatile LAST
+    try {
+      const { symbols } = await fetchTopSymbols(exchange, 5, "volatility")
+      const symbolList = symbols.map((s) => s.symbol)
+      // Sort ascending by volatility (most volatile LAST)
+      const sorted = symbols.sort((a, b) => Math.abs(a.priceChangePercent) - Math.abs(b.priceChangePercent))
+      return NextResponse.json({
+        symbols: sorted.map((s) => s.symbol),
+        source: "volatility-sorted",
+        exchange: exchange,
+        count: sorted.length,
+        sortedByVolatility: true,
+        mostVolatileLast: true,
+      })
+    } catch (fetchErr) {
+      console.warn(`[v0] Failed to fetch top symbols for ${exchange}:`, fetchErr)
+    }
+
+    // Fallback: return default symbols (legacy behavior)
     const defaultSymbols = [
       "BTCUSDT",
       "ETHUSDT",

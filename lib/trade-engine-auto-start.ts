@@ -173,30 +173,13 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
           }
         }
 
-        // ── Idempotent base-connection activation ───────────────────
-        // Migrations 015–017 unconditionally reset is_enabled_dashboard to
-        // "0" on every boot. Re-apply the correct value before the engine
-        // sweep so the coordinator always sees the right flag.
-        try {
-          const activationClient = getRedisClient()
-          for (const connId of BASE_CONNECTION_IDS) {
-            const connData = await activationClient.hgetall(`connection:${connId}`)
-            if (!connData) continue
-            if (connData.is_enabled_dashboard === "1") continue // already correct
-            await activationClient.hset(`connection:${connId}`, {
-              is_enabled_dashboard: "1",
-              is_active_inserted: "1",
-              is_assigned: "1",
-              is_enabled: "1",
-              is_inserted: "1",
-              is_active: "1",
-            })
-            await activationClient.sadd("connections:main:enabled", connId)
-            console.log(`[v0] [AutoStart] Self-heal: restored dashboard_enabled=1 for ${connId}`)
-          }
-        } catch (activErr) {
-          console.warn("[v0] [AutoStart] Failed to restore dashboard_enabled:", activErr)
-        }
+        // ── Idempotent base-connection activation (DISABLED) ───────────────────
+        // AUTO-START DISABLED: Connections no longer auto-enable on boot.
+        // Users must explicitly enable connections via the dashboard toggle.
+        // This allows starting without immediately running all engines.
+        //
+        // REMOVED: code that was setting is_enabled_dashboard="1" automatically.
+        // The healing sweep will now skip this activation block entirely.
 
         const connections = await getAllConnections()
         if (!Array.isArray(connections)) {
