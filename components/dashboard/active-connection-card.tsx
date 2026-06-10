@@ -363,14 +363,19 @@ export function ActiveConnectionCard({
   // Poll progression
   const fetchProgression = useCallback(async () => {
     try {
-      const res = await fetch(`/api/connections/progression/${connection.connectionId}`, {
+      const res = await fetch(`/api/connections/progression/${connection.connectionId}/stats`, {
         cache: "no-store",
         headers: { "Cache-Control": "no-cache, no-store, must-revalidate" },
       })
       if (res.ok) {
         const data = await res.json()
-        if (data.success && data.progression) {
-          setProgression(data.progression)
+        if (res.ok) {
+          setProgression({
+            phase: data.metadata?.phase || "idle",
+            isRunning: data.metadata?.engineRunning || false,
+            started_at: data.metadata?.startedAt,
+            ...data,
+          } as any)
           // Persist so the UI shows last-known progress immediately on reload
           // instead of blank/zero while the first poll completes.
           try {
