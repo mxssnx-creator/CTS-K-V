@@ -114,14 +114,20 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  try {
-    const { id: connectionId } = await params
+  // Add request timeout: if this endpoint takes >15 seconds, abort
+  const timeoutPromise = new Promise<Response>((_, reject) =>
+    setTimeout(() => reject(new Error("Stats endpoint timeout (15s exceeded)")), 15000)
+  )
 
-    await initRedis()
-    const client = getRedisClient()
-    if (!client) {
-      return NextResponse.json({ error: "Redis not available" }, { status: 503 })
-    }
+  const mainLogic = async () => {
+    try {
+      const { id: connectionId } = await params
+
+      await initRedis()
+      const client = getRedisClient()
+      if (!client) {
+        return NextResponse.json({ error: "Redis not available" }, { status: 503 })
+      }
 
     // ── Read all namespaces in parallel ──────────────────────────────────────
     // NOTE: hgetall returns null (not throws) when the key doesn't exist — always coerce to {}
@@ -1702,7 +1708,7 @@ export async function GET(
     // history table without round-tripping to the exchange.
     const tradeHistory = closedPositionsForHistory.slice(0, 500)
 
-    // ── PERFORMANCE TIERS ���─────────────────────────────────────────────────────
+    // ── PERFORMANCE TIERS ����─────────────────────────────────────────────────────
     // Per-stage (base / main / real / live) performance summary derived from
     // strategy_detail hashes (base/main/real from cross-symbol aggregation,
     // live from closed-archive realised P&L). Each tier holds the fields the
@@ -2841,11 +2847,23 @@ export async function GET(
       totalStrategyCount:    stratTotal,
       positionsCount:        positionsOpen,
     })
+    } catch (error) {
+      console.error("[v0] [/stats] Error:", error)
+      const { id } = await params
+      return NextResponse.json(
+        { error: error instanceof Error ? error.message : "Unknown error", connectionId: id },
+        { status: 500 }
+      )
+    }
+  }
+
+  // Race the main logic against a 15-second timeout
+  try {
+    return await Promise.race([mainLogic(), timeoutPromise])
   } catch (error) {
-    console.error("[v0] [/stats] Error:", error)
-    const { id } = await params
+    console.error("[v0] [/stats] Request failed:", error)
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Unknown error", connectionId: id },
+      { error: error instanceof Error ? error.message : "Stats request failed" },
       { status: 500 }
     )
   }
