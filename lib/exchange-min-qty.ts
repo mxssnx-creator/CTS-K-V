@@ -55,15 +55,48 @@ export const VENUE_MIN_QTY_BY_BASE: Record<string, number> = {
 }
 
 /**
+ * Common quote currencies appended in exchange-native concatenated symbols.
+ * Listed longest-first so "USDT" is stripped before "USD" and "BTC" is not
+ * accidentally consumed as a base when the actual base starts with "BTC".
+ */
+const KNOWN_QUOTES = ["USDT", "USDC", "BUSD", "USD", "BTC", "ETH", "EUR", "GBP"]
+
+/**
  * Looks up the minimum order quantity for the given symbol's base asset.
  *
- * @param symbol - Symbol in either CCXT (`BTC/USDT`) or hyphen-native
- *                 (`BTC-USDT`) or underscore (`BTC_USDT`) format.
+ * Handles three formats:
+ *   • Separated  : `BTC/USDT`, `BTC-USDT`, `BTC_USDT`  → split on separator
+ *   • Native/concat: `BTCUSDT`, `SOLUSDT`, `BNBUSDT`    → strip known quote suffix
+ *
+ * @param symbol - Symbol in any of the above formats.
  * @returns The minimum quantity in base units, or 1 if the base asset
  *          is not in the table.
  */
 export function getVenueMinQty(symbol: string | undefined | null): number {
   if (!symbol) return 1
-  const base = String(symbol).split(/[/\-_]/)[0]?.toUpperCase() ?? ""
-  return VENUE_MIN_QTY_BY_BASE[base] ?? 1
+  const raw = String(symbol).toUpperCase()
+
+  // Fast path: separator-based symbol (BTC/USDT, BTC-USDT, BTC_USDT)
+  const hasSep = /[/\-_]/.test(raw)
+  if (hasSep) {
+    const base = raw.split(/[/\-_]/)[0] ?? ""
+    return VENUE_MIN_QTY_BY_BASE[base] ?? 1
+  }
+
+  // Slow path: native concatenated symbol (BTCUSDT, SOLUSDT, …)
+  // Try exact match first (handles unusual tickers not decomposable below)
+  if (VENUE_MIN_QTY_BY_BASE[raw] !== undefined) {
+    return VENUE_MIN_QTY_BY_BASE[raw]
+  }
+  // Strip known quote suffixes to extract the base ticker
+  for (const quote of KNOWN_QUOTES) {
+    if (raw.endsWith(quote)) {
+      const base = raw.slice(0, raw.length - quote.length)
+      if (base.length > 0 && VENUE_MIN_QTY_BY_BASE[base] !== undefined) {
+        return VENUE_MIN_QTY_BY_BASE[base]
+      }
+    }
+  }
+  // Unknown symbol — return conservative default
+  return 1
 }

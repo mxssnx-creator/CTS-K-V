@@ -1,4 +1,4 @@
-import { initRedis, getSettings, setSettings, getConnection } from "@/lib/redis-db"
+import { initRedis, getSettings, setSettings, getConnection, getRedisClient } from "@/lib/redis-db"
 
 /**
  * Settings Coordinator
@@ -115,20 +115,35 @@ export async function notifySettingsChanged(
       // Reset per-stage counters so stats are recomputed from scratch
       // under the new settings — avoids blending pre-change and
       // post-change data in the dashboard.
+      //
+      // CRITICAL: setSettings() stores under a `settings:` prefix, so it writes
+      // to `settings:progression:{id}` — NOT the canonical `progression:{id}`
+      // hash that the dashboard reads via `getProgressionState / hgetall`.
+      // Use the raw Redis client + hset on the bare key instead.
       try {
-        const progKey = `progression:${connectionId}`
-        await setSettings(progKey, {
-          strategies_base_count: "0",
-          strategies_main_count: "0",
-          strategies_real_count: "0",
-          strategies_live_count: "0",
-          indication_auto_count: "0",
-          indication_main_count: "0",
-          indication_common_count: "0",
-          indication_optimal_count: "0",
-          indication_manual_count: "0",
-          settings_changed_at: new Date().toISOString(),
-        })
+        const client = getRedisClient()
+        if (client) {
+          // Only reset the per-stage SET and EVALUATED counters. These are the
+          // fields that blend pre-change and post-change strategy data. Do NOT
+          // reset cycle_count or total_trades — the progression timeline is still
+          // valid; only the per-stage strategy output needs to restart clean.
+          const progKey = `progression:${connectionId}`
+          await client.hset(progKey, {
+            strategies_base_total: "0",
+            strategies_main_total: "0",
+            strategies_real_total: "0",
+            strategies_base_evaluated: "0",
+            strategies_main_evaluated: "0",
+            strategies_real_evaluated: "0",
+            indications_direction_count: "0",
+            indications_move_count: "0",
+            indications_active_count: "0",
+            indications_active_advanced_count: "0",
+            indications_optimal_count: "0",
+            indications_auto_count: "0",
+            settings_changed_at: new Date().toISOString(),
+          })
+        }
       } catch { /* non-critical */ }
       console.log(`[v0] [SettingsCoordinator] Engine hot-reload flagged for ${connectionId}`)
     }

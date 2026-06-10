@@ -128,75 +128,26 @@ export async function initializeTradeEngineAutoStart(): Promise<void> {
         }
 
         if (currentStatus !== "running") {
-          if (operatorStopped) {
-            if (isStartup) {
-              console.log(
-                "[v0] [AutoStart] Startup sweep skipped: operator-stopped state detected. " +
-                  "Engines remain stopped until operator clicks Start.",
-              )
-            }
-            return
+          // AUTO-START DISABLED: never auto-resurrect the global engine.
+          // Only the operator's explicit Start action (via dashboard / QuickStart)
+          // may set trade_engine:global status=running. The monitor just skips
+          // its sweep and waits for the next tick.
+          if (isStartup) {
+            console.log(
+              `[v0] [AutoStart] Startup sweep skipped: global engine not running (status="${currentStatus || "empty"}"). ` +
+              "Engine will start only when operator clicks Start.",
+            )
           }
-          // Auto-resurrect: write status=running and continue the sweep so
-          // the connection monitor can re-arm engines for autoActive base
-          // connections. This matches the bootstrap path in
-          // `redis-migrations.ts → ensureBaseConnections`.
-          for (const connId of BASE_CONNECTION_IDS) {
-            const exists = await monClient.hgetall(`connection:${connId}`).catch(() => null)
-            if (exists && Object.keys(exists).length > 0) {
-              const nowIso = new Date().toISOString()
-              await monClient.hset("trade_engine:global", {
-                status: "running",
-                started_at: nowIso,
-                bootstrapped_at: nowIso,
-                bootstrapped_by: "auto-start-monitor",
-              })
-              console.log(
-                `[v0] [AutoStart] Self-heal: resurrected trade_engine:global=running ` +
-                  `(was "${currentStatus || "empty"}"; base connection ${connId} present)`,
-              )
-              break
-            }
-          }
-          // Re-read after the potential write — if the bootstrap wasn't
-          // applicable (no base connections), bail out cleanly.
-          const reReadState = (await monClient.hgetall("trade_engine:global").catch(() => null)) as
-            | Record<string, string>
-            | null
-          if (reReadState?.status !== "running") {
-            if (isStartup) {
-              console.log(
-                "[v0] [AutoStart] Startup sweep skipped: global engine not running and no base connection to bootstrap.",
-              )
-            }
-            return
-          }
+          return
         }
 
-        // ── Idempotent base-connection activation ───────────────────
-        // Migrations 015–017 unconditionally reset is_enabled_dashboard to
-        // "0" on every boot. Re-apply the correct value before the engine
-        // sweep so the coordinator always sees the right flag.
-        try {
-          const activationClient = getRedisClient()
-          for (const connId of BASE_CONNECTION_IDS) {
-            const connData = await activationClient.hgetall(`connection:${connId}`)
-            if (!connData) continue
-            if (connData.is_enabled_dashboard === "1") continue // already correct
-            await activationClient.hset(`connection:${connId}`, {
-              is_enabled_dashboard: "1",
-              is_active_inserted: "1",
-              is_assigned: "1",
-              is_enabled: "1",
-              is_inserted: "1",
-              is_active: "1",
-            })
-            await activationClient.sadd("connections:main:enabled", connId)
-            console.log(`[v0] [AutoStart] Self-heal: restored dashboard_enabled=1 for ${connId}`)
-          }
-        } catch (activErr) {
-          console.warn("[v0] [AutoStart] Failed to restore dashboard_enabled:", activErr)
-        }
+        // ── Idempotent base-connection activation (DISABLED) ─────────────���─────
+        // AUTO-START DISABLED: Connections no longer auto-enable on boot.
+        // Users must explicitly enable connections via the dashboard toggle.
+        // This allows starting without immediately running all engines.
+        //
+        // REMOVED: code that was setting is_enabled_dashboard="1" automatically.
+        // The healing sweep will now skip this activation block entirely.
 
         const connections = await getAllConnections()
         if (!Array.isArray(connections)) {

@@ -58,7 +58,8 @@ const initialFilters: AdvancedFiltersInd = {
 }
 
 export default function IndicationsPage() {
-  const { selectedConnectionId } = useExchange()
+  const { selectedConnectionId, activeConnections } = useExchange()
+  const resolvedConnectionId = selectedConnectionId || activeConnections?.[0]?.id || null
   const [indications, setIndications] = useState<Indication[]>([])
   const [isDemo, setIsDemo] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
@@ -70,7 +71,7 @@ export default function IndicationsPage() {
       setIsLoading(true)
       try {
         // Determine which connection to use (fallback to demo if none selected)
-        const connectionToUse = selectedConnectionId || "demo-mode"
+        const connectionToUse = resolvedConnectionId || "demo-mode"
 
         const response = await fetch(`/api/data/indications?connectionId=${encodeURIComponent(connectionToUse)}`)
         if (!response.ok) {
@@ -94,7 +95,7 @@ export default function IndicationsPage() {
     }
 
     loadIndications()
-  }, [selectedConnectionId])
+  }, [resolvedConnectionId])
 
   // Handle real-time indication updates via SSE
   const handleIndicationUpdate = useCallback((update: any) => {
@@ -134,7 +135,7 @@ export default function IndicationsPage() {
 
   // Subscribe to indication updates via SSE
   useIndicationUpdates(
-    selectedConnectionId && selectedConnectionId !== "demo-mode" ? selectedConnectionId : "",
+    resolvedConnectionId && resolvedConnectionId !== "demo-mode" ? resolvedConnectionId : "",
     handleIndicationUpdate
   )
 

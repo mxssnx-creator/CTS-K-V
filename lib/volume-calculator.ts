@@ -9,6 +9,7 @@
  */
 
 import { initRedis, getSettings, getAppSettings, setSettings, getRedisClient, getConnection } from "@/lib/redis-db"
+import { getMaxLeverageForExchange } from "@/lib/leverage-policy"
 
 interface VolumeCalculationParams {
   baseVolumeFactor?: number
@@ -43,6 +44,11 @@ interface VolumeCalculationParams {
   // setting can never blow out a live order to 100× the intended size.
   mainVolumeFactor?: number
   presetVolumeFactor?: number
+  // Adjust-type variant multiplier: block=1.5-2.0, dca=0.5, others=1.0.
+  // Applied after liveEngineFactor; absent/undefined → 1.0 (no scaling).
+  // Clamped to [0.1, 5] — narrower than engine factor's [0.1, 10] since
+  // this comes from automated variantProfiles, not operator overrides.
+  sizeMultiplier?: number
 }
 
 interface VolumeCalculationResult {
@@ -59,12 +65,16 @@ interface VolumeCalculationResult {
 
 export class VolumeCalculator {
   /**
-   * Universal hard floor: $3 notional covers BingX/Binance/Bybit/OKX minimums
+   * Universal hard floor: $5 notional covers BingX/Binance/Bybit/OKX minimums
    * while remaining conservative for margin constraints. The 101400 auto-correction
    * handler persists exact per-pair minimums to `settings:trading_pair:{symbol}`,
    * so this floor is mainly the safety net for first-time pairs.
+   *
+   * BingX perpetual minimum maintenance margin per position is approximately $5
+   * notional at 10x leverage → $0.50 margin. At $3 notional BingX returns
+   * code=101204 (Insufficient margin) on pairs like XRP, SOL, BNB.
    */
-  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 3
+  private static readonly UNIVERSAL_MIN_NOTIONAL_USD = 5
 
   /**
    * Fetch account balance and compute the leverage safety cap.
@@ -117,10 +127,10 @@ export class VolumeCalculator {
       // Non-critical — fall back to the $10k default so volume is calculated.
     }
 
-    // Leverage safety cap: keep margin per position above exchange floor.
-    //   ≤$50  → 10x  |  ≤$200 → 20x  |  ≤$500 → 50x  |  >$500 → 125x
-    const cap = balance <= 50 ? 10 : balance <= 200 ? 20 : balance <= 500 ? 50 : 125
-    return { accountBalance: balance, maxLeverage: Math.min(rawLeverage, cap) }
+    // No balance-based leverage cap — operator policy is always-max-leverage.
+    // The exchange setLeverage call clamps to the per-symbol bracket and the
+    // 101204 auto-halve retry handles any remaining margin rejections.
+    return { accountBalance: balance, maxLeverage: rawLeverage }
   }
 
   /**
@@ -151,6 +161,7 @@ export class VolumeCalculator {
       tradeMode,
       mainVolumeFactor,
       presetVolumeFactor,
+      sizeMultiplier,
     } = params
 
     // ── Resolve the engine-specific volume factor (Live-only) ──────
@@ -234,22 +245,37 @@ export class VolumeCalculator {
       // — which is exactly the spec: pseudo positions are ratio-only,
       // live positions calculate "indeed volume" (real notional) using
       // the per-engine ratio.
+      // ── Adjust-type variant multiplier (Block / DCA) ──────────────────
+      // Clamped to [0.1, 5]; absent/invalid → 1.0 (identity).
+      // Applied after liveEngineFactor so both multipliers compose:
+      //   notional = balance × positionCost × liveEngineFactor × variantMult / posAvg
+      const clampVariant = (raw: number | undefined): number => {
+        const n = Number(raw)
+        if (!Number.isFinite(n) || n <= 0) return 1
+        return Math.max(0.1, Math.min(5, n))
+      }
+      const variantMult = clampVariant(sizeMultiplier)
+
       const posAvg = positionsAverage && positionsAverage > 0 ? positionsAverage : 1
-      const positionSizeUsd = (accountBalance * positionCost * liveEngineFactor) / posAvg
+      const positionSizeUsd = (accountBalance * positionCost * liveEngineFactor * variantMult) / posAvg
       const calculatedVolume = positionSizeUsd / currentPrice
       const { final, adjusted, reason } = clampUp(calculatedVolume)
 
-      // Surface engine-factor provenance in the adjustment reason ONLY
-      // when it actually changed sizing (≠ 1.0). A 1.0 factor is the
-      // norm for Strategy callers and default Live config, and we don't
-      // want to spam the volume-history log with no-op entries.
+      // Surface multiplier provenance in the adjustment reason only when
+      // the factor actually changed sizing (≠ 1.0) to avoid log spam.
       const factorReason =
         liveEngineFactor !== 1 && tradeMode
           ? `${tradeMode}-engine volume factor ${liveEngineFactor.toFixed(2)}x applied`
           : undefined
-      const composedReason = adjusted && reason
-        ? (factorReason ? `${reason} | ${factorReason}` : reason)
-        : factorReason
+      const variantReason =
+        variantMult !== 1
+          ? `variant size multiplier ${variantMult.toFixed(2)}x applied (Block/DCA adjust-type)`
+          : undefined
+      const composedReason = [
+        adjusted ? reason : undefined,
+        factorReason,
+        variantReason,
+      ].filter(Boolean).join(" | ") || undefined
 
       return {
         calculatedVolume,
@@ -257,7 +283,7 @@ export class VolumeCalculator {
         volume: final,
         volumeUsd: final * currentPrice,
         leverage,
-        volumeAdjusted: adjusted || liveEngineFactor !== 1,
+        volumeAdjusted: adjusted || liveEngineFactor !== 1 || variantMult !== 1,
         adjustmentReason: composedReason,
       }
     }
@@ -375,7 +401,12 @@ export class VolumeCalculator {
     connectionId: string,
     symbol: string,
     currentPrice: number,
-    options: { tradeMode?: "main" | "preset" } = {},
+    options: {
+      tradeMode?: "main" | "preset"
+      // Block/DCA variant multiplier from RealPosition.sizeMultiplier.
+      // Absent / undefined → treated as 1.0 (no Block/DCA scaling).
+      sizeMultiplier?: number
+    } = {},
   ): Promise<VolumeCalculationResult> {
     try {
       await initRedis()
@@ -388,7 +419,24 @@ export class VolumeCalculator {
       // Previously this read `system_settings`, which is a different
       // bundle (cleanup schedule, backup toggles) — so the operator's
       // saved leverage/cost never reached volume calculations.
-      const settings = (await getAppSettings()) || {}
+      //
+      // Per-connection override: the connection settings dialog can save
+      // `leveragePercentage` / `useMaximalLeverage` / `exchangePositionCost`
+      // per-connection, mirrored into the `connection_settings:{id}` hash.
+      // Overlay any non-empty connection-hash scalar on top of the global
+      // app settings so per-connection sizing wins, else inherits global.
+      const globalSettings = (await getAppSettings()) || {}
+      let connSettings: Record<string, string> = {}
+      try {
+        connSettings = ((await client.hgetall(`connection_settings:${connectionId}`)) ||
+          {}) as Record<string, string>
+      } catch {
+        connSettings = {}
+      }
+      const settings: Record<string, unknown> = { ...(globalSettings as Record<string, unknown>) }
+      for (const [k, v] of Object.entries(connSettings)) {
+        if (v !== undefined && v !== null && v !== "") settings[k] = v
+      }
       // Default position cost: 0.02% of balance per position (ultra-minimal).
       // With the new spec (Base capped at 1 long + 1 short), position budget
       // is intentionally kept at the absolute floor. On a $10K balance:
@@ -413,12 +461,27 @@ export class VolumeCalculator {
         return Number.isFinite(raw) && raw > 0 ? raw : 2
       })()
 
-      const leveragePercentage = parseFloat(String(settings.leveragePercentage ?? "100"))
-      // `parseHash` coerces the stored "true"/"1" to boolean true, so a
-      // strict `=== true` check is now safe (the old
-      // `=== "true"` string compare would always miss).
-      const useMaxLeverage = settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true"
-      const rawLeverage = useMaxLeverage ? 125 : Math.round(125 * (leveragePercentage / 100))
+      // Resolve effective leverage:
+      //   useMaximalLeverage (default true)  → exchange predefinition max
+      //   useMaximalLeverage false            → maxLeverage × (leveragePercentage / 100)
+      //
+      // Both settings can be set per-connection (connection_settings:{id} hash
+      // overlaid on top of app_settings above). This makes the Settings UI
+      // controls ("Leverage %", "Max Leverage", "Use Maximal Leverage") actually
+      // reach volume calculations.
+      //
+      // Two downstream safety nets still apply after this:
+      //   1. setLeverage(symbol, X) on the connector — venue clamps to per-symbol bracket.
+      //   2. The live-stage 101204 auto-halve retry handles margin rejections.
+      const connection = await getConnection(connectionId).catch(() => null)
+      const exchangeMax   = getMaxLeverageForExchange(connection?.exchange)
+      const useMaximal    = settings.useMaximalLeverage === true ||
+                            settings.useMaximalLeverage === "true" ||
+                            settings.useMaximalLeverage === undefined  // default on
+      const levPct        = Math.max(1, Math.min(100, parseFloat(String(settings.leveragePercentage ?? "100"))))
+      const rawLeverage   = useMaximal
+        ? exchangeMax
+        : Math.max(1, Math.round(exchangeMax * (levPct / 100)))
 
       // Delegate balance-fetch + leverage-cap to the helper method so the
       // logic lives in its own clean scope (no let mutation, no TDZ risk).
@@ -474,6 +537,8 @@ export class VolumeCalculator {
         tradeMode: resolvedMode,
         mainVolumeFactor,
         presetVolumeFactor,
+        // Variant multiplier forwarded from the callsite (Block/DCA sizing).
+        sizeMultiplier: options.sizeMultiplier,
       })
 
       return result

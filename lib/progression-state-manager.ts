@@ -87,7 +87,7 @@
  * ╚═════════════════════════════════════════════════════════════════════════╝
  */
 
-import { getRedisClient, initRedis } from "@/lib/redis-db"
+import { getRedisClient, initRedis, setSettings } from "@/lib/redis-db"
 
 export interface ProgressionState {
   connectionId: string
@@ -415,11 +415,14 @@ return {
    */
   static async incrementPrehistoricCycle(connectionId: string, symbol: string): Promise<void> {
     try {
-      const client = getRedisClient()
-      if (!client) {
+      if (!getRedisClient()) {
         await initRedis()
       }
-      const actualClient = getRedisClient()
+      const client = getRedisClient()
+      if (!client) {
+        console.warn(`[v0] Redis client not available for incrementPrehistoricCycle`)
+        return
+      }
       const key = `progression:${connectionId}`
 
       // PERFORMANCE: The previous implementation called `getProgressionState`
@@ -459,21 +462,59 @@ return {
   }
 
   /**
-   * Mark prehistoric phase as complete
+   * Mark prehistoric phase as complete.
+   *
+   * Deterministically PINS the terminal progress state so the dashboard can
+   * never be left showing a sub-100% bar or an "X/N" label short of N once the
+   * run has actually finished — even if a symbol was skipped (no data) or threw
+   * mid-process and the live percent never organically reached the end. Pass
+   * `symbolTotal` (the connection's configured symbol count) to stamp the
+   * authoritative final counts.
    */
-  static async completePrehistoricPhase(connectionId: string): Promise<void> {
+  static async completePrehistoricPhase(connectionId: string, symbolTotal?: number): Promise<void> {
     try {
-      const client = getRedisClient()
+      // Ensure Redis is initialised BEFORE using the client.
+      // getRedisClient() returns null on cold-boot; binding `client` first then
+      // calling initRedis() left the local null, causing every completion call
+      // to crash on `client.hset` with "Cannot read properties of null".
+      // Re-fetch after init so we always hold a live instance.
+      let client = getRedisClient()
       if (!client) {
         await initRedis()
+        client = getRedisClient()!
       }
-      const actualClient = getRedisClient()
       const key = `progression:${connectionId}`
 
       await client.hset(key, {
         prehistoric_phase_active: "false",
         last_update: new Date().toISOString(),
       })
+
+      // Pin the prehistoric counter hash + the dashboard progress bar to their
+      // terminal values. We clamp the displayed processed count to the distinct
+      // SET cardinality (authoritative) but never below `symbolTotal` so the
+      // label reads a clean "N/N".
+      try {
+        const distinct = await client
+          .scard(`prehistoric:${connectionId}:symbols`)
+          .catch(() => 0)
+        const total = Math.max(1, symbolTotal ?? distinct ?? 1)
+        const finalProcessed = Math.max(distinct, total)
+        await client.hset(`prehistoric:${connectionId}`, {
+          symbols_processed: String(finalProcessed),
+          symbols_total: String(total),
+          is_complete: "1",
+        })
+        await setSettings(`engine_progression:${connectionId}`, {
+          phase: "prehistoric_data",
+          progress: 95,
+          detail: `Prehistoric calc complete — ${finalProcessed}/${total} symbols processed`,
+          sub_current: finalProcessed,
+          sub_total: total,
+          connection_id: connectionId,
+          updated_at: new Date().toISOString(),
+        }).catch(() => { /* non-critical */ })
+      } catch { /* non-critical */ }
 
       console.log(`[v0] [Prehistoric] Phase completed for connection ${connectionId}`)
     } catch (error) {
@@ -593,11 +634,14 @@ return {
    */
   static async resetProgressionState(connectionId: string): Promise<void> {
     try {
-      const client = getRedisClient()
-      if (!client) {
+      if (!getRedisClient()) {
         await initRedis()
       }
-      const actualClient = getRedisClient()
+      const client = getRedisClient()
+      if (!client) {
+        console.warn(`[v0] Redis client not available for resetProgressionState`)
+        return
+      }
       const key = `progression:${connectionId}`
       await client.del(key)
       console.log(`[v0] [Progression] State reset for ${connectionId}`)
@@ -622,11 +666,14 @@ return {
    */
   static async endProgression(connectionId: string, epoch = 0): Promise<void> {
     try {
-      const client = getRedisClient()
-      if (!client) {
+      if (!getRedisClient()) {
         await initRedis()
       }
-      const actualClient = getRedisClient()
+      const client = getRedisClient()
+      if (!client) {
+        console.warn(`[v0] Redis client not available for endProgression`)
+        return
+      }
       const key = `progression:${connectionId}`
       const now = Date.now()
 
@@ -675,11 +722,16 @@ return {
     connectionId: string,
     newEpoch: number,
   ): Promise<number> {
-    const client = getRedisClient()
-    if (!client) {
+    // CRITICAL: init first, then fetch the live client — the old pattern bound
+    // `client` before initRedis() ran, so the first call on a cold boot used null.
+    if (!getRedisClient()) {
       await initRedis()
     }
-    const actualClient = getRedisClient()
+    const client = getRedisClient()
+    if (!client) {
+      console.warn(`[v0] Redis client not available for archiveAndStartNewProgression — returning session 1`)
+      return 1
+    }
     const key = `progression:${connectionId}`
     const now = Date.now()
 
@@ -864,24 +916,69 @@ return {
 
       const liveSymbolCount = currentSymbols.length
       const liveSymbolsHash = currentSymbols.sort().join("|")
+
+      // ── Settings fingerprint ────────────────────────────────────────────
+      // Fields that fundamentally change what the progression computes.
+      // A progression born for is_live_trade=0 must be scrapped when
+      // the operator enables live trading (different code paths, different
+      // position sets). Likewise for testnet/preset mode switches and
+      // connection_method (library vs websocket), and the margin/position
+      // configuration that drives the exchange connector. We compare the
+      // *stored* snapshot (captured at engine-start) to the *live* values
+      // so the first settings-save that differs triggers a clean restart.
+      const liveFingerprint = [
+        connData.is_live_trade   || "0",
+        connData.is_testnet      || "0",
+        connData.is_preset_trade || "0",
+        connData.connection_method || "library",
+        connData.margin_type     || "cross",
+        connData.position_mode   || "hedge",
+      ].join(":")
+
+      // The stored snapshot is a JSON blob; parse it gracefully.
+      let storedFingerprint = ""
+      try {
+        const snap = existing.progress_settings_snapshot
+          ? JSON.parse(existing.progress_settings_snapshot)
+          : {}
+        storedFingerprint = [
+          snap.is_live_trade   || "0",
+          snap.is_testnet      || "0",
+          snap.is_preset_trade || "0",
+          snap.connection_method || "library",
+          snap.margin_type     || "cross",
+          snap.position_mode   || "hedge",
+        ].join(":")
+      } catch { /* treat missing snapshot as a mismatch */ }
+
       const liveSnapshot = {
         symbol_count: liveSymbolCount,
         symbols_hash: liveSymbolsHash,
-        is_live_trade: connData.is_live_trade,
-        is_preset_trade: connData.is_preset_trade,
+        is_live_trade: connData.is_live_trade || "0",
+        is_testnet: connData.is_testnet || "0",
+        is_preset_trade: connData.is_preset_trade || "0",
+        connection_method: connData.connection_method || "library",
+        margin_type: connData.margin_type || "cross",
+        position_mode: connData.position_mode || "hedge",
         updated_at: new Date().toISOString(),
       }
 
       const storedSymbolCount = parseInt(existing.symbol_count || "0", 10)
       const storedHash = existing.active_symbols_hash || ""
 
-      const mismatch = storedSymbolCount !== liveSymbolCount || storedHash !== liveSymbolsHash
+      const symbolMismatch = storedSymbolCount !== liveSymbolCount || storedHash !== liveSymbolsHash
+      // Only compare fingerprints when a stored snapshot exists (empty stored
+      // fingerprint = first ever start, not yet solidified — not a mismatch).
+      const settingsMismatch = storedFingerprint !== "" && storedFingerprint !== liveFingerprint
+      const mismatch = symbolMismatch || settingsMismatch
 
       if (mismatch) {
+        const reason = symbolMismatch
+          ? `symbols changed (stored=${storedSymbolCount} vs live=${liveSymbolCount})`
+          : `settings changed (stored="${storedFingerprint}" vs live="${liveFingerprint}")`
         console.log(
-          `[v0] [Progression] Re-coordination needed for ${connectionId}: ` +
-          `stored symbols=${storedSymbolCount} vs live=${liveSymbolCount}. ` +
-          `Stopping previous progress and starting fresh for actual state.`
+          `[v0] [Progression] Re-coordination needed for ${connectionId}: ${reason}. ` +
+          `Stopping previous progress and starting fresh for actual state.`,
         )
 
         // Force archive + new start (this stops previous via the archive logic + new epoch)
@@ -935,26 +1032,56 @@ return {
       const now = Date.now()
       const nowIso = new Date(now).toISOString()
 
+      // ── Staleness guard ────────────────────────────────────────────────
+      // A progression with `engine_started === "true"` may be a zombie:
+      // the engine init wrote the flag but then crashed before the first
+      // processor tick updated `last_update`. We detect this by comparing
+      // `last_update` (the canonical activity timestamp written every 500
+      // cycles and on every settings change) to a generous staleness bound.
+      //
+      // STALENESS_MS = 30 minutes. An actively running engine updates
+      // `last_update` at minimum every 500 cycles × ≥300ms = ~150s. If
+      // 30 min have elapsed with no update the engine is either stopped or
+      // dead — treating the progression as live would incorrectly attach
+      // a new engine start to a zombie session (wrong epoch, wrong counters).
+      const STALENESS_MS = 30 * 60 * 1000
+
       if (existing && Object.keys(existing).length > 0 && existing.engine_started === "true") {
-        // There is already one unique active progression (recoordinate ensured it matches current live state)
-        const sessionNumber = parseInt(existing.session_number || "1", 10)
-        const epoch = Number(existing.epoch) || now
+        // Check that the session is actually fresh — not a zombie from a prior
+        // crashed engine that set engine_started but never ran its first tick.
+        const lastUpdateMs = existing.last_update
+          ? new Date(existing.last_update).getTime()
+          : (existing.started_at ? Number(existing.started_at) : 0)
+        const sessionAge = now - lastUpdateMs
+        const isStale = !lastUpdateMs || !Number.isFinite(lastUpdateMs) || sessionAge > STALENESS_MS
 
-        // Light attach: update activity timestamps, keep the same unique session/epoch
-        await client.hset(key, {
-          last_update: nowIso,
-          last_visited: nowIso,
-          engine_started: "true",
-        }).catch(() => {})
+        if (!isStale) {
+          // There is already one healthy unique active progression (recoordinate ensured it matches current live state)
+          const sessionNumber = parseInt(existing.session_number || "1", 10)
+          const epoch = Number(existing.epoch) || now
 
-        await client.expire(key, 7 * 24 * 60 * 60).catch(() => {})
+          // Light attach: update activity timestamps, keep the same unique session/epoch
+          await client.hset(key, {
+            last_update: nowIso,
+            last_visited: nowIso,
+            engine_started: "true",
+          }).catch(() => {})
 
+          await client.expire(key, 7 * 24 * 60 * 60).catch(() => {})
+
+          console.log(
+            `[v0] [Progression] Attached to existing unique progression for ${connectionId} ` +
+            `(session=${sessionNumber}, epoch=${epoch}, age=${Math.round(sessionAge / 1000)}s)`,
+          )
+
+          return { sessionNumber, epoch, wasNew: false }
+        }
+
+        // Session is stale — treat as dead and start fresh
         console.log(
-          `[v0] [Progression] Attached to existing unique progression for ${connectionId} ` +
-          `(session=${sessionNumber}, epoch=${epoch})`
+          `[v0] [Progression] Stale session detected for ${connectionId} ` +
+          `(engine_started=true but last_update=${Math.round(sessionAge / 60000)}min ago) — starting fresh.`,
         )
-
-        return { sessionNumber, epoch, wasNew: false }
       }
 
       // No active unique progression (or it was cleaned by recoordinate) → start one

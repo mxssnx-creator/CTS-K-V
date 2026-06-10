@@ -112,8 +112,13 @@ async function runOneSweep(): Promise<SweepSummary> {
     const connId: string = conn.id || (conn as any).connection_id || (conn as any).connectionId
     if (!connId) continue
 
+    // Canonical per-connection hash is `connection_settings:{id}` (underscore)
+    // — the same key written by the settings PATCH route and read by the
+    // coordinator/volume-calculator. The old `connection:settings:{id}`
+    // (colon) key never existed, so every `settings?.*` gate below was dead
+    // and the cron relied solely on the `conn.is_live_trade` fallback.
     const settings = await client
-      .hgetall(`connection:settings:${connId}`)
+      .hgetall(`connection_settings:${connId}`)
       .catch(() => ({} as Record<string, string>))
 
     const isLiveTrade =
@@ -135,15 +140,29 @@ async function runOneSweep(): Promise<SweepSummary> {
       continue
     }
 
-    // Engine-running guard: realtime processor already reconciles every
-    // ~5 s via the live-sync path. Don't double-up here.
+    // Engine-running guard: the LivePositions loop in engine-manager.ts
+    // writes `last_processor_heartbeat` (epoch ms) into
+    // `settings:trade_engine_state:{id}` via client.hset.
+    //
+    // PREVIOUS BUG: code read bare `trade_engine_state:{id}` (missing the
+    // `settings:` prefix) and checked the non-existent `updated_at` field.
+    // Result: engineActiveRecently was always false, so the cron ran a
+    // full sync even while the in-process engine was already syncing every
+    // 200 ms — continuous double-syncing of every live position.
+    const engineStateKey = `settings:trade_engine_state:${connId}`
     const engineState = await client
-      .hgetall(`trade_engine_state:${connId}`)
+      .hgetall(engineStateKey)
       .catch(() => ({} as Record<string, string>))
-    const lastUpdatedAt = engineState?.updated_at
-      ? new Date(engineState.updated_at as string).getTime()
-      : 0
-    const engineActiveRecently = Date.now() - lastUpdatedAt < 90_000
+    // last_processor_heartbeat is epoch-ms (numeric string).
+    // Fall back to last_live_positions_run (ISO) if the numeric field is absent.
+    const heartbeatRaw = engineState?.last_processor_heartbeat
+    const lastHeartbeatMs = heartbeatRaw
+      ? Number(heartbeatRaw)
+      : engineState?.last_live_positions_run
+        ? new Date(engineState.last_live_positions_run as string).getTime()
+        : 0
+    const engineActiveRecently =
+      Number.isFinite(lastHeartbeatMs) && Date.now() - lastHeartbeatMs < 90_000
     if (engineActiveRecently) {
       summary.connectionsSkipped++
       continue

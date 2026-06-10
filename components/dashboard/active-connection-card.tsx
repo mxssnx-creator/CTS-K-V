@@ -117,6 +117,18 @@ export function ActiveConnectionCard({
   globalEngineRunning,
 }: ActiveConnectionCardProps) {
   const [progression, setProgression] = useState<ProgressionData | null>(null)
+  // Lightweight Real-stage averages + stage eval percentages, fetched on the
+  // same poll cadence as progression (no extra timer).
+  const [realAverages, setRealAverages] = useState<{
+    activeSets: number
+    posPerSet: number
+    posOpen: number
+  } | null>(null)
+  const [stageEvalPercent, setStageEvalPercent] = useState<{
+    base: number
+    main: number
+    real: number
+  } | null>(null)
   const [infoDialogOpen, setInfoDialogOpen] = useState(false)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [logsDialogOpen, setLogsDialogOpen] = useState(false)
@@ -351,14 +363,55 @@ export function ActiveConnectionCard({
   // Poll progression
   const fetchProgression = useCallback(async () => {
     try {
-      const res = await fetch(`/api/connections/progression/${connection.connectionId}`, {
+      const res = await fetch(`/api/connections/progression/${connection.connectionId}/stats`, {
         cache: "no-store",
         headers: { "Cache-Control": "no-cache, no-store, must-revalidate" },
       })
       if (res.ok) {
         const data = await res.json()
-        if (data.success && data.progression) {
-          setProgression(data.progression)
+        if (res.ok) {
+          setProgression({
+            phase: data.metadata?.phase || "idle",
+            isRunning: data.metadata?.engineRunning || false,
+            started_at: data.metadata?.startedAt,
+            ...data,
+          } as any)
+          // Persist so the UI shows last-known progress immediately on reload
+          // instead of blank/zero while the first poll completes.
+          try {
+            sessionStorage.setItem(
+              `acc:progression:${connection.connectionId}`,
+              JSON.stringify({ ...data.progression, _cachedAt: Date.now() })
+            )
+          } catch { /* sessionStorage unavailable */ }
+        }
+      }
+    } catch {
+      // Non-critical polling — swallow silently
+    }
+    // Real-stage averaged counts + stage eval %. Folded into the same poll so
+    // we don't spin up a second interval. Failures are non-fatal.
+    try {
+      const tRes = await fetch(`/api/connections/progression/${connection.connectionId}/tracking/strategies`, {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache, no-store, must-revalidate" },
+      })
+      if (tRes.ok) {
+        const tData = await tRes.json()
+        const tracking = tData?.tracking ?? tData
+        if (tracking?.real?.averages) {
+          setRealAverages({
+            activeSets: Number(tracking.real.averages.activeSets) || 0,
+            posPerSet: Number(tracking.real.averages.posPerSet) || 0,
+            posOpen: Number(tracking.real.averages.posOpen) || 0,
+          })
+        }
+        if (tracking?.stageEvalPercent) {
+          setStageEvalPercent({
+            base: Number(tracking.stageEvalPercent.base) || 0,
+            main: Number(tracking.stageEvalPercent.main) || 0,
+            real: Number(tracking.stageEvalPercent.real) || 0,
+          })
         }
       }
     } catch {
@@ -370,6 +423,23 @@ export function ActiveConnectionCard({
   useEffect(() => {
     phaseRef.current = progression?.phase || "idle"
   }, [progression?.phase])
+
+  // Restore last-known progression from sessionStorage on mount so the card
+  // shows previous progress immediately on page reload instead of blank.
+  useEffect(() => {
+    try {
+      const cached = sessionStorage.getItem(`acc:progression:${connection.connectionId}`)
+      if (cached) {
+        const parsed = JSON.parse(cached)
+        const age = Date.now() - (parsed._cachedAt ?? 0)
+        if (age < 10 * 60 * 1000) {
+          const { _cachedAt: _, ...prog } = parsed
+          setProgression(prog)
+        }
+      }
+    } catch { /* ignore corrupted data */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connection.connectionId])
 
   useEffect(() => {
     fetchProgression()
@@ -1292,6 +1362,40 @@ export function ActiveConnectionCard({
                               </span>
                             </div>
                           )}
+                          {/* ── Real-stage averaged counts + stage eval % ── */}
+                          {realAverages && (
+                            <>
+                              <div className="flex items-center gap-1" title="Average number of Real Sets running.">
+                                <span className="text-muted-foreground">Avg Sets</span>
+                                <span className="font-medium tabular-nums text-emerald-700 dark:text-emerald-400">
+                                  {realAverages.activeSets.toFixed(1)}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-1" title="Average positions (entries) held per running Real Set.">
+                                <span className="text-muted-foreground">Avg Pos/Set</span>
+                                <span className="font-medium tabular-nums text-emerald-700 dark:text-emerald-400">
+                                  {realAverages.posPerSet.toFixed(1)}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-1" title="Average total open positions across running Real Sets.">
+                                <span className="text-muted-foreground">Avg Open</span>
+                                <span className="font-medium tabular-nums text-emerald-700 dark:text-emerald-400">
+                                  {realAverages.posOpen.toFixed(1)}
+                                </span>
+                              </div>
+                            </>
+                          )}
+                          {stageEvalPercent && (
+                            <div
+                              className="flex items-center gap-1"
+                              title="Stage pass-through: Base is the 100% entry point; Main = survived Base→Main; Real = survived Main→Real."
+                            >
+                              <span className="text-muted-foreground">Evals B/M/R</span>
+                              <span className="font-medium tabular-nums text-sky-700 dark:text-sky-400">
+                                {stageEvalPercent.base.toFixed(0)}% / {stageEvalPercent.main.toFixed(0)}% / {stageEvalPercent.real.toFixed(0)}%
+                              </span>
+                            </div>
+                          )}
                           {currentSymbol && phase === "prehistoric_data" && (
                             <div className="flex items-center gap-1 ml-auto">
                               <span className="text-muted-foreground">Now:</span>
@@ -1477,7 +1581,7 @@ export function ActiveConnectionCard({
                                 </span>
                                 <span className="text-muted-foreground">
                                   {isLive ? "Hold" : "DDT"} <span className="text-foreground font-medium">
-                                    {avgDDT > 0 ? `${Math.round(avgDDT)}m` : "—"}
+                                    {avgDDT > 0 ? `${Math.round(avgDDT)}m` : "���"}
                                   </span>
                                 </span>
                               </div>

@@ -1,22 +1,16 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { getSession } from "@/lib/auth"
 import { auditLogger } from "@/lib/audit-logger"
 
 export async function GET(request: NextRequest) {
   try {
-    const user = await getSession()
-    if (!user) {
-      return NextResponse.json({ error: "Not authenticated" }, { status: 401 })
-    }
-
     const { searchParams } = new URL(request.url)
     const limit = Math.min(Number.parseInt(searchParams.get("limit") || "100"), 1000)
     const startDate = searchParams.get("start_date") ? new Date(searchParams.get("start_date")!) : undefined
     const endDate = searchParams.get("end_date") ? new Date(searchParams.get("end_date")!) : undefined
 
-    // Get audit logs for this user
+    // Get audit logs (system-level — no per-user filtering)
     const logs = await auditLogger.exportLogs({
-      user_id: String(user.id),
+      user_id: "system",
       start_date: startDate,
       end_date: endDate,
     })

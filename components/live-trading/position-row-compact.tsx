@@ -50,6 +50,18 @@ export function PositionRowCompact({ position, onClose, onModify, index }: Posit
   const priceChange = position.currentPrice - position.entryPrice
   const priceChangePercent = (priceChange / position.entryPrice) * 100
 
+  // Smart decimal precision: use enough digits to show non-zero value
+  // e.g. 0.01765 → "0.01765", 1234.56 → "1234.56", 0.00042 → "0.00042"
+  const formatPrice = (p: number): string => {
+    if (p === 0) return "0.00"
+    const abs = Math.abs(p)
+    if (abs >= 100) return p.toFixed(2)
+    if (abs >= 1) return p.toFixed(4)
+    // Find first significant digit
+    const sig = Math.max(2, Math.ceil(-Math.log10(abs)) + 3)
+    return p.toFixed(Math.min(sig, 8))
+  }
+
   return (
     <div className="group border border-slate-700/50 hover:border-slate-600 rounded bg-slate-900/30 hover:bg-slate-900/50 transition-all">
       {/* Main row */}
@@ -78,9 +90,9 @@ export function PositionRowCompact({ position, onClose, onModify, index }: Posit
         {/* Price info */}
         <div className="flex items-center gap-2 text-slate-300 font-mono text-xs flex-1 min-w-[180px]">
           <span className="text-slate-500">Entry:</span>
-          <span>{position.entryPrice.toFixed(2)}</span>
+          <span>{formatPrice(position.entryPrice)}</span>
           <span className="text-slate-500">→</span>
-          <span className={isProfit ? "text-green-400" : "text-red-400"}>{position.currentPrice.toFixed(2)}</span>
+          <span className={isProfit ? "text-green-400" : "text-red-400"}>{formatPrice(position.currentPrice)}</span>
           <span className={`text-xs ${isProfit ? "text-green-400" : "text-red-400"}`}>
             ({isProfit ? "+" : ""}{priceChangePercent.toFixed(2)}%)
           </span>

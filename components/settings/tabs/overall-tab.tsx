@@ -327,44 +327,59 @@ export function OverallTab({
                 <p className="text-sm text-muted-foreground">Configure leverage settings and limits</p>
 
                 <div className="grid md:grid-cols-2 gap-6">
-                  <div className="space-y-2">
+                  {/* Leverage % — active only when Use Maximal Leverage is off */}
+                  <div className={`space-y-2 ${settings.useMaximalLeverage !== false ? "opacity-50 pointer-events-none" : ""}`}>
                     <div className="flex items-center justify-between">
-                      <Label>Leverage Percentage</Label>
-                      <span className="text-sm font-medium">{settings.leveragePercentage || 100}%</span>
+                      <Label>Leverage %</Label>
+                      <span className="text-sm font-medium">
+                        {settings.useMaximalLeverage !== false
+                          ? "Max (overridden)"
+                          : `${settings.leveragePercentage ?? 100}%`}
+                      </span>
                     </div>
                     <Slider
                       min={5}
                       max={100}
                       step={5}
-                      value={[settings.leveragePercentage || 100]}
-                      onValueChange={([value]) => handleSettingChange("leveragePercentage", value)}
+                      value={[Number(settings.leveragePercentage ?? 100)]}
+                      onValueChange={([v]) => handleSettingChange("leveragePercentage", v)}
+                      disabled={settings.useMaximalLeverage !== false}
                     />
-                    <p className="text-xs text-muted-foreground">Percentage of max leverage to use (5-100%)</p>
+                    <p className="text-xs text-muted-foreground">
+                      Fraction of exchange max leverage to use. Only active when Use Maximal Leverage is off.
+                    </p>
                   </div>
 
-                  <div className="space-y-2">
+                  {/* Max Leverage display — resolved per exchange at order time */}
+                  <div className="space-y-2 opacity-60 pointer-events-none">
                     <div className="flex items-center justify-between">
                       <Label>Max Leverage</Label>
                       <span className="text-sm font-medium">{settings.max_leverage || 125}x</span>
                     </div>
                     <Slider
                       min={1}
-                      max={125}
+                      max={200}
                       step={1}
-                      value={[settings.max_leverage || 125]}
-                      onValueChange={([value]) => handleSettingChange("max_leverage", value)}
+                      value={[Number(settings.max_leverage ?? 125)]}
+                      disabled
                     />
-                    <p className="text-xs text-muted-foreground">Maximum leverage allowed (1-125x)</p>
+                    <p className="text-xs text-muted-foreground">
+                      Exchange predefinition maximum — resolved at order time, not editable here.
+                    </p>
                   </div>
 
-                  <div className="flex items-center justify-between p-3 border rounded-lg">
+                  {/* Use Maximal Leverage toggle */}
+                  <div className="flex items-center justify-between p-3 border rounded-lg md:col-span-2">
                     <div>
                       <Label>Use Maximal Leverage</Label>
-                      <p className="text-xs text-muted-foreground">Always use maximum available leverage</p>
+                      <p className="text-xs text-muted-foreground">
+                        When on, the engine always uses the exchange&apos;s maximum leverage.
+                        Turn off to apply Leverage % instead.
+                      </p>
                     </div>
                     <Switch
                       checked={settings.useMaximalLeverage !== false}
-                      onCheckedChange={(checked) => handleSettingChange("useMaximalLeverage", checked)}
+                      onCheckedChange={(v) => handleSettingChange("useMaximalLeverage", v)}
                     />
                   </div>
                 </div>

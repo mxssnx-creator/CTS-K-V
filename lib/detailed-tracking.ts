@@ -149,6 +149,22 @@ export interface StrategyStageTracking {
     // Per-variant cumulative counts at Real (post-filter)
     // Indexed by variant name ("default" | "trailing" | "block" | "dca" | "pause")
     variantsAccumulated: Record<string, number>
+    /**
+     * ── Averaged running counts (operator spec) ──────────────────────
+     * Averages of the live Real-stage counts sampled over a fixed
+     * calculation interval (the interval itself is an internal detail and
+     * is NOT surfaced in the UI — only these averaged counts are shown):
+     *   - activeSets:    avg number of Real Sets running
+     *   - posPerSet:     avg positions (entries) held per running Set
+     *   - posOpen:       avg total open positions across running Sets
+     *   - samples:       how many samples backed the averages (diagnostic)
+     */
+    averages: {
+      activeSets: number
+      posPerSet: number
+      posOpen: number
+      samples: number
+    }
   }
   live: {
     setsActive: number                // currently on exchange with open positions
@@ -191,6 +207,20 @@ export interface StrategyStageTracking {
     minCount: number
     /** True when current count clears `minCount` and PF blending is active. */
     active: boolean
+  }
+  /**
+   * ── Stage pass-through percentages (operator spec) ──────────────────
+   * "Percentages of Sets evals Base, Main, Real Stages." Modeled as the
+   * cascade survival rate of the filter pipeline:
+   *   - base: 100% (entry point — every evaluated Base Set counts)
+   *   - main: Main evaluated / Base evaluated  (how much survived Base→Main)
+   *   - real: Real evaluated / Main evaluated  (how much survived Main→Real)
+   * Each value is a 0–100 percentage, clamped to [0,100].
+   */
+  stageEvalPercent: {
+    base: number
+    main: number
+    real: number
   }
 }
 
@@ -317,8 +347,37 @@ export async function getStrategyTracking(
     const h = !Number.isFinite(n) || n <= 0 ? fallbackHours : Math.max(1, Math.min(72, n))
     return h * 60
   }
-  const mainDdtCeilingMin = ddtHoursToMin((appSettings as any).maxDrawdownTimeMainHours, 4)
-  const realDdtCeilingMin = ddtHoursToMin((appSettings as any).maxDrawdownTimeRealHours, 4)
+  // Per-connection overlay: the engine gate now resolves DDT as
+  // connection hash → global app setting → default, so the display must do
+  // the same to stay identical to what's enforced.
+  const resolveDdtMin = (key: string, fallbackHours: number): number => {
+    const raw =
+      (settings as Record<string, string>)[key] ??
+      (appSettings as Record<string, unknown>)[key]
+    return ddtHoursToMin(raw, fallbackHours)
+  }
+  const mainDdtCeilingMin = resolveDdtMin("maxDrawdownTimeMainHours", 4)
+  const realDdtCeilingMin = resolveDdtMin("maxDrawdownTimeRealHours", 4)
+
+  // Canonical per-stage min Profit-Factor thresholds — read from the SAME
+  // source + key names + defaults the engine gate uses in
+  // `strategy-coordinator.loadAppPFThresholds` (`mainProfitFactor` /
+  // `realProfitFactor`, connection hash overlaid on global app settings,
+  // clamp [0,5], defaults main 1.0 / real 1.0). The old display read
+  // `settings.minProfitFactorMain` / `minProfitFactorReal` (defaults
+  // 1.2 / 1.4) which are NEVER written anywhere — so the dashboard PF
+  // ceiling permanently diverged from the gate the engine enforced.
+  const resolvePF = (key: string, fallback: number): number => {
+    // connection hash wins, else global app setting, else default.
+    const raw =
+      (settings as Record<string, string>)[key] ??
+      (appSettings as Record<string, unknown>)[key]
+    const n = Number(raw)
+    if (!Number.isFinite(n) || n < 0) return fallback
+    return Math.max(0, Math.min(5, n))
+  }
+  const mainPFThreshold = resolvePF("mainProfitFactor", 1.0)
+  const realPFThreshold = resolvePF("realProfitFactor", 1.0)
 
   // Variant breakdowns
   const mainVariants = await readVariantBreakdown(client, connectionId, "main")
@@ -380,6 +439,77 @@ export async function getStrategyTracking(
     return sum
   })()
 
+  // ── Real averaged running counts ──────────────────────────────────
+  // Average the per-cycle Real samples written by the coordinator
+  // (`real_samples:{conn}`, a bounded ring of {t, sets, pps, open}) over a
+  // fixed calculation interval. The interval is an internal detail; only
+  // the resulting averaged counts are surfaced. lrange is O(N) over a
+  // ≤600-entry capped list and never blocks.
+  const REAL_AVG_INTERVAL_MS = 5 * 60 * 1000
+  const realAverages = await (async () => {
+    try {
+      const raw = (await client
+        .lrange(`real_samples:${connectionId}`, 0, -1)
+        .catch(() => [])) as string[]
+      const cutoff = Date.now() - REAL_AVG_INTERVAL_MS
+      let nSets = 0, nPps = 0, nOpen = 0, count = 0
+      for (const entry of raw) {
+        try {
+          const s = JSON.parse(entry) as { t: number; sets: number; pps: number; open: number }
+          if (!s || typeof s.t !== "number" || s.t < cutoff) continue
+          nSets += Number(s.sets) || 0
+          nPps  += Number(s.pps) || 0
+          nOpen += Number(s.open) || 0
+          count++
+        } catch { /* skip malformed sample */ }
+      }
+      if (count === 0) {
+        // No samples in-window: fall back to the latest live snapshot so the
+        // tiles show the current values rather than zero on a fresh boot.
+        return {
+          activeSets: realCombined,
+          posPerSet: Number(real.avg_pos_per_set || "0"),
+          posOpen: Number(real.entries_total || "0"),
+          samples: 0,
+        }
+      }
+      return {
+        activeSets: Number((nSets / count).toFixed(2)),
+        posPerSet: Number((nPps / count).toFixed(2)),
+        posOpen: Number((nOpen / count).toFixed(2)),
+        samples: count,
+      }
+    } catch {
+      return { activeSets: 0, posPerSet: 0, posOpen: 0, samples: 0 }
+    }
+  })()
+
+  // ── Stage pass-through percentages (cascade survival rate) ────────
+  // Uses the cumulative lifetime counters the coordinator maintains so the
+  // ratios are stable instead of oscillating with per-cycle snapshots:
+  //   strategies_{stage}_total      = Sets the stage OUTPUT (promoted)
+  //   strategies_{stage}_evaluated  = Sets that ENTERED the stage (input)
+  // base = 100% (pipeline entry; every Base set that exists passed by definition)
+  // main = Main output / Main input (Base→Main survival; expected ~1%)
+  // real = Real output / Real input (Main→Real survival)
+  // Each clamped to [0,100].
+  const baseOutput    = Number(prog.strategies_base_total     || "0")
+  const baseInput     = Number(prog.strategies_base_evaluated  || "0")
+  const mainOutput    = Number(prog.strategies_main_total      || "0")
+  const mainInput     = Number(prog.strategies_main_evaluated  || "0")
+  const realOutput    = Number(prog.strategies_real_total      || "0")
+  const realInput     = Number(prog.strategies_real_evaluated  || "0")
+  const pct = (num: number, den: number): number =>
+    den > 0 ? Math.max(0, Math.min(100, Number(((num / den) * 100).toFixed(1)))) : 0
+  // base  = 100% when Base sets exist (pipeline entry → always pass).
+  // main  = mainOutput / mainInput  — survival through the Main PF filter.
+  // real  = realOutput / realInput  — survival through the Real strict filter.
+  const stageEvalPercent = {
+    base: baseOutput > 0 ? 100 : 0,          // Base is the entry point: 100% when any exist
+    main: pct(mainOutput, mainInput),        // % of Main-entered sets that passed
+    real: pct(realOutput, realInput),        // % of Real-entered sets that passed
+  }
+
   return {
     base: {
       setsActivelyProcessing: baseActivelyProcessing,
@@ -405,7 +535,7 @@ export async function getStrategyTracking(
       setsProgressing: Number(main.sets_progressing || main.created_sets || "0"),
       avgProfitFactor: Number(main.avg_profit_factor || "0"),
       avgDrawdownTime: Number(main.avg_drawdown_time || "0"),
-      minProfitFactor: Number(settings.minProfitFactorMain || "1.2"),
+      minProfitFactor: mainPFThreshold,
       maxDrawdownTime: mainDdtCeilingMin,
       variants: mainVariants,
     },
@@ -419,7 +549,7 @@ export async function getStrategyTracking(
       avgProfitFactor: Number(real.avg_profit_factor || "0"),
       avgDrawdownTime: Number(real.avg_drawdown_time || "0"),
       avgPosPerSet: Number(real.avg_pos_per_set || "0"),
-      minProfitFactor: Number(settings.minProfitFactorReal || "1.4"),
+      minProfitFactor: realPFThreshold,
       maxDrawdownTime: realDdtCeilingMin,
       axisAccumulation,
       variantsAccumulated: realVariants,
@@ -429,6 +559,7 @@ export async function getStrategyTracking(
         general:     realGeneral,
         combined:    realCombined,
       },
+      averages: realAverages,
     },
     live: {
       setsActive: liveActive,
@@ -448,6 +579,7 @@ export async function getStrategyTracking(
       minCount: prevPosMinCount,
       active: prevPos.hasSignal,
     },
+    stageEvalPercent,
   }
 }
 

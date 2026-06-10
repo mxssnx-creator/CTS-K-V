@@ -37,20 +37,40 @@ import { safeParseResponse } from "@/lib/safe-response-parser"
  * - Hedge position mode
  */
 export class BingXConnector extends BaseExchangeConnector {
-  private timeOffset: number = 0 // milliseconds to adjust local time
-  private lastTimeSync: number = 0
-  // Re-sync every 60 s (down from 300 s). In serverless environments each
-  // request may be a fresh module instance so lastTimeSync resets to 0 and
-  // the first sync always fires — the interval only matters within a single
-  // long-lived instance (e.g. development server).
+  // ── Static (process-wide) time-sync state ────────────────────────────────
+  //
+  // Each test-endpoint call creates a fresh BingXConnector instance, which
+  // previously reset timeOffset=0 and lastTimeSync=0 on every request — so
+  // every test fired a syncServerTime() round-trip AND used offset=0 for the
+  // first signed request, consistently producing 100421 errors before the sync
+  // resolved.
+  //
+  // Sharing the offset and last-sync timestamp statically means:
+  //   1. The first successful sync populates the cache for all subsequent
+  //      instances — they skip the round-trip and use the cached offset.
+  //   2. Instances created within the 60 s TTL get a pre-warmed offset and
+  //      send the correct timestamp on the very first request.
+  //   3. The sync promise is also shared so multiple concurrent instances
+  //      (e.g. a burst of dashboard polls) coalesce onto one network call.
+  private static sharedTimeOffset: number = 0
+  private static sharedLastSync:   number = 0
+  private static sharedSyncPromise: Promise<void> | null = null
+  private static lastSyncFailLogTs: number = 0
+
+  // Instance accessors delegate to the static shared state so the rest of
+  // the class can use `this.timeOffset` / `this.lastTimeSync` / etc. without
+  // knowing about the static indirection.
+  private get  timeOffset(): number               { return BingXConnector.sharedTimeOffset }
+  private set  timeOffset(v: number)              { BingXConnector.sharedTimeOffset = v }
+  private get  lastTimeSync(): number             { return BingXConnector.sharedLastSync }
+  private set  lastTimeSync(v: number)            { BingXConnector.sharedLastSync = v }
+  private get  syncPromise(): Promise<void> | null { return BingXConnector.sharedSyncPromise }
+  private set  syncPromise(v: Promise<void> | null) { BingXConnector.sharedSyncPromise = v }
+
+  // Re-sync every 60 s. Because the state is now static, this interval is
+  // effectively process-wide — the first instance to exceed it triggers a
+  // fresh sync and all others reuse the result.
   private timeSyncIntervalMs: number = 60_000
-  // Serialise the initial sync: if multiple signed requests fire concurrently
-  // before the first syncServerTime() resolves, they all await the SAME
-  // promise instead of each reading timeOffset=0 (stale) and all failing
-  // with "timestamp is invalid". Without this, up to N concurrent calls can
-  // all use offset=0 and all fail before any of their individual syncs
-  // complete — producing one 109400 error per call per cold start.
-  private syncPromise: Promise<void> | null = null
   // recvWindow (ms) attached to every signed request. BingX validates
   // `serverTime - timestamp <= recvWindow` (default ~5000ms, max 60000ms). On
   // the Vercel→BingX link RTT routinely measured 800-1136ms, so one-way transit
@@ -69,9 +89,6 @@ export class BingXConnector extends BaseExchangeConnector {
   // ~2s behind our best estimate of server time, we trade harmless lateness
   // (absorbed by the 60s recvWindow) for the elimination of fatal earliness.
   private timestampLagMs: number = 2_000
-  // Cross-instance throttle for the "Failed to sync" log so a network blip
-  // across many connector instances doesn't flood output.
-  private static lastSyncFailLogTs = 0
 
   constructor(credentials: ExchangeCredentials, exchange: string = "bingx") {
     super(credentials, exchange)
@@ -423,9 +440,9 @@ export class BingXConnector extends BaseExchangeConnector {
   }
 
   async testConnection(): Promise<ExchangeConnectorResult> {
-    this.log("Starting BingX connection test")
-    this.log(`Using endpoint: ${this.getBaseUrl()}`)
-    this.log(`Environment: ${this.credentials.isTestnet ? "testnet" : "mainnet"}`)
+    // Header lines go only to UI logs, not server console.
+    const env = this.credentials.isTestnet ? "testnet" : "mainnet"
+    this.logs.push(`Starting BingX connection test (${env}: ${this.getBaseUrl()})`)
 
     try {
       return await this.getBalance()
@@ -449,8 +466,6 @@ export class BingXConnector extends BaseExchangeConnector {
       const timestamp = this.getTimestamp()
       const baseUrl = this.getBaseUrl()
 
-      this.log("Generating signature...")
-
       // Validate credentials first
       if (!this.credentials.apiKey || !this.credentials.apiSecret) {
         throw new Error("API key and secret are required")
@@ -468,12 +483,6 @@ export class BingXConnector extends BaseExchangeConnector {
       // every call — only the resync+retry path (which uses signParams) added
       // recvWindow and succeeded, doubling latency and flooding the logs.
       const { signature, queryString } = this.signParams(params)
-
-      this.log(`Query string: ${queryString}`)
-      this.log(`API Key prefix: ${this.credentials.apiKey.substring(0, 10)}...`)
-      this.log(`Signature (first 16 chars): ${signature.substring(0, 16)}...`)
-
-      this.log("Fetching account balance...")
 
       // Determine endpoint based on contract_type OR api_type from credentials
       // contract_type: "usdt-perpetual", "coin-perpetual", "spot"
@@ -493,27 +502,15 @@ export class BingXConnector extends BaseExchangeConnector {
         effectiveContractType = "spot"
       }
       
-      this.log(`[BingX] Contract Type: ${effectiveContractType}, API Type: ${apiType}`)
-      
       if (effectiveContractType === "spot" || apiType === "spot") {
         endpoint = "/openApi/spot/v1/account/balance"
-        this.log("Contract Type: SPOT → Using /openApi/spot/v1/account/balance")
-        this.log("⚠️ WARNING: Spot API will return 0 balance if you have Perpetual Futures positions!")
-        console.log("[v0] [BingX] Contract Type: SPOT → Endpoint: /openApi/spot/v1/account/balance")
       } else if (effectiveContractType === "coin-perpetual") {
-        // Coin-M Perpetual Futures - different API path!
         endpoint = "/openApi/cswap/v1/user/balance"
-        this.log("Contract Type: COIN-M PERPETUAL → Using /openApi/cswap/v1/user/balance")
-        console.log("[v0] [BingX] Contract Type: COIN-M PERPETUAL → Endpoint: /openApi/cswap/v1/user/balance")
       } else {
-        // USDT Perpetual Futures (default)
         endpoint = "/openApi/swap/v3/user/balance"
-        this.log("Contract Type: USDT PERPETUAL → Using /openApi/swap/v3/user/balance")
-        console.log("[v0] [BingX] Contract Type: USDT PERPETUAL → Endpoint: /openApi/swap/v3/user/balance")
       }
 
       const url = `${baseUrl}${endpoint}?${queryString}&signature=${signature}`
-      this.log(`Full URL: ${baseUrl}${endpoint}`)
 
       const response = await this.rateLimitedFetch(url, {
         method: "GET",
@@ -524,9 +521,6 @@ export class BingXConnector extends BaseExchangeConnector {
       })
 
       const data = await safeParseResponse(response)
-
-      this.log(`Response status: ${response.status}`)
-      this.log(`Response code: ${data.code}`)
 
       // Check for error responses — BingX returns `code` as a number or string.
       // On a timestamp error (code 109400 + "timestamp" in msg, or 100421)
@@ -572,22 +566,14 @@ export class BingXConnector extends BaseExchangeConnector {
         }
       }
 
-      this.log("Successfully retrieved account data")
+      // Push a quiet success marker to the UI log (no server console output).
 
-      // Parse balance data - BingX returns data.data as the array directly
-      this.log(`[Debug] Full response data: ${JSON.stringify(data).substring(0, 500)}`)
-      
-      // data.data IS the balance array, not data.data.balance
+      // data.data IS the balance array
       const balanceData = Array.isArray(data.data) ? data.data : []
-      
+
       if (!Array.isArray(balanceData)) {
         this.logError(`Invalid balance data format: ${JSON.stringify(balanceData).substring(0, 200)}`)
         throw new Error("Invalid balance data format from API")
-      }
-
-      this.log(`[Debug] Received ${balanceData.length} balance entries`)
-      if (balanceData.length > 0) {
-        this.log(`[Debug] First balance entry: ${JSON.stringify(balanceData[0]).substring(0, 300)}`)
       }
 
       // Extract USDT balance - BingX returns balance as a string number
@@ -595,24 +581,18 @@ export class BingXConnector extends BaseExchangeConnector {
       // For PERPETUAL: use 'balance' field (this is the total balance in wallet)
       const usdtEntry = balanceData.find((b: any) => b.asset === "USDT")
       const usdtBalance = usdtEntry ? Number.parseFloat(usdtEntry.balance || "0") : 0
-      
-      this.log(`[Debug] USDT entry found: ${!!usdtEntry}`)
-      this.log(`[Debug] USDT balance value: ${usdtBalance}`)
 
-      // Get BTC price from market data
-      // BingX spot ticker returns: { code: 0, data: { symbol, lastPrice, priceChangePercent, ... } }
+      // Get BTC price from market data (for display only — silent failure OK)
       let btcPrice = 0
       try {
         const priceResponse = await fetch("https://open-api.bingx.com/openApi/spot/v1/ticker/24hr?symbol=BTC-USDT")
         if (priceResponse.ok) {
           const priceData = await priceResponse.json()
-          // The 24hr ticker returns data as an array or object; lastPrice is the current price
           const ticker = Array.isArray(priceData.data) ? priceData.data[0] : priceData.data
           btcPrice = Number.parseFloat(ticker?.lastPrice || ticker?.closePrice || ticker?.price || "0")
-          this.log(`[Debug] BTC/USDT price fetched: $${btcPrice.toFixed(2)}`)
         }
-      } catch (e) {
-        this.log(`[Debug] Could not fetch BTC price: ${e}`)
+      } catch {
+        // BTC price is for display only — silent failure is fine
       }
 
       // Map all balances with proper field extraction
@@ -641,9 +621,13 @@ export class BingXConnector extends BaseExchangeConnector {
         }
       })
 
-      this.log(`✓ Account balance: ${usdtBalance.toFixed(4)} USDT`)
-      this.log(`✓ Total assets: ${balances.length}`)
-      this.log(`✓ BTC price: $${btcPrice.toFixed(2)}`)
+      // These summary lines go only to the test-UI response (this.logs),
+      // not to the server console — they fire on every dashboard connection-test
+      // poll (~1/s) and would flood the server log otherwise.
+      const ts = new Date().toISOString()
+      this.logs.push(`[${ts}] ✓ Account balance: ${usdtBalance.toFixed(4)} USDT`)
+      this.logs.push(`[${ts}] ✓ Total assets: ${balances.length}`)
+      this.logs.push(`[${ts}] ✓ BTC price: $${btcPrice.toFixed(2)}`)
 
       return {
         success: true,
@@ -672,7 +656,7 @@ export class BingXConnector extends BaseExchangeConnector {
       // Sync server time before any signed request to prevent timestamp errors
       await this.syncServerTime()
 
-      // ── Quantity sanity & formatting ─────────────────────────────────────
+      // ��─ Quantity sanity & formatting ─────────────────────────────────────
       // BingX rejects quantities that fall below the symbol step size, and in
       // many cases responds with its generic "this api is not exist" error
       // instead of a precise reason. Normalise the quantity to a reasonable
@@ -1001,10 +985,12 @@ export class BingXConnector extends BaseExchangeConnector {
           const tsData = await this.safeJson(tsResp)
           if (this.isBingXSuccess(tsData.code)) {
             const info = tsData.data?.order || tsData.data || {}
-            return {
-              success: true,
-              orderId: String(info.orderId ?? info.orderID ?? ""),
+            const id = info.orderId || info.orderID || tsData.data?.orderId
+            if (id) {
+              this.log(`✓ ${orderType} placed on timestamp retry: ${id}`)
+              return { success: true, orderId: String(id) }
             }
+            // Fall through to error handling if orderId was not found
           }
           Object.assign(data, tsData)
         }
@@ -1027,10 +1013,12 @@ export class BingXConnector extends BaseExchangeConnector {
           const retryData2 = await this.safeJson(retryResp2)
           if (this.isBingXSuccess(retryData2.code)) {
             const info2 = retryData2.data?.order || retryData2.data || {}
-            return {
-              success: true,
-              orderId: String(info2.orderId ?? info2.orderID ?? ""),
+            const id2 = info2.orderId || info2.id || retryData2.data?.orderId
+            if (id2) {
+              this.log(`✓ ${orderType} placed on reduceOnly hedge retry: ${id2}`)
+              return { success: true, orderId: String(id2) }
             }
+            // Fall through to error handling if orderId was not found
           }
           // Fall through to the normal error path with the retry's response.
           data.code = retryData2.code
@@ -1052,8 +1040,11 @@ export class BingXConnector extends BaseExchangeConnector {
           if (this.isBingXSuccess(retryData.code)) {
             const info = retryData.data?.order || retryData.data || {}
             const id = info.orderId || info.id || retryData.data?.orderId
-            this.log(`✓ ${orderType} placed on retry: ${id}`)
-            return { success: true, orderId: id ? String(id) : undefined }
+            if (id) {
+              this.log(`✓ ${orderType} placed on one-way retry: ${id}`)
+              return { success: true, orderId: String(id) }
+            }
+            // Fall through to error handling if orderId was not found
           }
           throw new Error(`BingX stop order error (code=${retryData.code}): ${retryData.msg || "Unknown"}`)
         }
@@ -1062,8 +1053,16 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const info = data.data?.order || data.data || {}
       const orderId = info.orderId || info.id || data.data?.orderId
+      if (!orderId) {
+        // BingX returned success but we couldn't extract the order ID from the response.
+        // This is a malformed response that we should treat as a failure to prevent
+        // marking a position as protected when no actual protection order exists.
+        const errorMsg = `BingX returned success but orderId was missing/empty from response`
+        this.logError(`✗ ${orderType} placement failed: ${errorMsg}`)
+        return { success: false, error: errorMsg }
+      }
       this.log(`✓ ${orderType} placed: ${orderId} @ ${stopStr}`)
-      return { success: true, orderId: orderId ? String(orderId) : undefined }
+      return { success: true, orderId: String(orderId) }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to place stop order: ${errorMsg}`)
@@ -1073,7 +1072,10 @@ export class BingXConnector extends BaseExchangeConnector {
 
   async cancelOrder(symbol: string, orderId: string): Promise<{ success: boolean; error?: string }> {
     try {
-      // Sync server time before any signed request
+      // Sync server time before any signed request.
+      // The throttle inside syncServerTime (60 s) means concurrent cancel
+      // calls don't pile up on re-sync — the first triggers a real HTTP
+      // call, subsequent ones within the window return immediately.
       await this.syncServerTime()
 
       this.log(`Cancelling order ${orderId} for ${symbol}`)
@@ -1084,26 +1086,47 @@ export class BingXConnector extends BaseExchangeConnector {
       const endpoint = isSpot ? "/openApi/spot/v1/trade/cancel" : "/openApi/swap/v2/trade/order"
       const method = isSpot ? "POST" : "DELETE"
       const bingxSymbol = this.toBingXSymbol(symbol)
+      const baseUrl = this.getBaseUrl()
 
-      const params = {
-        symbol: bingxSymbol,
-        orderId,
-        timestamp: this.getTimestamp(),
+      const buildUrl = () => {
+        const params = { symbol: bingxSymbol, orderId, timestamp: this.getTimestamp() }
+        const { signature, queryString: signedQs } = this.signParams(params)
+        return `${baseUrl}${endpoint}?${signedQs}&signature=${signature}`
       }
 
-      const { signature, queryString: signedQs } = this.signParams(params)
-      const url = `${this.getBaseUrl()}${endpoint}?${signedQs}&signature=${signature}`
+      const doRequest = (url: string) =>
+        this.rateLimitedFetch(url, {
+          method,
+          headers: { "X-BX-APIKEY": this.credentials.apiKey },
+        })
 
-      const response = await this.rateLimitedFetch(url, {
-        method,
-        headers: { "X-BX-APIKEY": this.credentials.apiKey },
-      })
+      let response = await doRequest(buildUrl())
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
 
-      const data = await this.safeJson(response)
+      let data = await this.safeJson(response)
+
+      // ── Timestamp-mismatch retry (code 100421 / 109400-timestamp) ──────
+      // The serial stuck-placed loop can span 20-30s; by the time the 3rd+
+      // position calls cancelOrder the cached offset may have drifted just
+      // past BingX's ±1000ms window and produces code 100421.  Re-sync once
+      // and retry — same pattern as getBalance.
+      if (!this.isBingXSuccess(data.code)) {
+        const isTimestampErr =
+          String(data.code) === "100421" ||
+          (String(data.code) === "109400" &&
+            String(data.msg ?? "").toLowerCase().includes("timestamp"))
+        if (isTimestampErr) {
+          this.lastTimeSync = 0
+          this.syncPromise = null
+          await this.syncServerTime()
+          const retryResponse = await doRequest(buildUrl())
+          if (!retryResponse.ok) throw new Error(`HTTP ${retryResponse.status}: ${retryResponse.statusText}`)
+          data = await this.safeJson(retryResponse)
+        }
+      }
 
       if (!this.isBingXSuccess(data.code)) {
         throw new Error(`BingX API error (code=${data.code}): ${data.msg || "Unknown error"}`)

@@ -205,30 +205,22 @@ export async function POST() {
     )
 
     // ── 3. Reset per-connection runtime flags on connection records ───
-    // The connection row itself is preserved (protected prefix), but the
-    // transient flags (paused-by-global, dashboard-active, live-trade)
-    // must reset so the operator gets a clean slate on the next QuickStart.
-    //
-    // EXCEPTION: base connection (bingx-x01) is persistent
-    // operator choices — their is_enabled_dashboard / is_assigned flags
-    // must NOT be zeroed out here. The self-healing monitor in
-    // trade-engine-auto-start.ts re-applies them on every 30s tick, but
-    // clearing them triggers a 30s window where those connections are
-    // disabled, which is surprising and incorrect behaviour for a "Reset DB"
-    // operation that is supposed to clear only runtime state.
-    const BASE_CONNECTION_IDS_CLEAR = ["bingx-x01"]
+    // The connection row itself is preserved (protected prefix), but ALL
+    // transient flags (paused-by-global, dashboard-active, live-trade,
+    // enabled-dashboard) reset so the operator gets a clean stopped slate.
+    // AUTO-START DISABLED: base connections are no longer special-cased to
+    // preserve is_enabled_dashboard="1". A DB reset gives a truly clean slate;
+    // the operator must re-enable connections manually after a reset.
     try {
       const { getAllConnections, updateConnection } = await import("@/lib/redis-db")
       const conns = await getAllConnections()
       for (const c of conns) {
-        const isBaseConn = BASE_CONNECTION_IDS_CLEAR.includes(c.id)
         await updateConnection(c.id, {
           ...c,
-          // Preserve enabled state for base connections — they are always on.
-          is_enabled_dashboard: isBaseConn ? "1" : "0",
+          is_enabled_dashboard: "0",
           is_active: "0",
-          is_active_inserted: isBaseConn ? "1" : "0",
-          is_assigned: isBaseConn ? "1" : "0",
+          is_active_inserted: "0",
+          is_assigned: "0",
           is_live_trade: "0",
           is_preset_trade: "0",
           paused_by_global: "0",
@@ -236,7 +228,7 @@ export async function POST() {
           updated_at: new Date().toISOString(),
         })
       }
-      console.log(`[v0] [ClearProgressions] reset runtime flags on ${conns.length} connections (base connections preserved)`)
+      console.log(`[v0] [ClearProgressions] reset runtime flags on ${conns.length} connections (all disabled)`)
       // Second persist — captures the connection-flag resets so they are
       // durable on disk, not just in-memory. Without this, a Next.js
       // hot-reload between the reset and the next request restores the

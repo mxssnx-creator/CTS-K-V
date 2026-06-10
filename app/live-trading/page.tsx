@@ -3,8 +3,7 @@
 
 export const dynamic = "force-dynamic"
 // Page with sidebar and exchange selector
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { useState, useEffect, useMemo, useCallback } from "react"
+import { useState, useEffect, useMemo, useCallback, useRef } from "react"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { PositionRowCompact } from "@/components/live-trading/position-row-compact"
@@ -36,40 +35,82 @@ export default function LiveTradingPage() {
   const [isDemo, setIsDemo] = useState(false)
   const [isEngineRunning, setIsEngineRunning] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
+  const [closingIds, setClosingIds] = useState<Set<string>>(new Set())
   const [sortBy, setSortBy] = useState<"pnl" | "entry" | "time">("pnl")
   const [filterSide, setFilterSide] = useState<"all" | "long" | "short">("all")
+  // Keep a stable ref to the fetch function so the polling interval can call
+  // it without adding it as a dependency (avoids interval recreation churn).
+  const loadPositionsRef = useRef<(() => Promise<void>) | undefined>(undefined)
 
-  // Load positions on mount and when connection changes
-  useEffect(() => {
-    const loadPositions = async () => {
-      setIsLoading(true)
-      try {
-        // Determine which connection to use (fallback to demo if none selected)
-        const connectionToUse = selectedConnectionId || "demo-mode"
-
-        const response = await fetch(`/api/data/positions?connectionId=${encodeURIComponent(connectionToUse)}`)
-        if (!response.ok) {
-          throw new Error(`Failed to fetch positions: ${response.statusText}`)
-        }
-
-        const data = await response.json()
-        if (data.success) {
-          setPositions(data.data || [])
-          setIsDemo(data.isDemo)
-        } else {
-          throw new Error(data.error || "Unknown error")
-        }
-      } catch (error) {
-        console.error("[Live Trading] Failed to load:", error)
-        toast.error("Failed to load positions")
-        setPositions([])
-      } finally {
-        setIsLoading(false)
+  const loadPositions = useCallback(async () => {
+    try {
+      const connectionToUse = selectedConnectionId || "demo-mode"
+      const response = await fetch(`/api/data/positions?connectionId=${encodeURIComponent(connectionToUse)}`)
+      if (!response.ok) throw new Error(`Failed to fetch positions: ${response.statusText}`)
+      const data = await response.json()
+      if (data.success) {
+        setPositions(data.data || [])
+        setIsDemo(data.isDemo)
+      } else {
+        throw new Error(data.error || "Unknown error")
       }
+    } catch (error) {
+      console.error("[Live Trading] Failed to load:", error)
     }
-
-    loadPositions()
   }, [selectedConnectionId])
+
+  // Keep ref in sync
+  useEffect(() => { loadPositionsRef.current = loadPositions }, [loadPositions])
+
+  // Initial load + 5-second polling so closed positions disappear from the UI
+  useEffect(() => {
+    let cancelled = false
+    const doLoad = async () => {
+      setIsLoading(true)
+      try { await loadPositions() } catch { /* ignore */ }
+      if (!cancelled) setIsLoading(false)
+    }
+    doLoad()
+
+    const interval = setInterval(() => {
+      loadPositionsRef.current?.()
+    }, 5000)
+
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [loadPositions])
+
+  // Close a position: call the server so PseudoPositionManager records the close,
+  // then immediately remove it from local state for instant UI feedback.
+  const handleClosePosition = useCallback(async (id: string) => {
+    if (closingIds.has(id)) return // prevent double-close
+    const connectionToUse = selectedConnectionId || "demo-mode"
+    setClosingIds((prev) => new Set([...prev, id]))
+    // Optimistic removal from local state
+    setPositions((prev) => prev.filter((p) => p.id !== id))
+    try {
+      const res = await fetch(
+        `/api/data/positions/${encodeURIComponent(id)}?connectionId=${encodeURIComponent(connectionToUse)}`,
+        { method: "DELETE" },
+      )
+      const body = await res.json().catch(() => null)
+      if (!res.ok || !body?.success) {
+        // Revert optimistic removal on failure and re-fetch to get accurate state
+        toast.error(`Failed to close position: ${body?.error ?? res.statusText}`)
+        await loadPositions()
+      } else {
+        toast.success("Position closed")
+      }
+    } catch (err) {
+      console.error("[Live Trading] Close position error:", err)
+      toast.error("Failed to close position")
+      await loadPositions()
+    } finally {
+      setClosingIds((prev) => { const next = new Set(prev); next.delete(id); return next })
+    }
+  }, [selectedConnectionId, closingIds, loadPositions])
 
   // Handle real-time position updates via SSE
   const handlePositionUpdate = useCallback((update: any) => {
@@ -318,10 +359,7 @@ export default function LiveTradingPage() {
             <PositionRowCompact
               key={position.id}
               position={position}
-              onClose={(id) => {
-                setPositions((prev) => prev.filter((p) => p.id !== id))
-                toast.success("Position closed")
-              }}
+              onClose={handleClosePosition}
               onModify={() => {
                 toast.info("Position modification UI would open here")
               }}

@@ -85,6 +85,16 @@ interface StrategyTracking {
       general: number
       combined: number
     }
+    /**
+     * Averaged running counts at the Real stage (averaged over an internal
+     * calculation interval — only the averaged counts are shown).
+     */
+    averages?: {
+      activeSets: number
+      posPerSet: number
+      posOpen: number
+      samples: number
+    }
   }
   live: {
     setsActive: number
@@ -109,6 +119,11 @@ interface StrategyTracking {
     avgDDT: number
     minCount: number
     active: boolean
+  }
+  stageEvalPercent?: {
+    base: number
+    main: number
+    real: number
   }
 }
 
@@ -168,6 +183,16 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
               accent="success"
             />
           </div>
+
+          {/* Stage pass-through % — how much of each stage's input survives
+              the filter into the next stage. Base is the 100% entry point. */}
+          {data.stageEvalPercent && (
+            <div className="mt-3 grid grid-cols-3 gap-2 border-t border-border pt-3">
+              <StageEvalPct label="Base evals" value={data.stageEvalPercent.base} />
+              <StageEvalPct label="Main evals" value={data.stageEvalPercent.main} />
+              <StageEvalPct label="Real evals" value={data.stageEvalPercent.real} accent />
+            </div>
+          )}
         </CardContent>
       </Card>
 
@@ -522,6 +547,36 @@ export function StrategyPipeline({ connectionId }: { connectionId: string }) {
             </div>
           )}
 
+          {/* ── REAL AVERAGED COUNTS ─────────────────────────────────────
+              Averaged running counts at the Real stage: Active Sets,
+              Positions per Set, and total Open Positions. These smooth out
+              per-cycle noise so operators see the steady-state size of the
+              Real stage rather than a single jittery snapshot. */}
+          {data.real.averages && (
+            <div className="mt-4 rounded-md border border-border bg-muted/30 p-3">
+              <div className="mb-2 text-[11px] uppercase tracking-wide text-muted-foreground font-semibold">
+                Real Averages
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <PerspectiveTile
+                  label="Active Sets"
+                  value={data.real.averages.activeSets}
+                  hint="Average number of Real Sets running, averaged over the calculation interval."
+                />
+                <PerspectiveTile
+                  label="Pos / Set"
+                  value={data.real.averages.posPerSet}
+                  hint="Average positions (entries) held per running Real Set."
+                />
+                <PerspectiveTile
+                  label="Open Positions"
+                  value={data.real.averages.posOpen}
+                  hint="Average total open positions across running Real Sets."
+                />
+              </div>
+            </div>
+          )}
+
           {/* Position-count axis accumulation */}
           <div className="mt-4">
             <div className="mb-2 text-[11px] uppercase tracking-wide text-muted-foreground">
@@ -687,6 +742,29 @@ function StageBadge({
         <span className="font-mono text-xl tabular-nums">{count}</span>
         <span className="text-xs text-muted-foreground">/ {total} total</span>
       </div>
+    </div>
+  )
+}
+
+function StageEvalPct({
+  label,
+  value,
+  accent,
+}: {
+  label: string
+  value: number
+  accent?: boolean
+}) {
+  return (
+    <div
+      className={`flex flex-col rounded-md border px-3 py-2 ${
+        accent ? "border-primary/40 bg-primary/5" : "border-border bg-card"
+      }`}
+    >
+      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+        {label}
+      </div>
+      <span className="font-mono text-lg tabular-nums">{value.toFixed(1)}%</span>
     </div>
   )
 }

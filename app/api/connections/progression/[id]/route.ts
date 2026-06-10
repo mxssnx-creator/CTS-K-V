@@ -205,7 +205,12 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // Get detailed prehistoric progress tracking
     let prehistoricProgress = {
       symbolsProcessed: 0,
-      symbolsTotal: 3, // BTC, ETH, SOL
+      // Default to 1 until the Redis hash is read below — this prevents the
+      // progress denominator from showing "0/3" on fresh quickstarts where
+      // the operator may have chosen a single symbol. The hash field
+      // `symbols_total` (written by quickstart + engine start) overrides
+      // this as soon as it exists.
+      symbolsTotal: 1,
       candlesLoaded: 0,
       candlesTotal: 0,
       indicatorsCalculated: 0,
@@ -365,6 +370,11 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         indicationCycleCount,
         strategyCycleCount,
         realtimeCycleCount: toNumber(engineState?.realtime_cycle_count),
+        // LivePositions loop (Loop C) telemetry — written by engine-manager
+        // `tickLivePositions` every 200 ms into `progression:{id}`.
+        livePositionsCycleCount: parseInt(progHash.live_positions_cycle_count || "0", 10),
+        livePositionsLastCycleAt: toNumber(progHash.live_positions_last_cycle_at),
+        livePositionsLastCycleMs: toNumber(progHash.live_positions_last_cycle_ms),
         cycleTimeMs: toNumber(engineState?.last_cycle_duration),
         totalStrategiesEvaluated: toNumber(engineState?.total_strategies_evaluated),
         totalIndicationsEvaluated: toNumber(engineState?.total_indications_evaluated),

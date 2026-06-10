@@ -196,13 +196,16 @@ export class PrehistoricProgressTracker {
     if (!client) return defaultProgress
 
     try {
-      // Use HGETALL with timeout to prevent hanging
-      const state = await Promise.race([
+      // Use HGETALL with timeout to prevent hanging.
+      // The Promise.race union collapses to `{}` under TS inference, so we
+      // explicitly type the resolved hash as a string record. Every field
+      // below is read as a string and parsed defensively.
+      const state = (await Promise.race([
         client.hgetall(this.trackingKey),
         new Promise((_, reject) => setTimeout(() => reject(new Error("Progress fetch timeout")), 1000)),
-      ]).catch(() => null)
+      ]).catch(() => null)) as Record<string, string> | null
 
-      if (!state) return defaultProgress
+      if (!state || Object.keys(state).length === 0) return defaultProgress
 
       const total = parseInt(state.total_symbols as string) || 0
       const processed = parseInt(state.processed_symbols as string) || 0

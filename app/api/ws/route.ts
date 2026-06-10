@@ -2,7 +2,6 @@
 // Since Next.js doesn't natively support WebSocket, we use SSE for real-time streaming
 import type { NextRequest } from "next/server"
 import { getBroadcaster } from "@/lib/event-broadcaster"
-import { getSession } from "@/lib/auth"
 
 export const dynamic = "force-dynamic"
 
@@ -13,12 +12,6 @@ export async function GET(request: NextRequest) {
 
     if (!connectionId) {
       return new Response("Missing connectionId parameter", { status: 400 })
-    }
-
-    // Verify authentication
-    const session = await getSession()
-    if (!session) {
-      return new Response("Unauthorized", { status: 401 })
     }
 
     // Set up SSE response headers

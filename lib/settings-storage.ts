@@ -17,7 +17,13 @@ function getDefaultSettings(): Record<string, any> {
     theme: "dark",
     language: "en",
     notifications_enabled: true,
-    default_leverage: 10,
+    // default_leverage is a legacy display field — the engine resolves leverage
+    // from the exchange predefinition (getMaxLeverageForExchange) and the
+    // useMaximalLeverage / leveragePercentage settings. The value 0 means
+    // "use predefinition max"; non-zero values here are informational only.
+    default_leverage: 0,
+    useMaximalLeverage: true,
+    leveragePercentage: 100,
     default_volume: 100,
     max_open_positions: 10,
     max_drawdown_percent: 20,

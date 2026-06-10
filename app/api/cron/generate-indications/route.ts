@@ -20,6 +20,8 @@
 import { NextResponse } from "next/server"
 import { isTruthyFlag, isConnectionInActivePanel } from "@/lib/connection-state-utils"
 import { StrategyCoordinator } from "@/lib/strategy-coordinator"
+import { fetchTopSymbols } from "@/lib/top-symbols"
+import { RealtimeProcessor } from "@/lib/trade-engine/realtime-processor"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -32,22 +34,18 @@ const FALLBACK_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 const volatileSymbolCache = new Map<string, { symbol: string; ts: number }>()
 const CACHE_TTL = 60_000
 
+// CRITICAL: Never HTTP-self-fetch from a route handler — it deadlocks the dev server
+// and hangs on Vercel when the request context is unavailable. Call the shared lib fn
+// directly so resolution happens in-process with zero network overhead.
 async function getMostVolatileSymbol(exchange: string): Promise<string> {
   const cached = volatileSymbolCache.get(exchange)
   if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.symbol
 
   try {
-    const baseUrl = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || `http://localhost:${process.env.PORT || "3002"}`
-    const res = await fetch(
-      `${baseUrl}/api/exchange/${exchange}/top-symbols?t=${Date.now()}`,
-      { signal: AbortSignal.timeout(4000), cache: "no-store" }
-    )
-    if (res.ok) {
-      const data = await res.json()
-      if (data.symbol) {
-        volatileSymbolCache.set(exchange, { symbol: data.symbol, ts: Date.now() })
-        return data.symbol
-      }
+    const result = await fetchTopSymbols(exchange, 1, "volatility")
+    if (result?.symbol) {
+      volatileSymbolCache.set(exchange, { symbol: result.symbol, ts: Date.now() })
+      return result.symbol
     }
   } catch {
     // fall through to fallback
@@ -212,16 +210,12 @@ async function generateIndicationsForConnection(
     const rangePercent = close > 0 ? (range / close) * 100 : 0
     const now          = Date.now()
 
-    // Store real market data in Redis for future cycles
-    await client.hset(`market_data:${symbol}`, {
-      close:  String(close),
-      open:   String(open),
-      high:   String(high),
-      low:    String(low),
-      symbol,
-      updated_at: String(now),
-    }).catch(() => {})
-    await client.expire(`market_data:${symbol}`, 3600).catch(() => {})
+    // ── PIPELINED WRITES ───────────────────────────────────────────────────────
+    // All Redis writes for this cron cycle (market data + indications + cycle
+    // counters + progression hset) are batched into a single pipeline so the
+    // round-trip overhead is 1 RTT regardless of how many indication types fired.
+    // The emulator's multi() Proxy correctly sequences all commands.
+    const pipeline = client.multi()
 
     // ── Indications ────────────────────────────────────────────────────────────
     // Each type has a distinct signal condition and fires at a different rate:
@@ -296,164 +290,98 @@ async function generateIndicationsForConnection(
 
     const progKey = `progression:${connectionId}`
 
-    // Write indication counts to progression hash — only for types that actually fired
-    for (const ind of indications) {
-      await client.hincrby(progKey, `indications_${ind.type}_count`, 1)
-      // Also write flat counter key for backward compat
-      await client.incr(`indications:${connectionId}:${ind.type}:count`).catch(() => {})
-      await client.expire(`indications:${connectionId}:${ind.type}:count`, 86400).catch(() => {})
-
-      // Store latest value for the dialog type breakdowns
-      await client.hset(`indications:${connectionId}:${ind.type}:latest`, {
-        symbol,
-        value: String(ind.value),
-        confidence: String(ind.confidence.toFixed(4)),
-        profitFactor: String(ind.profitFactor.toFixed(4)),
-        timestamp: String(now),
-      }).catch(() => {})
-      await client.expire(`indications:${connectionId}:${ind.type}:latest`, 3600).catch(() => {})
-    }
-
     result.indications = indications.length
-    // This cron route is the ACTUAL realtime driver in this deployment — the
-    // engine-manager realtime loop that the comment below once referred to does
-    // not run here (verified: 0 RealtimeProgression markers vs. hundreds of cron
-    // cycles). So the cumulative `indications_count` and the realtime cycle
-    // counters MUST be written here, otherwise the dashboard's total-indications
-    // tile and realtime-progression tiles are permanently stuck at 0. The
-    // earlier "authoritative in engine-manager" note created a coordination gap
-    // where NO writer ever advanced these fields.
-    if (indications.length > 0) {
-      await client.hincrby(progKey, "indications_count", indications.length)
-      await client.hincrby(progKey, "indication_live_cycle_count", 1)
-    }
-    await client.hincrby(progKey, "indication_cycle_count", 1)
-    // Mirror the indication cycle as the realtime-progression cycle so the
-    // dashboard's realtime tiles reflect the live cadence of this driver.
-    await client.hincrby(progKey, "realtime_cycle_count", 1)
 
-    // ── Strategy generation (proportional to indications that fired) ──────────
-    // Base: 1 set per indication type that fired this cycle (varies 1-5 based on market)
-    // Main: ~50-70% of Base pass the minPF>=1.2 filter (varies with market quality)
-    // Real: ~30-50% of Main pass the minPF>=1.4 + confidence>=0.65 filter (stricter)
-    // Ratios are intentionally non-uniform to reflect real filter cascade behaviour.
-    const baseGenerated  = indications.length
-    const mainPassRate   = 0.45 + Math.min(0.30, momentum * 10)   // 45-75%; better market = more pass
-    const realPassRate   = 0.25 + Math.min(0.25, volFactor * 5)   // 25-50%; tighter filter
-    const mainGenerated  = Math.max(0, Math.floor(baseGenerated * mainPassRate))
-    const realGenerated  = Math.max(0, Math.floor(mainGenerated * realPassRate))
-
-    await client.hincrby(progKey, "strategies_base_total", baseGenerated)
-    await client.hincrby(progKey, "strategies_main_total", mainGenerated)
-    await client.hincrby(progKey, "strategies_real_total", realGenerated)
-    // NOTE: Do NOT increment strategies_count here.
-    // The canonical strategies_count is written by engine-manager during realtime cycle.
-    // This is a utility/analysis endpoint and should not mutate canonical counters.
-    await client.hincrby(progKey, "strategy_cycle_count", 1)
-
-    // Also write flat counter keys for backward compat
-    await client.incrby(`strategies:${connectionId}:base:count`, baseGenerated).catch(() => {})
-    await client.incrby(`strategies:${connectionId}:main:count`, mainGenerated).catch(() => {})
-    await client.incrby(`strategies:${connectionId}:real:count`, realGenerated).catch(() => {})
-    await client.expire(`strategies:${connectionId}:base:count`, 86400).catch(() => {})
-    await client.expire(`strategies:${connectionId}:main:count`, 86400).catch(() => {})
-    await client.expire(`strategies:${connectionId}:real:count`, 86400).catch(() => {})
-
-    // Write per-stage strategy detail metrics so the stats API can display
-    // avg profit factor, avg drawdown time, and avg pos eval for Real.
-    // These are estimated from the indication signal strength this cycle.
-    const basePF    = indications.length > 0
-      ? indications.reduce((s, i) => s + i.profitFactor, 0) / indications.length
-      : 1.1
-    const mainPF    = basePF * (1 + mainPassRate * 0.15)
-    const realPF    = mainPF * (1 + realPassRate * 0.20)
-    const baseDDT   = 0                                          // BASE: no drawdown time (raw entries)
-    const mainDDT   = 30 + Math.round(volFactor * 200)          // MAIN: 30-230 min depending on volatility
-    const realDDT   = Math.max(0, mainDDT - 20)                 // REAL: slightly lower (filtered)
-    // posEvalReal: averaged confidence of indications that fired (proxy for position quality)
-    const posEvalReal = indications.length > 0
-      ? indications.reduce((s, i) => s + i.confidence, 0) / indications.length
-      : 0
-    const basePassRatio = baseGenerated > 0 ? mainGenerated / baseGenerated : 0
-    const mainPassRatio = mainGenerated > 0 ? realGenerated / mainGenerated : 0
-
-    const ttlDay = 86400
-    await Promise.all([
-      // Base stage detail
-      client.hset(`strategy_detail:${connectionId}:base`, {
-        created_sets: String(baseGenerated),
-        avg_profit_factor: String(basePF.toFixed(4)),
-        avg_drawdown_time: String(baseDDT),
-        pass_rate: String(basePassRatio.toFixed(4)),
-        passed_sets: String(mainGenerated),
-        evaluated: String(baseGenerated),
-        updated_at: String(now),
-      }).catch(() => {}),
-      client.expire(`strategy_detail:${connectionId}:base`, ttlDay).catch(() => {}),
-
-      // Main stage detail
-      client.hset(`strategy_detail:${connectionId}:main`, {
-        created_sets: String(mainGenerated),
-        avg_profit_factor: String(mainPF.toFixed(4)),
-        avg_drawdown_time: String(mainDDT),
-        pass_rate: String(mainPassRatio.toFixed(4)),
-        passed_sets: String(realGenerated),
-        evaluated: String(mainGenerated),
-        updated_at: String(now),
-      }).catch(() => {}),
-      client.expire(`strategy_detail:${connectionId}:main`, ttlDay).catch(() => {}),
-
-      // Real stage detail ��� includes avgPosEvalReal
-      client.hset(`strategy_detail:${connectionId}:real`, {
-        created_sets: String(realGenerated),
-        avg_profit_factor: String(realPF.toFixed(4)),
-        avg_drawdown_time: String(realDDT),
-        avg_pos_eval_real: String(posEvalReal.toFixed(4)),
-        pass_rate: String(realGenerated > 0 ? "1.0000" : "0.0000"),
-        passed_sets: String(realGenerated),
-        evaluated: String(realGenerated),
-        updated_at: String(now),
-      }).catch(() => {}),
-      client.expire(`strategy_detail:${connectionId}:real`, ttlDay).catch(() => {}),
-
-      // evaluated / passed keys for the stats route's ratio calculation
-      client.incrby(`strategies:${connectionId}:base:evaluated`, baseGenerated).catch(() => {}),
-      client.incrby(`strategies:${connectionId}:base:passed`,    mainGenerated).catch(() => {}),
-      client.incrby(`strategies:${connectionId}:main:evaluated`, mainGenerated).catch(() => {}),
-      client.incrby(`strategies:${connectionId}:main:passed`,    realGenerated).catch(() => {}),
-      client.incrby(`strategies:${connectionId}:real:evaluated`, realGenerated).catch(() => {}),
-      client.incrby(`strategies:${connectionId}:real:passed`,    realGenerated).catch(() => {}),
-      client.expire(`strategies:${connectionId}:base:evaluated`, ttlDay).catch(() => {}),
-      client.expire(`strategies:${connectionId}:base:passed`,    ttlDay).catch(() => {}),
-      client.expire(`strategies:${connectionId}:main:evaluated`, ttlDay).catch(() => {}),
-      client.expire(`strategies:${connectionId}:main:passed`,    ttlDay).catch(() => {}),
-      client.expire(`strategies:${connectionId}:real:evaluated`, ttlDay).catch(() => {}),
-      client.expire(`strategies:${connectionId}:real:passed`,    ttlDay).catch(() => {}),
-    ])
-
-    // ── Cycle completion accounting ─────────────────────────────────────
-    // `cycles_completed` / `successful_cycles` were only ever written by
-    // ProgressionStateManager.incrementCycle, which runs inside the
-    // engine-manager realtime loop. That loop does not execute in this
-    // deployment, so the dashboard's "cycles completed" and success-rate
-    // tiles were frozen at 0 / a random placeholder. Since this cron is the
-    // real driver, record real completion here: a cycle that produced at
-    // least one indication is a success, otherwise it is a no-data failure.
+    // ── Strategy counts (computed locally, no extra Redis reads) ─────────────
+    // Base: 1 set per indication type that fired this cycle (varies 1-5)
+    // Main: ~50-70% of Base pass the minPF>=1.2 filter
+    // Real: ~30-50% of Main pass the minPF>=1.4 + confidence>=0.65 filter
+    //
+    // IMPORTANT: only the cycle counter is written here — NOT the cumulative
+    // stage totals (strategies_base_total etc.). Those are written exclusively
+    // by StrategyCoordinator.executeStrategyFlow to prevent double-counting.
+    const baseGenerated = indications.length
+    const mainPassRate  = 0.45 + Math.min(0.30, momentum * 10)
+    const realPassRate  = 0.25 + Math.min(0.25, volFactor * 5)
+    const mainGenerated = Math.max(0, Math.floor(baseGenerated * mainPassRate))
+    const realGenerated = Math.max(0, Math.floor(mainGenerated * realPassRate))
     const cycleSucceeded = indications.length > 0
-    await Promise.all([
-      client.hincrby(progKey, "cycles_completed", 1),
-      cycleSucceeded
-        ? client.hincrby(progKey, "successful_cycles", 1)
-        : client.hincrby(progKey, "failed_cycles", 1),
+
+    // ── Single-pipeline writes — 1 RTT for the entire cron cycle ────────────
+    // market_data, all per-indication counters + latest hashes, progression
+    // counters, cycle-completion accounting and final progression snapshot are
+    // all queued into one multi()/exec() so N indication types + M counter
+    // fields collapse to a single round-trip.
+    //
+    // NOTE: Do NOT write realtime_cycle_count here — the engine-manager's
+    // startIndicationProcessor tick is authoritative for that field. Writing it
+    // here too causes double-counting when both run concurrently.
+
+    // market_data writes
+    pipeline.hset(`market_data:${symbol}`, {
+      close:  String(close),
+      open:   String(open),
+      high:   String(high),
+      low:    String(low),
+      symbol,
+      updated_at: String(now),
+    })
+    pipeline.expire(`market_data:${symbol}`, 3600)
+
+    // per-indication writes (up to 5 × 4 ops = up to 20 ops, all pipelined)
+    for (const ind of indications) {
+      pipeline.hincrby(progKey, `indications_${ind.type}_count`, 1)
+      pipeline.incr(`indications:${connectionId}:${ind.type}:count`)
+      pipeline.expire(`indications:${connectionId}:${ind.type}:count`, 86400)
+      pipeline.hset(`indications:${connectionId}:${ind.type}:latest`, {
+        symbol,
+        value:        String(ind.value),
+        confidence:   String(ind.confidence.toFixed(4)),
+        profitFactor: String(ind.profitFactor.toFixed(4)),
+        timestamp:    String(now),
+      })
+      pipeline.expire(`indications:${connectionId}:${ind.type}:latest`, 3600)
+    }
+
+    // cumulative indication counters — only when indications fired
+    // This cron route is the ACTUAL realtime driver in this deployment (the
+    // engine-manager realtime loop does not run in serverless). These writes
+    // are what keeps total-indications and realtime-progression tiles alive.
+    if (indications.length > 0) {
+      pipeline.hincrby(progKey, "indications_count", indications.length)
+      pipeline.hincrby(progKey, "indication_live_cycle_count", 1)
+    }
+    pipeline.hincrby(progKey, "indication_cycle_count", 1)
+    pipeline.hincrby(progKey, "strategy_cycle_count", 1)
+
+    // cycle completion accounting
+    pipeline.hincrby(progKey, "cycles_completed", 1)
+    if (cycleSucceeded) {
+      pipeline.hincrby(progKey, "successful_cycles", 1)
+    } else {
+      pipeline.hincrby(progKey, "failed_cycles", 1)
+    }
+
+    // Execute all writes in a single round-trip
+    await pipeline.exec().catch(() => {})
+
+    // ── Post-exec: compute success rate from fresh counters (2 hgets) ───────
+    // Two reads after the pipeline ensures we see the incremented values.
+    // Parallelised via Promise.all so they share one RTT.
+    const [completedRaw, succeededRaw, startedAtRaw] = await Promise.all([
+      client.hget(progKey, "cycles_completed").catch(() => "0"),
+      client.hget(progKey, "successful_cycles").catch(() => "0"),
+      client.hget(progKey, "started_at").catch(() => ""),
     ])
-    const completed = parseInt((await client.hget(progKey, "cycles_completed").catch(() => "0")) || "0", 10)
-    const succeeded = parseInt((await client.hget(progKey, "successful_cycles").catch(() => "0")) || "0", 10)
+    const completed      = parseInt((completedRaw as string) || "0", 10)
+    const succeeded      = parseInt((succeededRaw as string) || "0", 10)
     const realSuccessRate = completed > 0 ? (succeeded / completed) * 100 : 100
+
     await client.hset(progKey, {
       cycle_success_rate: String(realSuccessRate.toFixed(1)),
-      last_update: new Date().toISOString(),
-      last_symbol: symbol,
-      started_at: (await client.hget(progKey, "started_at").catch(() => "")) || String(Date.now()),
+      last_update:        new Date().toISOString(),
+      last_symbol:        symbol,
+      started_at:         (startedAtRaw as string) || String(Date.now()),
     })
     await client.expire(progKey, 7 * 24 * 60 * 60)
 
@@ -468,11 +396,47 @@ async function generateIndicationsForConnection(
   return result
 }
 
+// ── Per-process in-flight guard ──────────────────────────────────────────────
+// Prevents concurrent executions within the SAME Node process (e.g. two tabs
+// call the cron at the same millisecond and both enter before either finishes).
+// The Redis-level lock below handles CROSS-process dedup; this handles same-
+// process without a Redis round-trip.
+let _cronInFlight = false
+
 export async function GET() {
+  // ── Same-process guard ──────────────────────────────────────────────────────
+  if (_cronInFlight) {
+    return NextResponse.json({ success: true, skipped: true, reason: "in-flight" }, { status: 200 })
+  }
+
   try {
     const { initRedis, getRedisClient, getAllConnections } = await import("@/lib/redis-db")
     await initRedis()
     const client = getRedisClient()
+
+    // ── Redis in-flight dedup lock (cross-process / cross-tab) ─────────────
+    // Key TTL = 5s. If any caller (another tab, another serverless invocation)
+    // already acquired the lock, skip this tick and return 200 immediately
+    // instead of racing on the progression:{conn} hincrby counters.
+    // We use the plain Redis `SET NX EX` primitive — no owner-token needed
+    // because we only need mutual exclusion within the TTL window, not
+    // ownership revocation. The lock auto-expires so a crashed caller never
+    // blocks future ticks.
+    const CRON_LOCK_KEY  = "cron_lock:generate-indications"
+    const CRON_LOCK_TTL  = 5     // seconds — one full cron window
+    let acquiredCronLock = false
+    try {
+      const setResult = await client.set(CRON_LOCK_KEY, "1", { NX: true, EX: CRON_LOCK_TTL })
+      acquiredCronLock = setResult === "OK"
+    } catch {
+      // If the lock store is unreachable treat as acquired so processing continues.
+      acquiredCronLock = true
+    }
+    if (!acquiredCronLock) {
+      return NextResponse.json({ success: true, skipped: true, reason: "cron-locked" }, { status: 200 })
+    }
+
+    _cronInFlight = true
 
     const connections = await getAllConnections()
 
@@ -521,18 +485,17 @@ export async function GET() {
 
       let primarySymbol = symbolsRaw[0]
       if (!primarySymbol) {
-        try {
-          const marketDataKeys = await client.keys("market_data:*")
-          const flatSymbolKeys = (marketDataKeys || []).filter(
-            (k: string) => !k.includes(":1m") && !k.includes(":5m") && !k.includes(":15m")
-          )
-          if (flatSymbolKeys.length > 0) {
-            const symbolFromRedis = flatSymbolKeys[0].replace("market_data:", "")
-            if (symbolFromRedis && symbolFromRedis.length > 3) {
-              primarySymbol = symbolFromRedis
+        // Avoid O(N) client.keys scan — probe well-known symbols in-order via cheap HGET
+        // (each is one O(1) round-trip bounded by the number of candidates, not keyspace size).
+        for (const sym of ["BTCUSDT", "ETHUSDT", "SOLUSDT"]) {
+          try {
+            const close = await client.hget(`market_data:${sym}`, "close").catch(() => null)
+            if (close && parseFloat(close) > 0) {
+              primarySymbol = sym
+              break
             }
-          }
-        } catch {  }
+          } catch { /* keep probing */ }
+        }
       }
 
       if (!primarySymbol) {
@@ -545,13 +508,46 @@ export async function GET() {
       }
 
       for (let c = 0; c < cyclesPerCron; c++) {
-        for (const symbol of symbolsToProcess) {
-          const r = await generateIndicationsForConnection(connection.id, symbol, client, exchangeName)
+        // Process all symbols for this cycle concurrently.
+        // Each call touches distinct market_data:{symbol} and
+        // indications:{conn}:{type}:latest keys so there is no key collision.
+        // The progression:{conn} hincrby writes are atomic per-key operations so
+        // concurrent increments are safe (the Redis emulator serialises them).
+        const cycleResults = await Promise.all(
+          symbolsToProcess.map(symbol =>
+            generateIndicationsForConnection(connection.id, symbol, client, exchangeName)
+          )
+        )
+        for (const r of cycleResults) {
           totalIndications += r.indications
           totalBase += r.base
           totalMain += r.main
           totalReal += r.real
         }
+      }
+    }
+
+    // ── PSEUDO-POSITION SL/TP + MAX-HOLD AUTO-CLOSE SWEEP ──────────────────
+    // The RealtimeProcessor.processRealtimeUpdates() method is the ONLY path
+    // that checks pseudo-position SL/TP levels and force-closes positions that
+    // have crossed their threshold. In this deployment the engine-manager's
+    // in-process 200ms timer does NOT run (serverless environment), so without
+    // this call SL/TP can NEVER fire — positions accumulate open forever.
+    //
+    // We run one sweep per active connection per cron tick. The sweep is
+    // O(N) in active positions (all price reads are pipelined, single RTT)
+    // and bounded by the number of unique symbols. No lock is needed because
+    // processRealtimeUpdates already has per-position in-flight dedup.
+    //
+    // This is fire-and-forget per the "realtime continuity" principle: a
+    // failed sweep on one connection should not abort cron progress for others.
+    for (const connection of activeConnections) {
+      try {
+        const proc = new RealtimeProcessor(connection.id)
+        await proc.processRealtimeUpdates()
+      } catch (rtErr) {
+        // Non-fatal — SL/TP sweep failure should never abort indication generation.
+        console.warn(`[v0] [Cron] RealtimeProcessor sweep failed for ${connection.id}:`, rtErr instanceof Error ? rtErr.message : String(rtErr))
       }
     }
 
@@ -563,8 +559,20 @@ export async function GET() {
         //   - All stage writes + hincrby counters happen through the canonical paths (no more synthetic counts)
         //   - Eliminates holes and missing processings even when no browser tab keeps the engine loops alive
         // The cron now provides continuous real processing for Prod (Vercel serverless).
-        const conn = "bingx-x01"
-        const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        // Use the first active connection (resolved earlier) — do NOT hard-code "bingx-x01" since
+        // the operator's connection may have a different ID or the base connection may change.
+        const conn = activeConnections[0]?.id || "bingx-x01"
+        // Use the first active connection's own symbols if available, else PROD_SYMBOLS fallback.
+        let prodConnSymbols: string[] = []
+        try {
+          const storedSym = activeConnections[0]?.active_symbols
+          prodConnSymbols = Array.isArray(storedSym)
+            ? storedSym
+            : typeof storedSym === "string" && storedSym.startsWith("[")
+              ? JSON.parse(storedSym)
+              : storedSym ? [storedSym] : []
+        } catch { prodConnSymbols = [] }
+        const symbols = prodConnSymbols.length > 0 ? prodConnSymbols : ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
         // Minimal but realistic indications (enough for Base sets across types/directions)
         // These exercise the full real logic in createBaseSets / createMainSets / evaluateRealSets / createLiveSets
@@ -592,42 +600,21 @@ export async function GET() {
           return inds
         }
 
-        for (const sym of symbols) {
-          const indications = makeIndications(sym)
-          const coordinator = new StrategyCoordinator(conn)
-          await coordinator.executeStrategyFlow(sym, indications, false).catch((e: any) => {
-            console.warn(`[v0] [Cron] Real strategy flow failed for ${sym}:`, e?.message || e)
-            return []
-          })
-          // Execution itself performs all canonical writes, hincrby, and Set persistence.
-          // We ignore the return value here; the outer generate loop already tallies its own synthetic counts.
-        }
+        // Reuse one coordinator instance for the entire symbol batch — each
+        // executeStrategyFlow call shares the same PF/DDT/hedge caches (5s TTL)
+        // so only one Redis read per cache-category happens instead of N.
+        const coordinator = new StrategyCoordinator(conn)
+        const batch = symbols.map((sym) => ({ symbol: sym, indications: makeIndications(sym) }))
+        await coordinator.executeStrategyFlowBatch(batch, false).catch((e: any) => {
+          console.warn(`[v0] [Cron] Real strategy flow batch failed:`, e?.message || e)
+        })
+        // executeStrategyFlowBatch performs all canonical writes, hincrby, and Set persistence.
 
         // Ensure prehistoric gates stay satisfied (real flow above already advances real counters)
         await client.set(`prehistoric:${conn}:done`, "1").catch(() => {})
         await client.set(`prehistoric:${conn}:firstpass:done`, "1").catch(() => {})
         await client.expire(`prehistoric:${conn}:done`, 86400 * 7).catch(() => {})
         await client.expire(`prehistoric:${conn}:firstpass:done`, 86400 * 7).catch(() => {})
-
-        // Keep a minimal live position so the Positions tile never shows 0 after cold start
-        const liveOpenKey = `live:positions:${conn}`
-        const liveOpenListKey = `live:positions:${conn}:open`
-        const now = Date.now()
-        const posId = `live:${conn}:cronlive:1`
-        const livePos: Record<string, string> = {
-          id: posId, connectionId: conn, symbol: "BTCUSDT", direction: "long", side: "long",
-          entryPrice: "65000", averageExecutionPrice: "65000", executedQuantity: "0.015",
-          remainingQuantity: "0.015", leverage: "10", marginType: "cross", status: "open",
-          statusReason: "prod_cron_realtime", unrealized_pnl: "87.5", unrealized_pnl_percent: "1.35",
-          markPrice: "65500", createdAt: String(now - 1000 * 60 * 45), updatedAt: String(now),
-          fills: JSON.stringify([{ price: 65000, quantity: 0.015, timestamp: now - 1000 * 60 * 45 }]),
-        }
-        await client.hset(`live:position:${conn}:${posId}`, livePos).catch(() => {})
-        await client.sadd(`live:positions:${conn}:open`, posId).catch(() => {})
-        await client.lpush(liveOpenKey, posId).catch(() => {})
-        await client.lpush(liveOpenListKey, posId).catch(() => {})
-        await client.hincrby(`progression:${conn}`, "live_positions_created_count", 1).catch(() => {})
-        await client.hincrby(`progression:${conn}`, "live_positions_cycle_count", 1).catch(() => {})
 
         // Logistics marker
         await client.hset("system:logistics", {
@@ -663,6 +650,16 @@ export async function GET() {
       { error: error instanceof Error ? error.message : "Unknown error" },
       { status: 500 },
     )
+  } finally {
+    // Always release both guards so the next tick can run.
+    _cronInFlight = false
+    // Release the Redis lock early (before TTL) so subsequent ticks don't
+    // wait the full 5s when the handler finishes quickly.
+    try {
+      const { getRedisClient } = await import("@/lib/redis-db")
+      const c = getRedisClient()
+      if (c) await c.del("cron_lock:generate-indications").catch(() => {})
+    } catch { /* non-critical */ }
   }
 }
 

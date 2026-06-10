@@ -74,7 +74,11 @@ export function IndicationRowCompact({ indication, onToggle, index }: Indication
 
   const formatTime = (timestamp: string) => {
     try {
-      const date = new Date(timestamp)
+      // Timestamp may be epoch-ms as a numeric string (e.g. "1749252897123") or ISO format.
+      const ms = Number(timestamp)
+      const date =
+        Number.isFinite(ms) && ms > 1_000_000_000_000 ? new Date(ms) : new Date(timestamp)
+      if (isNaN(date.getTime())) return "N/A"
       return date.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })
     } catch {
       return "N/A"

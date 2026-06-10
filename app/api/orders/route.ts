@@ -1,5 +1,4 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { getSession } from "@/lib/auth"
 import { getSettings, setSettings } from "@/lib/redis-db"
 import { auditLogger } from "@/lib/audit-logger"
 import { apiErrorHandler, ApiError } from "@/lib/api-error-handler"
@@ -78,21 +77,12 @@ function validateOrder(order: any): { valid: boolean; error?: string } {
 
 export async function GET(request: NextRequest) {
   try {
-    const user = await getSession()
-    if (!user) {
-      throw new ApiError("Not authenticated", {
-        statusCode: 401,
-        code: "UNAUTHORIZED",
-        context: { operation: "get_orders" },
-      })
-    }
-
     const { searchParams } = new URL(request.url)
     const status = searchParams.get("status")
     const limit = Math.min(Number.parseInt(searchParams.get("limit") || "50"), 500)
 
     const allOrders = (await getSettings("orders")) || []
-    let filtered = allOrders.filter((o: any) => o.user_id === user.id)
+    let filtered = allOrders
 
     if (status) {
       if (!["pending", "filled", "partially_filled", "cancelled", "rejected"].includes(status)) {
@@ -130,16 +120,8 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const user = await getSession()
-    if (!user) {
-      return NextResponse.json(
-        { success: false, error: "Not authenticated", category: API_CATEGORY },
-        { status: 401 }
-      )
-    }
-
-    // Rate limit check
-    const isAllowed = checkOrderRateLimit(String(user.id))
+    // Rate limit check (keyed on system since no user session)
+    const isAllowed = checkOrderRateLimit("system")
     if (!isAllowed) {
       return NextResponse.json(
         {
@@ -179,7 +161,7 @@ export async function POST(request: NextRequest) {
     // Order validation
     const validation = validateOrder({ quantity, price, order_type, side })
     if (!validation.valid) {
-      console.warn(`Order validation failed for user ${user.id}: ${validation.error}`)
+      console.warn(`Order validation failed: ${validation.error}`)
       return NextResponse.json(
         { success: false, error: validation.error, category: API_CATEGORY },
         { status: 400 }
@@ -197,7 +179,7 @@ export async function POST(request: NextRequest) {
     const existing = (await getSettings("orders")) || []
     const newOrder = {
       id: `order:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`,
-      user_id: String(user.id),
+      user_id: "system",
       connection_id,
       symbol: symbol.toUpperCase(),
       order_type: order_type.toLowerCase(),
@@ -213,7 +195,7 @@ export async function POST(request: NextRequest) {
 
     // Log order creation for audit
     await auditLogger.log({
-      user_id: String(user.id),
+      user_id: "system",
       action: "order_create",
       entity_type: "order",
       entity_id: newOrder.id,
@@ -229,7 +211,7 @@ export async function POST(request: NextRequest) {
     })
 
     console.log(
-      `[v0] [Audit] Order created by ${user.id}: ${symbol} ${side} ${quantity}@${price || "market"}`
+      `[v0] [Audit] Order created: ${symbol} ${side} ${quantity}@${price || "market"}`
     )
 
     existing.push(newOrder)

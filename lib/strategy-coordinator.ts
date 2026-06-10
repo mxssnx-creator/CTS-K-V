@@ -19,7 +19,7 @@
 import { initRedis, getSettings, setSettings, getRedisClient } from "@/lib/redis-db"
 import { logProgressionEvent } from "@/lib/engine-progression-logs"
 import { PositionThresholdManager } from "@/lib/position-threshold-manager"
-import { PseudoPositionManager } from "@/lib/trade-engine/pseudo-position-manager"
+import { PseudoPositionManager, nanoid } from "@/lib/trade-engine/pseudo-position-manager"
 import {
   compact,
   loadCompactionConfig,
@@ -200,7 +200,7 @@ export interface StrategySet {
    *      Base→Main filters reject it.
    *   2. evaluateRealSets uses `successRate`/`profitFactor` to TUNE
    *      `entries[].sizeMultiplier` and `leverage` per variant — the
-   *      "Real stage … accumulation for pos cnts sets … relying to
+   *      "Real stage �� accumulation for pos cnts sets … relying to
    *      their base sets configs independent" path.
    */
   prevPos?: {
@@ -242,6 +242,14 @@ export interface PositionContext {
   prevLosses: number
   /** Per-symbol open position count (for symbol-scoped variant decisions) */
   perSymbolOpen: Record<string, number>
+  /**
+   * Per-symbol, per-direction open position count.
+   * Key: symbol, value: { long: n, short: n }.
+   * Used by expandAxisSets so each direction's axis entryCount reflects
+   * only the positions actually open in that direction — keeps long and
+   * short coordinations fully independent.
+   */
+  perSymbolOpenByDir: Record<string, { long: number; short: number }>
 }
 
 // ── Position-Count Cartesian Axis Windows (operator spec) ────────────────────
@@ -686,7 +694,7 @@ export class StrategyCoordinator {
     },
     real: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default ��� operator-tunable
+      minProfitFactor: 1.0,   // spec default ����������������� operator-tunable
       confidence: 0.65,       // advisory only
       description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
@@ -725,7 +733,27 @@ export class StrategyCoordinator {
     this._pfThresholdsLoadedAt = now
     try {
       const { getAppSettings } = await import("@/lib/redis-db")
-      const s = (await getAppSettings()) || {}
+      const globalS = (await getAppSettings()) || {}
+      // ── Per-connection override of global app settings (CRITICAL wiring) ──
+      // PF thresholds, per-stage DDT, and stage min-position-counts are saved
+      // per-connection by the settings dialog and mirrored (flattened +
+      // unit-converted) into `connection_settings:{id}` by the PATCH route.
+      // Resolution order per the approved plan: connection hash wins, else
+      // fall back to the global app setting, else the built-in default below.
+      // We overlay the connection hash on top of global settings so any field
+      // the operator did NOT set per-connection transparently inherits global.
+      let connS: Record<string, string> = {}
+      try {
+        connS = ((await getRedisClient().hgetall(`connection_settings:${this.connectionId}`)) ||
+          {}) as Record<string, string>
+      } catch {
+        connS = {}
+      }
+      const s: Record<string, unknown> = { ...(globalS as Record<string, unknown>) }
+      // Only let non-empty connection-hash scalars override.
+      for (const [k, v] of Object.entries(connS)) {
+        if (v !== undefined && v !== null && v !== "") s[k] = v
+      }
       const clamp = (raw: unknown, fallback: number): number => {
         const n = Number(raw)
         if (!Number.isFinite(n) || n < 0) return fallback
@@ -776,6 +804,23 @@ export class StrategyCoordinator {
       this.METRICS.main.maxDrawdownTime = mainDdtMin
       this.METRICS.real.maxDrawdownTime = realDdtMin
       this.METRICS.live.maxDrawdownTime = liveDdtMin
+
+      // ── Per-stage eval position-count thresholds (CRITICAL wiring fix) ──
+      // `mainEvalPosCount` / `realEvalPosCount` are the minimum entryCount a
+      // Set must contain before Main/Real validation considers it. The
+      // settings dialog saves these AND the PATCH route mirrors them into the
+      // `connection_settings:{id}` hash, but until now NOTHING read them back —
+      // the coordinator used its constructor defaults (15 / 10) forever, so
+      // operator changes silently never took effect. `s` already overlays the
+      // per-connection hash on top of global app_settings (see top of this
+      // method), so connection wins → global → built-in default. Clamp [1,200].
+      const evalCount = (raw: unknown): number | null => {
+        const n = Number(raw)
+        if (!Number.isFinite(n) || n < 1) return null
+        return Math.min(200, Math.max(1, Math.floor(n)))
+      }
+      this._coordinationSettings.mainEvalPosCount = evalCount((s as any).mainEvalPosCount) ?? 15
+      this._coordinationSettings.realEvalPosCount = evalCount((s as any).realEvalPosCount) ?? 10
     } catch (err) {
       // Don't fail the whole flow on a settings read miss — the
       // already-loaded values (either the defaults or the last
@@ -813,9 +858,16 @@ export class StrategyCoordinator {
   }
 
   /**
-   * Load coordination settings from app settings.
+   * Load coordination settings from app settings with per-connection overlay.
    *
    * Reads axis enable flags, variant toggles, and block strategy settings.
+   * Applies the same resolution hierarchy as loadAppPFThresholds():
+   *   connection_settings:{id} hash  →  global app_settings  →  coded default
+   *
+   * This means the operator's per-connection edits in Connection Settings →
+   * Strategy (Trailing on/off, Block on/off, blockVolumeRatio, axis windows,
+   * etc.) actually reach the engine instead of being silently discarded.
+   *
    * Cached for _coordinationTtlMs (5s).
    */
   private async loadCoordinationSettings(): Promise<void> {
@@ -825,23 +877,69 @@ export class StrategyCoordinator {
 
     try {
       const { getAppSettings } = await import("@/lib/redis-db")
-      const s = (await getAppSettings()) || {}
+      const globalS = (await getAppSettings()) || {}
 
-      this._coordinationSettings.axes.prev.enabled = !!(s as any).axisPrevEnabled
-      this._coordinationSettings.axes.prev.maxWindow = Number((s as any).axisPrevMaxWindow) || 0
-      this._coordinationSettings.axes.last.enabled = !!(s as any).axisLastEnabled
-      this._coordinationSettings.axes.last.maxWindow = Number((s as any).axisLastMaxWindow) || 0
-      this._coordinationSettings.axes.cont.enabled = !!(s as any).axisContEnabled
-      this._coordinationSettings.axes.cont.maxWindow = Number((s as any).axisContMaxWindow) || 0
-      this._coordinationSettings.axes.pause.enabled = !!(s as any).axisPauseEnabled
-      this._coordinationSettings.axes.pause.maxWindow = Number((s as any).axisPauseMaxWindow) || 0
+      // ── Per-connection override of global coordination settings ─────────
+      // The PATCH route flattens CoordinationSettings fields (variantTrailingEnabled,
+      // axisPrevEnabled, blockVolumeRatio, etc.) into `connection_settings:{id}`.
+      // Overlay them on top of global settings so any field the operator did
+      // NOT set per-connection transparently inherits the global value.
+      let connS: Record<string, string> = {}
+      try {
+        connS = ((await getRedisClient().hgetall(`connection_settings:${this.connectionId}`)) ||
+          {}) as Record<string, string>
+      } catch {
+        connS = {}
+      }
+      const s: Record<string, unknown> = { ...(globalS as Record<string, unknown>) }
+      for (const [k, v] of Object.entries(connS)) {
+        if (v !== undefined && v !== null && v !== "") s[k] = v
+      }
 
-      this._coordinationSettings.variants.trailing = !!(s as any).variantTrailingEnabled
-      this._coordinationSettings.variants.block = !!(s as any).variantBlockEnabled
-      this._coordinationSettings.variants.dca = !!(s as any).variantDcaEnabled
-      this._coordinationSettings.variants.pause = !!(s as any).variantPauseEnabled
+      // Boolean helper: accepts "true"/true → true, "false"/false → false,
+      // undefined → supplied default. Mirrors the hash-stored "true"/"false"
+      // strings written by the PATCH route.
+      const bool = (val: unknown, def: boolean): boolean => {
+        if (val === "true"  || val === true)  return true
+        if (val === "false" || val === false) return false
+        return def
+      }
+      const num = (val: unknown, def: number): number => {
+        const n = Number(val)
+        return Number.isFinite(n) ? n : def
+      }
+
+      this._coordinationSettings.axes.prev.enabled   = bool(s.axisPrevEnabled,   false)
+      this._coordinationSettings.axes.prev.maxWindow  = num(s.axisPrevMaxWindow,   0)
+      this._coordinationSettings.axes.last.enabled   = bool(s.axisLastEnabled,   false)
+      this._coordinationSettings.axes.last.maxWindow  = num(s.axisLastMaxWindow,   0)
+      this._coordinationSettings.axes.cont.enabled   = bool(s.axisContEnabled,   false)
+      this._coordinationSettings.axes.cont.maxWindow  = num(s.axisContMaxWindow,   0)
+      this._coordinationSettings.axes.pause.enabled  = bool(s.axisPauseEnabled,  false)
+      this._coordinationSettings.axes.pause.maxWindow = num(s.axisPauseMaxWindow,  0)
+
+      // Variant toggles. Defaults: trailing=true, block=true, dca=false, pause=true
+      // (spec: DCA off by default). The bool() helper only falls back to the
+      // default when the key is genuinely absent — an explicit "false" is honoured.
+      this._coordinationSettings.variants.trailing = bool(s.variantTrailingEnabled, true)
+      this._coordinationSettings.variants.block    = bool(s.variantBlockEnabled,    true)
+      this._coordinationSettings.variants.dca      = bool(s.variantDcaEnabled,      false)
+      this._coordinationSettings.variants.pause    = bool(s.variantPauseEnabled,    true)
+
+      // ── Block-strategy tuning (previously never read from settings) ─────
+      // blockVolumeRatio and blockMaxStack control the Block variant's live
+      // size-stacking formula. Without reading them here the engine always
+      // used the coded defaults (1.0 / 3) regardless of operator changes.
+      const bvr = Number(s.blockVolumeRatio)
+      if (Number.isFinite(bvr) && bvr > 0) {
+        this._coordinationSettings.blockVolumeRatio = Math.max(0.25, Math.min(3.0, bvr))
+      }
+      const bms = Number(s.blockMaxStack)
+      if (Number.isFinite(bms) && bms >= 2) {
+        this._coordinationSettings.blockMaxStack = Math.min(8, Math.max(2, Math.floor(bms)))
+      }
     } catch {
-      // use last-known values
+      // use last-known values on any Redis error
     }
   }
 
@@ -981,7 +1079,7 @@ export class StrategyCoordinator {
     return out
   }
 
-  // ─── STAGE 1: BASE ───────────────────────────────────────────────────────────
+  // ─���─ STAGE 1: BASE ───────────────────────────────────────────────────────────
 
   /**
    * Read the multi-step trailing matrix from Redis settings (mirror-aware).
@@ -1346,9 +1444,18 @@ export class StrategyCoordinator {
         client.expire(`strategies:${this.connectionId}:base:count`, 86400),
         client.expire(`strategies:${this.connectionId}:base:evaluated`, 86400),
       ]
+      // Base is the pipeline entry point — every Set it produces IS its own
+      // evaluation (it passes by definition of being emitted). The old
+      // denominator `variantPasses.length × setMap.size` counted "raw combos
+      // attempted" which was always ≥ baseSets.length, making Base eval%
+      // appear << 100% and breaking the stageEvalPercent cascade display.
+      // The correct denominator is baseSets.length: same as the numerator,
+      // so Base always evaluates at 100%.
       if (baseSets.length > 0) {
-        writes.push(client.hincrby(redisKey, "strategies_base_total", baseSets.length))
-        writes.push(client.hincrby(redisKey, "strategies_base_evaluated", baseSets.length))
+        writes.push(
+          client.hincrby(redisKey, "strategies_base_total",     baseSets.length),
+          client.hincrby(redisKey, "strategies_base_evaluated", baseSets.length),
+        )
       }
 
       // ── ACTIVE-NOW snapshot per (symbol, stage) ───────────────────────
@@ -1433,7 +1540,7 @@ export class StrategyCoordinator {
       baseSets = stored?.sets || []
     }
 
-    const metrics = this.METRICS.main
+    const metricsMain = this.METRICS.main
     const maxEntries = this.config.maxEntriesPerSet || 250
     const ctx = posCtx ?? this.neutralPositionContext()
     const mainSets: StrategySet[] = []
@@ -1445,6 +1552,11 @@ export class StrategyCoordinator {
     // Apply a one-time mild relaxation only for prod + live_trade after quickstart.
     // This mirrors the Real-stage bootstrap and restores the behaviour where
     // "it used to produce live orders on first quickstart".
+    // IMPORTANT: use a LOCAL minPF variable — never mutate this.METRICS.main
+    // in-place. The class field is shared across all symbols in the same cycle
+    // (and across cycles within the 5s PF-cache window), so an in-place write
+    // would bleed the relaxed threshold into every subsequent symbol's call.
+    let mainMinPF = metricsMain.minProfitFactor
     try {
       const { isProductionEnvironment, getConnection: getConn } = await import("@/lib/redis-db")
       const { isTruthyFlag } = await import("@/lib/connection-state-utils")
@@ -1452,17 +1564,20 @@ export class StrategyCoordinator {
         const conn = await getConn(this.connectionId).catch(() => null as any)
         const liveOn = isTruthyFlag(conn?.is_live_trade) || isTruthyFlag(conn?.live_trade_enabled)
         if (liveOn) {
-          const origPF = metrics.minProfitFactor
-          metrics.minProfitFactor = Math.min(origPF, 0.85)
-          if (origPF !== metrics.minProfitFactor) {
+          const relaxed = Math.min(mainMinPF, 0.85)
+          if (relaxed !== mainMinPF) {
             console.log(
               `[v0] [StrategyCoordinator] ${this.connectionId} MAIN bootstrap (prod + live quickstart): ` +
-              `relaxed minProfitFactor ${origPF} → ${metrics.minProfitFactor} to allow first Base→Main→Real flow.`
+              `relaxed minProfitFactor ${mainMinPF} → ${relaxed} to allow first Base→Main→Real flow.`
             )
+            mainMinPF = relaxed
           }
         }
       }
     } catch { /* non-fatal */ }
+    // Build a cycle-local metrics view so the shared METRICS object is never
+    // mutated and every symbol in the same batch uses its own threshold copy.
+    const metrics: EvaluationMetrics = { ...metricsMain, minProfitFactor: mainMinPF }
 
     // ── Stage-validation min-position threshold (operator spec) ────
     // "Main has to evaluate from stage Base with profitfactor for X
@@ -1604,7 +1719,7 @@ export class StrategyCoordinator {
     // ── Await all async builds to complete ───────────────────────────────
     const results = await Promise.all(buildTasks)
     
-    // ── Process results and populate mainSets ────────────────────────────
+    // ── Process results and populate mainSets ──���─────────────────────────
     for (const result of results) {
       const { baseSet, profile, built, cachedSet } = result
       const set = cachedSet || built
@@ -1657,8 +1772,12 @@ export class StrategyCoordinator {
       // instead of static projections. Per-symbol is correct because
       // axis Sets and their hedge bucketing are scoped to one symbol.
       const liveCont = symbolCtx?.continuousCount ?? 0
+      // Direction-specific open counts for this symbol — gives expandAxisSets
+      // independent liveCont per direction so long and short axis Sets get
+      // different entryCount values when one direction is more accumulated.
+      const liveContByDir = ctx.perSymbolOpenByDir?.[symbol] ?? { long: 0, short: 0 }
       for (const defaultSet of defaultByBaseKey.values()) {
-        const expanded = this.expandAxisSets(defaultSet, minPF, liveCont)
+        const expanded = this.expandAxisSets(defaultSet, minPF, liveCont, liveContByDir)
         for (const axisSet of expanded) {
           mainSets.push(axisSet)
           axisSetsAdded++
@@ -1823,6 +1942,19 @@ export class StrategyCoordinator {
       if (mainSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_total", mainSets.length))
       if (baseSets.length > 0) writes.push(client.hincrby(redisKey, "strategies_main_evaluated", baseSets.length))
 
+      // ── ACTIVE-NOW snapshot for Main stage (per symbol, like Base/Real) ───
+      // The stats route reads `strategies_active:{conn}` and aggregates by
+      // stage suffix. Without {symbol}:main fields the `stratCounts.main`
+      // bucket was always 0, making the Main column on the dashboard empty.
+      writes.push(
+        client.hset(`strategies_active:${this.connectionId}`, {
+          [`${symbol}:main`]:           String(mainSets.length),
+          // main:evaluated = Base Sets that entered Main filter (= candidates)
+          [`${symbol}:main:evaluated`]: String(baseSets.length),
+        }),
+        client.expire(`strategies_active:${this.connectionId}`, 600),
+      )
+
       const relatedCreated = mainSets.length - reused
       const activeVariantNames = activeVariants.map((p) => p.name)
       writes.push(
@@ -1855,9 +1987,6 @@ export class StrategyCoordinator {
 
       await Promise.all(writes)
     } catch { /* non-critical — Redis write failure should not kill strategy flow */ }
-
-    if (baseSets.length > 0) {
-    }
 
     return {
       result: {
@@ -1989,7 +2118,7 @@ export class StrategyCoordinator {
     }
     const mainSets: StrategySet[] = inputSets ?? (stored?.sets || [])
 
-    const metrics = this.METRICS.real
+    const metricsReal = this.METRICS.real
 
      // ── Stage-validation min-position threshold (operator spec, systemwide fix) ────
      // Same semantics as Main: Sets below `realEvalPosCount` are
@@ -2014,6 +2143,11 @@ export class StrategyCoordinator {
       // so the first qualifying axis/profile sets can escalate to Live execution.
       // PF/DDT still apply (just lowered), and normal strictness returns as soon
       // as real history accumulates.
+      // IMPORTANT: use a LOCAL minPF — never mutate this.METRICS.real in-place.
+      // The class field is shared across all symbols in the same cycle and across
+      // cycles within the 5s PF-cache window; an in-place mutation bleeds the
+      // relaxed threshold into every subsequent symbol's Real evaluation.
+      let realMinPF = metricsReal.minProfitFactor
       try {
         const { getConnection: getConn } = await import("@/lib/redis-db")
         const { isTruthyFlag } = await import("@/lib/connection-state-utils")
@@ -2025,18 +2159,19 @@ export class StrategyCoordinator {
 
           // PF bootstrap relaxation — lower the Real gate slightly to allow first
           // cycles to promote sets when live trading is explicitly enabled.
-          const originalRealPF = metrics.minProfitFactor
-          metrics.minProfitFactor = Math.min(originalRealPF, 0.75)
-
-          if (originalRealPF !== metrics.minProfitFactor) {
+          const relaxed = Math.min(realMinPF, 0.75)
+          if (relaxed !== realMinPF) {
             console.log(
               `[v0] [StrategyCoordinator] ${this.connectionId} REAL bootstrap (live quickstart): ` +
-              `relaxed minProfitFactor ${originalRealPF} → ${metrics.minProfitFactor} and posCount→${realMinPos} ` +
+              `relaxed minProfitFactor ${realMinPF} → ${relaxed} and posCount→${realMinPos} ` +
               `to allow first Real→Live escalation while history builds.`
             )
+            realMinPF = relaxed
           }
         }
       } catch { /* non-fatal */ }
+      // Build a cycle-local metrics view — shared METRICS.real never mutated.
+      const metrics: EvaluationMetrics = { ...metricsReal, minProfitFactor: realMinPF }
      
      // Get real active keys for validation (moved outside try block for scope access)
      let realActiveKeysForVP: Set<string> = new Set()
@@ -2111,7 +2246,7 @@ export class StrategyCoordinator {
         // valid_real until that position is closed — even if its PF/DDT
         // temporarily dips below threshold this cycle. Without this exemption
         // a transient metric wobble drops the Set from realQualifying →
-        // realSorted → netted → realPostHedge, so it is never persisted or
+        // realSorted �� netted → realPostHedge, so it is never persisted or
         // dispatched, orphaning the live position from its Real-stage owner
         // (reconcile/sync can no longer map it to a Set). This mirrors the
         // exemption already applied at the min-pos gate above.
@@ -2199,7 +2334,7 @@ export class StrategyCoordinator {
     let netCancelled = 0
     for (const s of passthrough) {
       const aw = s.axisWindows
-      // ── CRITICAL FIX: Profile-variant Sets always go to hedging ──
+      // ── CRITICAL FIX: Profile-variant Sets always go to hedging ��─
       // Sets in `passthrough` are profile-variant (default/trailing/block/DCA)
       // and MUST participate in hedge netting. Previously, sets without
       // axisWindows were auto-added to netted, bypassing the netting logic.
@@ -2325,25 +2460,11 @@ export class StrategyCoordinator {
       const { bumpRealPosAccumulation, bumpValidPositions, bumpAxisPosAccumulation, bumpHedgePosAccumulation } = await import(
         "@/lib/pos-history",
       )
-      const realActiveKeysForVP = await (async () => {
-        try {
-          const c = getRedisClient()
-          const base = new Set<string>(
-            (await c
-              .smembers(`pseudo_positions:${this.connectionId}:active_config_keys`)
-              .catch(() => [])) as string[],
-          )
-          // Same authoritative enrichment as the validation gate above so the
-          // "running now" valid-positions counter agrees with the filter: a
-          // Set with an open live position counts as running regardless of the
-          // (unreliable) active_config_keys fingerprint set.
-          try {
-            const liveSetKeys = await this.getOpenLiveSetKeys()
-            for (const k of liveSetKeys) base.add(k)
-          } catch { /* fail-open */ }
-          return base
-        } catch { return new Set<string>() }
-      })()
+      // Reuse `realActiveKeysForVP` already resolved at the function's top
+      // (smembers + getOpenLiveSetKeys). Performing a second fetch here was a
+      // redundant extra round-trip pair (one SMEMBERS + one live-positions scan)
+      // on every Real-stage cycle, adding ~2 Redis RTTs with zero benefit since
+      // the data can't change within the same async function call.
       const accPipeline = getRedisClient().multi()
       for (const s of realSets) {
         const parentKey = s.parentSetKey || s.setKey.split("#")[0]
@@ -2504,16 +2625,10 @@ export class StrategyCoordinator {
       // Position evaluation real: average confidence of REAL sets
       // (how well did the Real stage filter perform)
       const realAvgConf = realSets.length > 0 ? realSets.reduce((s, st) => s + (st.avgConfidence || 0), 0) / realSets.length : 0
-      // passRatioReal = fraction of ELIGIBLE Main Sets (those that reached the
-      // PF/DDT gate — not the ones gated out before it by insufficient_pos_count)
-      // that passed into Real. Using mainSets.length as the denominator deflates
-      // the ratio because mainSets includes the large axis fan-out (~320 Sets per
-      // Base Set) while realSets are comparatively few after the PF gate.
-      // The correct denominator is the count of Sets that were actually evaluated
-      // against PF/DDT criteria (not pre-rejected by the pos-count gate).
-      const mainPFEligible = mainSetsEligible.filter(
-        (s) => !(s.status === "invalid" && s.rejectionReason?.includes("insufficient_pos_count")),
-      ).length
+      // passRatioReal = fraction of ELIGIBLE Main Sets that passed into Real.
+      // `mainPFEligible` is computed once above (outside this try-block) and
+      // reused here — the duplicate inner `const mainPFEligible` that used to
+      // shadow it was removed to fix the redundant filter re-computation.
       const passRatioReal = mainPFEligible > 0 ? realSets.length / mainPFEligible : 0
       const realEntriesTotal  = realSets.reduce((s, st) => s + (st.entryCount || 0), 0)
       const realAvgPosPerSet  = realSets.length > 0 ? realEntriesTotal / realSets.length : 0
@@ -2541,6 +2656,15 @@ export class StrategyCoordinator {
         const base = (s.parentSetKey ?? s.setKey).split("#")[0]
         return realActiveBaseKeys.has(base)
       }).length
+
+      // Open positions = sum of entryCount across the Real Sets that are
+      // actively running now (each entry is one open position the Set holds).
+      const realOpenPositions = realSets.reduce((sum, s) => {
+        const base = (s.parentSetKey ?? s.setKey).split("#")[0]
+        return realActiveBaseKeys.has(base) ? sum + (s.entryCount || 0) : sum
+      }, 0)
+      // Positions (entries) per running Set — averaged over running Sets only.
+      const realPosPerRunningSet = realRunningNow > 0 ? realOpenPositions / realRunningNow : 0
 
       // ── Real 4-perspective stats (Overall / Accumulated / General / Combined) ──
       // Per operator spec: "in Strategies Real ensure correct stats..
@@ -2674,6 +2798,30 @@ export class StrategyCoordinator {
       )
 
       // ── P1-1: Real-stage per-variant aggregation ───────────���────────
+      // ── Real-stage rolling sample (for averaged count stats) ──────────
+      // Push one timestamped sample of the live Real counts per (symbol,
+      // cycle) onto a bounded ring list. The tracking layer averages all
+      // samples inside a fixed interval window to produce the displayed
+      // "average" Active Sets / Positions-per-Set / Positions-Open figures.
+      // lpush + ltrim is O(1)-ish and order-independent, so concurrent
+      // symbol workers can never corrupt or stall it (no read-modify-write).
+      // The interval window itself is an internal calc detail — the UI shows
+      // only the resulting averages, never the "N minutes" framing.
+      try {
+        const sampleKey = `real_samples:${this.connectionId}`
+        const sample = JSON.stringify({
+          t: Date.now(),
+          sets: realSets.length,          // all Real Sets passing gates this cycle
+          pps: Number(realPosPerRunningSet.toFixed(3)),
+          open: realOpenPositions,        // running (pseudo-open) positions
+        })
+        writes.push(
+          client.lpush(sampleKey, sample),
+          client.ltrim(sampleKey, 0, 599),
+          client.expire(sampleKey, 3600),
+        )
+      } catch { /* non-critical */ }
+
       // Same shape as Main's `variantAgg` but computed over the Real
       // output (post-PF/DDT filter). Lets the stats API answer "how
       // much of Real is Default vs Adjust{Block, DCA} vs Trailing?"
@@ -2713,7 +2861,7 @@ export class StrategyCoordinator {
         )
       }
 
-      // ── POSITION-COUNT AXIS ACCUMULATION (Real stage) ──────────────
+      // ── POSITION-COUNT AXIS ACCUMULATION (Real stage) ───────────��──
       // Per spec: "Do the Additional Sets / Position Counts Accumulation
       // in Strategies Real instead of in Main". The axis windows are
       // tagged at Main creation time but the cumulative accumulation
@@ -3060,6 +3208,15 @@ export class StrategyCoordinator {
         qualifying.length > 0
           ? client.hincrby(redisKey, "strategies_live_total", qualifying.length)
           : Promise.resolve(),
+        // ── ACTIVE-NOW snapshot for Live stage ────────────────────────────
+        // Without {symbol}:live fields the `stratCounts.live` bucket in the
+        // stats route always returned 0, making the Live column empty.
+        client.hset(`strategies_active:${this.connectionId}`, {
+          [`${symbol}:live`]:           String(qualifying.length),
+          // live:evaluated = Real Sets that entered Live selection (= candidates)
+          [`${symbol}:live:evaluated`]: String(realSets.length),
+        }),
+        client.expire(`strategies_active:${this.connectionId}`, 600),
         client.expire(redisKey, 7 * 24 * 60 * 60),
         client.hset(liveDetailKey, {
           // Legacy per-cycle aggregate fields (last-symbol-wins). Kept
@@ -3232,7 +3389,7 @@ export class StrategyCoordinator {
                 const liveResult = await executeLivePosition(
                   this.connectionId,
                   {
-                    id: `real:${this.connectionId}:${set.setKey}:${symbol}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`,
+                    id: `real:${this.connectionId}:${set.setKey}:${symbol}:${Date.now()}:${nanoid(8)}`,
                     connectionId: this.connectionId,
                     symbol,
                     direction: set.direction,
@@ -3274,6 +3431,11 @@ export class StrategyCoordinator {
                     parentSetKey: set.parentSetKey,
                     setVariant:   set.variant,
                     axisWindows:  set.axisWindows,
+                    // Forward the variant size multiplier so VolumeCalculator
+                    // can apply Block (1.5–2.0×) or DCA (0.5×) notional scaling
+                    // before placing the exchange order. Falls back to set-level
+                    // sizeMultiplier then 1.0 if the entry doesn't carry one.
+                    sizeMultiplier: bestEntry.sizeMultiplier ?? (set as any).sizeMultiplier ?? 1,
                   },
                   connector
                 )
@@ -3287,7 +3449,14 @@ export class StrategyCoordinator {
                 } else if (liveResult.status === "rejected") {
                   rejected++
                 } else if (liveResult.status === "error") {
-                  errored++
+                  // 101204 (Insufficient margin) and other recoverable margin/rejection
+                  // errors are counted as "rejected" not "errored" for accurate stats.
+                  // Only truly exceptional errors (circuit breaker, API down, etc.) count as errored.
+                  if ((liveResult as any).errorCode === "101204" || (liveResult as any).code === "101204") {
+                    rejected++
+                  } else {
+                    errored++
+                  }
                 }
               } catch (err) {
                 errored++
@@ -3423,7 +3592,7 @@ export class StrategyCoordinator {
 
                 // Multi-step trailing — Set carries its own profile from
                 // BASE, so trailing-on/off and the three ratios are
-                // operator-determined per the matrix in Settings →
+                // operator-determined per the matrix in Settings ���
                 // Strategy → Trailing. Sets WITHOUT a profile keep the
                 // legacy single-step behaviour with statistical on/off
                 // (`bestEntry.confidence >= 0.85`).
@@ -3516,6 +3685,7 @@ export class StrategyCoordinator {
       lastLosses: 0,
       prevLosses: 0,
       perSymbolOpen: {},
+      perSymbolOpenByDir: {},
     }
   }
 
@@ -3540,10 +3710,17 @@ export class StrategyCoordinator {
       // positions). No extra Redis reads — getActivePositions already pulls
       // the full hashes behind a 1s internal cache.
       const perSymbolOpen: Record<string, number> = {}
+      // Direction-split variant: tracks long and short independently per
+      // symbol so expandAxisSets can give each direction its own liveCont.
+      const perSymbolOpenByDir: Record<string, { long: number; short: number }> = {}
       for (const p of active) {
         const sym = String(p.symbol || "")
         if (!sym) continue
         perSymbolOpen[sym] = (perSymbolOpen[sym] ?? 0) + 1
+        if (!perSymbolOpenByDir[sym]) perSymbolOpenByDir[sym] = { long: 0, short: 0 }
+        const dir = String(p.direction || p.side || "long").toLowerCase()
+        if (dir === "short") perSymbolOpenByDir[sym].short += 1
+        else                 perSymbolOpenByDir[sym].long  += 1
       }
 
       // ── P-CTX-1: Read from dedicated closed-positions index ──────────
@@ -3628,6 +3805,7 @@ export class StrategyCoordinator {
         lastLosses:      lastN.filter((r) => r.pnl < 0).length,
         prevLosses,
         perSymbolOpen,
+        perSymbolOpenByDir,
       }
 
       this.positionContextCache = { ctx, ts: now }
@@ -3812,6 +3990,7 @@ export class StrategyCoordinator {
     baseDefault: StrategySet,
     minPF: number,
     liveCont = 0,
+    liveContByDir?: { long: number; short: number },
   ): StrategySet[] {
     const axisSets: StrategySet[] = []
     const baseEC = baseDefault.entryCount || 0
@@ -3869,18 +4048,22 @@ export class StrategyCoordinator {
               // The `cont` axis dimension represents "actual + next N-1
               // positions to accumulate". Per spec we only credit
               // positions that ACTUALLY exist live this cycle. Cap by
-              // `liveCont` so axis Sets reflect the rolling continuous
-              // count, not a static projection that would over-count
-              // empty slots. Worst case (liveCont = 0) collapses to
-              // `entryCount = baseEC`, growing as positions accrue.
-              const credited = Math.min(cont, Math.max(0, liveCont))
+              // the DIRECTION-SPECIFIC open count so long and short axis
+              // Sets reflect independently accumulated position counts —
+              // not a shared total that would always mirror both sides.
+              // Falls back to the aggregate `liveCont` when the caller
+              // does not provide per-direction data (e.g. prehistoric).
+              const dirLiveCont = liveContByDir
+                ? (dir === "short" ? liveContByDir.short : liveContByDir.long)
+                : liveCont
+              const credited = Math.min(cont, Math.max(0, dirLiveCont))
               const ec = baseEC + credited
 
               // ── Synthetic representative entry ─────────────────────
               // One entry per axis Set so:
               //   • variant-aggregate loop counts it (passed_sets / sumPF / sumDDT)
               //   • Real-stage tuner has something to mutate
-              //   • per-axis Pos-acc ledger has a non-zero delta to record
+              //   �� per-axis Pos-acc ledger has a non-zero delta to record
               // Quality fields are inherited from the Base default's
               // realised-history aggregates; positionState carries the
               // axis tuple so the dashboard can drill in.
@@ -3987,7 +4170,7 @@ export class StrategyCoordinator {
         ],
       },
       {
-        // ── Pause variant — 1..8 last-position validation windows (step 1) ──
+        // ── Pause variant — 1..8 last-position validation windows (step 1) ─���
         // Spec: *"add Pause 1-8 Pos step 1 to Main additional Sets creation
         // after Pos prev,Last,cont .. add the 1-8 Last for counting Pause of
         // validating."* Each sub-config encodes one validation lookback N
@@ -4019,7 +4202,7 @@ export class StrategyCoordinator {
    * Deterministic fingerprint of {base Set × variant × position context}.
    * Drives the "IF NOT ALREADY CREATED" dedup check.
    *
-   * ── Bucket ranges (P0-3, spec-aligned) ─��───────────────────────────
+   * ── Bucket ranges (P0-3, spec-aligned) ─��────────────────────��──────
    * Spec ranges:
    *   - Prev Positions         1-12   (13 buckets 0-12)
    *   - Last Positions W/L     1-4    (5 buckets each 0-4)

@@ -30,7 +30,9 @@ export interface ExchangeAPI {
   placeOrder(order: any): Promise<any>
   cancelOrder(orderId: string): Promise<boolean>
   getOrderBook(symbol: string): Promise<any>
-  subscribeToTicker(symbol: string, callback: (data: any) => void): void
+  /** Subscribe to real-time ticker updates. Returns an unsubscribe function that
+   *  MUST be called when the subscription is no longer needed to prevent interval leaks. */
+  subscribeToTicker(symbol: string, callback: (data: any) => void): () => void
   setMarginMode?(symbol: string, mode: "cross" | "isolated"): Promise<boolean>
   setHedgingMode?(mode: "single" | "hedge"): Promise<boolean>
   setLeverage?(symbol: string, leverage: number): Promise<boolean>
@@ -210,7 +212,11 @@ export class BybitAPI implements ExchangeAPI {
       ...order,
       marginMode: this.config.marginMode || "cross",
       hedgingMode: this.config.hedgingMode || "single",
-      leverage: this.config.leverage || 10,
+      // Use per-connection maxLeverage when caller did not supply leverage,
+      // falling back to config.leverage (operator-set), then to the safe
+      // default of 125 (Bybit perp cap). The old fallback of 10 prevented
+      // max-leverage positions from being opened via this shim path.
+      leverage: this.config.leverage || this.config.maxLeverage || 125,
       connectionMethod: this.activeConnectionMethod,
     }
 
@@ -337,7 +343,7 @@ export class BybitAPI implements ExchangeAPI {
     }
   }
 
-  subscribeToTicker(symbol: string, callback: (data: any) => void): void {
+  subscribeToTicker(symbol: string, callback: (data: any) => void): () => void {
     console.log(`[v0] [Bybit] [${this.activeConnectionMethod.toUpperCase()}] Subscribing to ticker for ${symbol}`)
     const interval = setInterval(() => {
       callback({
@@ -346,6 +352,7 @@ export class BybitAPI implements ExchangeAPI {
         timestamp: Date.now(),
       })
     }, 1000)
+    return () => clearInterval(interval)
   }
 }
 
@@ -617,7 +624,7 @@ export class BingXAPI implements ExchangeAPI {
     }
   }
 
-  subscribeToTicker(symbol: string, callback: (data: any) => void): void {
+  subscribeToTicker(symbol: string, callback: (data: any) => void): () => void {
     const interval = setInterval(() => {
       callback({
         symbol,
@@ -625,6 +632,7 @@ export class BingXAPI implements ExchangeAPI {
         timestamp: Date.now(),
       })
     }, 1200)
+    return () => clearInterval(interval)
   }
 }
 
@@ -894,7 +902,7 @@ export class PionexAPI implements ExchangeAPI {
     }
   }
 
-  subscribeToTicker(symbol: string, callback: (data: any) => void): void {
+  subscribeToTicker(symbol: string, callback: (data: any) => void): () => void {
     const interval = setInterval(() => {
       callback({
         symbol,
@@ -902,6 +910,7 @@ export class PionexAPI implements ExchangeAPI {
         timestamp: Date.now(),
       })
     }, 1500)
+    return () => clearInterval(interval)
   }
 }
 
@@ -1157,7 +1166,7 @@ export class OrangeXAPI implements ExchangeAPI {
     }
   }
 
-  subscribeToTicker(symbol: string, callback: (data: any) => void): void {
+  subscribeToTicker(symbol: string, callback: (data: any) => void): () => void {
     const interval = setInterval(() => {
       callback({
         symbol,
@@ -1165,6 +1174,7 @@ export class OrangeXAPI implements ExchangeAPI {
         timestamp: Date.now(),
       })
     }, 1100)
+    return () => clearInterval(interval)
   }
 }
 

@@ -1,5 +1,4 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { getSession } from "@/lib/auth"
 import { PseudoPositionManager } from "@/lib/trade-engine/pseudo-position-manager"
 
 /**
@@ -140,11 +139,6 @@ async function getRealPositions(connectionId: string): Promise<Position[]> {
 
 export async function GET(request: NextRequest) {
   try {
-    const user = await getSession()
-    if (!user) {
-      return NextResponse.json({ success: false, error: "Not authenticated" }, { status: 401 })
-    }
-
     const connectionId = request.nextUrl.searchParams.get("connectionId")
     if (!connectionId) {
       return NextResponse.json({ success: false, error: "connectionId query parameter required" }, { status: 400 })

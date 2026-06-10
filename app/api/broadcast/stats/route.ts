@@ -6,18 +6,11 @@
 import type { NextRequest } from 'next/server'
 import { NextResponse } from 'next/server'
 import { getBroadcaster } from '@/lib/event-broadcaster'
-import { getSession } from '@/lib/auth'
 
 export const dynamic = 'force-dynamic'
 
 export async function GET(request: NextRequest) {
   try {
-    // Verify authentication
-    const session = await getSession()
-    if (!session) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
     const broadcaster = getBroadcaster()
     const stats = broadcaster.getStats()
 

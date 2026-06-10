@@ -237,6 +237,39 @@ export class ConfigSetProcessor {
         if (candles.length === 0) {
           console.log(`[v0] [ConfigSetProcessor] ⚠ no candles for ${symbol} — skipping`)
           symbolsWithoutData++
+          // CRITICAL ("0/N stuck" + stalled progress-bar fix): a symbol with
+          // no prehistoric candles must STILL count toward the processed
+          // total, otherwise `symbols_processed` can never reach
+          // `symbols_total` (dashboard sticks at "X/N") AND the percent bar
+          // — computed from the local `symbolsProcessed` below — can never
+          // reach 95%. Increment the local counter, add to the canonical SET
+          // (single atomic source of truth), and mirror BOTH the distinct
+          // count and the legacy `prehistoric_symbols_processed_count` field.
+          // SADD is idempotent so a replay can't double-count.
+          symbolsProcessed++
+          try {
+            await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
+            await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400)
+            await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
+            const distinctSkipProcessed = await client.scard(`prehistoric:${this.connectionId}:symbols`)
+            await client.hset(`prehistoric:${this.connectionId}`, {
+              symbols_processed: String(distinctSkipProcessed),
+            })
+            // Advance the dashboard percent bar even for data-less symbols,
+            // using the SAME `engine_progression` schema the main path writes.
+            const totalSyms = Math.max(1, symbols.length)
+            const skipPct = Math.min(95, 15 + Math.round((symbolsProcessed / totalSyms) * 80))
+            void setSettings(`engine_progression:${this.connectionId}`, {
+              phase: "prehistoric_data",
+              progress: skipPct,
+              detail: `Prehistoric calc filling sets — ${symbolsProcessed}/${totalSyms} symbols processed (no data: ${symbol})`,
+              sub_current: symbolsProcessed,
+              sub_total: totalSyms,
+              sub_item: symbol,
+              connection_id: this.connectionId,
+              updated_at: new Date().toISOString(),
+            }).catch(() => { /* non-critical */ })
+          } catch { /* non-critical */ }
           await logProgressionEvent(this.connectionId, "config_set_symbol_skipped", "warning", `No prehistoric candles for ${symbol}`, {
             symbol,
             stage: "prehistoric",
@@ -341,16 +374,27 @@ export class ConfigSetProcessor {
         // writes to separate `prehistoric_indications_total` and
         // `prehistoric_strategies_total` keys. This prevents the "jumped counters"
         // effect when transitioning from setup to live trading.
+        //
+        // CRITICAL ("0/N stuck" fix): `symbols_processed` is derived from the
+        // cardinality of the `prehistoric:{id}:symbols` SET, NOT the shared
+        // mutable `symbolsProcessed` local. With SYMBOL_CONCURRENCY parallel
+        // workers, writing `String(symbolsProcessed)` raced — an out-of-order
+        // async write could stamp a STALE (lower) value over a newer one,
+        // freezing the dashboard at "X/N". SADD + SCARD is order-independent
+        // and idempotent, so the distinct count is always monotonic and exact.
+        await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
+        const distinctProcessed = await client
+          .scard(`prehistoric:${this.connectionId}:symbols`)
+          .catch(() => symbolsProcessed)
         await Promise.all([
           progressWrite,
           client.hincrby(progressKey, "prehistoric_indications_total", indicationResults),
           client.hincrby(progressKey, "prehistoric_strategies_total", strategyPositions),
           client.expire(progressKey, 7 * 24 * 60 * 60),
-          client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol),
           client.expire(`prehistoric:${this.connectionId}:symbols`, 86400),
           client.hset(`prehistoric:${this.connectionId}`, {
             candles_loaded: String(candlesProcessed),
-            symbols_processed: String(symbolsProcessed),
+            symbols_processed: String(distinctProcessed),
             intervals_processed: String(totalIntervalsProcessed),
             missing_intervals: String(missingIntervalsLoaded),
           }),
@@ -374,13 +418,18 @@ export class ConfigSetProcessor {
         // path's post-prehistoric handler). Fire-and-forget — a stuck
         // Redis write should never delay the next symbol.
         try {
+          // Use the monotonic SCARD-derived `distinctProcessed` (NOT the racy
+          // `symbolsProcessed` local) for BOTH the percent and the X/Y display
+          // so the progress bar and the "symbols processed of N" label can
+          // never regress under parallel workers — they advance in lockstep
+          // with the authoritative distinct-symbol set.
           const total = Math.max(1, symbols.length)
-          const pct = Math.min(95, 15 + Math.round((symbolsProcessed / total) * 80))
+          const pct = Math.min(95, 15 + Math.round((distinctProcessed / total) * 80))
           void setSettings(`engine_progression:${this.connectionId}`, {
             phase: "prehistoric_data",
             progress: pct,
-            detail: `Prehistoric calc filling sets — ${symbolsProcessed}/${total} symbols processed`,
-            sub_current: symbolsProcessed,
+            detail: `Prehistoric calc filling sets — ${distinctProcessed}/${total} symbols processed`,
+            sub_current: distinctProcessed,
             sub_total: total,
             sub_item: symbol,
             connection_id: this.connectionId,
@@ -398,6 +447,34 @@ export class ConfigSetProcessor {
       } catch (error) {
         console.error(`[v0] [ConfigSetProcessor] ✗ ${symbol}:`, error instanceof Error ? error.message : String(error))
         errors++
+        // CRITICAL ("stuck below 100%" fix): a symbol that throws mid-process
+        // must STILL count toward progress, otherwise the SCARD-derived
+        // distinct count never reaches N and the bar freezes forever. Mirror
+        // the skip-branch accounting: add to the canonical SET (idempotent),
+        // bump the legacy counter, and advance the dashboard percent using the
+        // monotonic distinct count.
+        symbolsProcessed++
+        try {
+          await client.sadd(`prehistoric:${this.connectionId}:symbols`, symbol)
+          await client.expire(`prehistoric:${this.connectionId}:symbols`, 86400)
+          await client.hincrby(progressKey, "prehistoric_symbols_processed_count", 1)
+          const distinctErrProcessed = await client.scard(`prehistoric:${this.connectionId}:symbols`)
+          await client.hset(`prehistoric:${this.connectionId}`, {
+            symbols_processed: String(distinctErrProcessed),
+          })
+          const totalSyms = Math.max(1, symbols.length)
+          const errPct = Math.min(95, 15 + Math.round((distinctErrProcessed / totalSyms) * 80))
+          void setSettings(`engine_progression:${this.connectionId}`, {
+            phase: "prehistoric_data",
+            progress: errPct,
+            detail: `Prehistoric calc filling sets — ${distinctErrProcessed}/${totalSyms} symbols processed (error: ${symbol})`,
+            sub_current: distinctErrProcessed,
+            sub_total: totalSyms,
+            sub_item: symbol,
+            connection_id: this.connectionId,
+            updated_at: new Date().toISOString(),
+          }).catch(() => { /* non-critical */ })
+        } catch { /* non-critical */ }
         await logProgressionEvent(this.connectionId, "config_set_symbol_error", "error", `Prehistoric processing failed for ${symbol}`, {
           symbol,
           error: error instanceof Error ? error.message : String(error),
@@ -550,49 +627,59 @@ export class ConfigSetProcessor {
       }
       await Promise.all(workers)
 
-      // Compute PF only when we actually saw closed positions on both
-      // sides, otherwise the value is meaningless and we leave the field
-      // alone (downstream realtime writers will populate it later).
+      // Always write the PF field so the dashboard's "Historic PF" tile
+      // renders immediately, even when no closed positions exist yet.
+      // If positions exist, compute; otherwise default to 0 so the UI
+      // shows a valid value instead of undefined/blank.
+      let pfStr = "0.0000"
+      let pfSource = "no_closed_positions"
       if (resultCount > 0 && (posSum > 0 || negAbsSum > 0)) {
         const rawPF = negAbsSum > 0 ? posSum / negAbsSum : 9.999 // all-wins ceiling
         const aggregatePF = Math.min(9.999, Math.max(0, rawPF))
-        const pfStr = aggregatePF.toFixed(4)
-        const stageWrites: Promise<any>[] = []
-        for (const stage of ["base", "main", "real"] as const) {
-          const stageKey = `strategy_detail:${this.connectionId}:${stage}`
-          stageWrites.push(
-            client.hset(stageKey, {
-              avg_profit_factor: pfStr,
-              // Mark provenance so anyone debugging the dashboard can tell
-              // this PF was synthesised from prehistoric positions and not
-              // from realtime strategy-coordinator. Cleared on the first
-              // realtime write because that flow doesn't set this field.
-              avg_profit_factor_source: "prehistoric_aggregate",
-              avg_profit_factor_count: String(resultCount),
-              avg_profit_factor_calc_at: new Date().toISOString(),
-            }),
-          )
-          stageWrites.push(client.expire(stageKey, 86400))
-          // Also mirror into the canonical progression hash so the
-          // legacy fallback chain in the /stats route can find it
-          // even if the per-stage detail hash is unreadable for any
-          // reason. Stage-specific keys avoid clobbering the
-          // realtime writer's own writes.
-          stageWrites.push(
-            client.hset(`progression:${this.connectionId}`, {
-              [`strategy_${stage}_avg_profit_factor`]: pfStr,
-            }),
-          )
-        }
-        // Single overall key for the dashboard's "Historic PF" surface.
+        pfStr = aggregatePF.toFixed(4)
+        pfSource = "prehistoric_aggregate"
+      }
+      
+      const stageWrites: Promise<any>[] = []
+      for (const stage of ["base", "main", "real"] as const) {
+        const stageKey = `strategy_detail:${this.connectionId}:${stage}`
         stageWrites.push(
-          client.hset(`prehistoric:${this.connectionId}`, {
-            historic_avg_profit_factor: pfStr,
-            historic_avg_profit_factor_count: String(resultCount),
-            historic_avg_profit_factor_at: new Date().toISOString(),
+          client.hset(stageKey, {
+            avg_profit_factor: pfStr,
+            // Mark provenance so anyone debugging the dashboard can tell
+            // this PF was synthesised from prehistoric positions and not
+            // from realtime strategy-coordinator. Cleared on the first
+            // realtime write because that flow doesn't set this field.
+            avg_profit_factor_source: pfSource,
+            avg_profit_factor_count: String(resultCount),
+            avg_profit_factor_calc_at: new Date().toISOString(),
           }),
         )
-        await Promise.all(stageWrites)
+        stageWrites.push(client.expire(stageKey, 86400))
+        // Also mirror into the canonical progression hash so the
+        // legacy fallback chain in the /stats route can find it
+        // even if the per-stage detail hash is unreadable for any
+        // reason. Stage-specific keys avoid clobbering the
+        // realtime writer's own writes.
+        stageWrites.push(
+          client.hset(`progression:${this.connectionId}`, {
+            [`strategy_${stage}_avg_profit_factor`]: pfStr,
+          }),
+        )
+      }
+      // Single overall key for the dashboard's "Historic PF" surface.
+      // Always written (even with 0.0000 if no closed positions) so the
+      // UI field is never undefined.
+      stageWrites.push(
+        client.hset(`prehistoric:${this.connectionId}`, {
+          historic_avg_profit_factor: pfStr,
+          historic_avg_profit_factor_count: String(resultCount),
+          historic_avg_profit_factor_at: new Date().toISOString(),
+        }),
+      )
+      await Promise.all(stageWrites)
+      
+      if (resultCount > 0) {
         console.log(
           `[v0] [ConfigSetProcessor] Historic PF aggregated: ${pfStr} ` +
           `(across ${resultCount} positions, +${posSum.toFixed(2)}% / ` +
@@ -600,8 +687,8 @@ export class ConfigSetProcessor {
         )
       } else {
         console.log(
-          `[v0] [ConfigSetProcessor] Historic PF skipped — no closed positions ` +
-          `(scan ${Date.now() - tStart}ms)`,
+          `[v0] [ConfigSetProcessor] Historic PF initialized: 0.0000 ` +
+          `(no closed positions yet, scan ${Date.now() - tStart}ms)`,
         )
       }
     } catch (err) {
@@ -618,7 +705,7 @@ export class ConfigSetProcessor {
     // calc is done" signal. Without this call the phase stayed `active`
     // forever even though processing had finished.
     try {
-      await ProgressionStateManager.completePrehistoricPhase(this.connectionId)
+      await ProgressionStateManager.completePrehistoricPhase(this.connectionId, symbols.length)
     } catch (err) {
       console.warn(
         `[v0] [ConfigSetProcessor] completePrehistoricPhase failed:`,

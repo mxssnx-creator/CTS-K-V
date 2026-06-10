@@ -17,6 +17,7 @@ interface ComponentStatus {
   connectionName: string
   exchange: string
   engineRunning: boolean
+  isActive?: boolean
   isTestnet: boolean
   phases: {
     prehistoric: {
@@ -94,7 +95,9 @@ export function SystemVerificationPanel() {
   if (loading) return <div className="p-4 text-center">Loading verification...</div>
   if (error) return <div className="p-4 text-red-600">Error: {error}</div>
 
-  const comp = status?.components?.[0] as ComponentStatus | undefined
+  // Prefer the active connection; fall back to the first enabled connection
+  const allComps = (status?.components ?? []) as ComponentStatus[]
+  const comp = (allComps.find((c) => c.isActive) ?? allComps[0]) as ComponentStatus | undefined
 
   if (!comp) {
     return (
@@ -148,21 +151,33 @@ export function SystemVerificationPanel() {
   ]
 
   const allCriticalComplete =
+    comp.engineRunning &&
     comp.phases.prehistoric.completed &&
     comp.phases.indications.cycleCount > 0 &&
     comp.phases.strategies.cycleCount > 0 &&
     comp.phases.liveTrading.active
 
+  // Use yellow only when the engine should be running but isn't (active connection, engine stopped).
+  // Inactive connections that are stopped show a neutral muted card — that is expected behavior.
+  const engineStopped = !comp.engineRunning
+  const cardClass = allCriticalComplete
+    ? "border-green-200 bg-green-50"
+    : engineStopped
+      ? "border-border bg-muted/30"
+      : "border-yellow-200 bg-yellow-50"
+  const titleClass = allCriticalComplete ? "text-green-900" : engineStopped ? "text-foreground" : "text-yellow-900"
+  const descClass = allCriticalComplete ? "text-green-800" : engineStopped ? "text-muted-foreground" : "text-yellow-800"
+
   return (
     <div className="space-y-4">
-      <Card className={allCriticalComplete ? "border-green-200 bg-green-50" : "border-yellow-200 bg-yellow-50"}>
+      <Card className={cardClass}>
         <CardHeader>
           <div className="flex items-center justify-between">
             <div>
-              <CardTitle className={allCriticalComplete ? "text-green-900" : "text-yellow-900"}>
+              <CardTitle className={titleClass}>
                 {comp.connectionName} ({comp.exchange.toUpperCase()})
               </CardTitle>
-              <CardDescription className={allCriticalComplete ? "text-green-800" : "text-yellow-800"}>
+              <CardDescription className={descClass}>
                 Engine {comp.engineRunning ? "Running" : "Stopped"} • {comp.isTestnet ? "Testnet" : "Mainnet"}
               </CardDescription>
             </div>
@@ -170,7 +185,7 @@ export function SystemVerificationPanel() {
               {comp.engineRunning ? (
                 <Badge className="bg-green-600">Engine Running</Badge>
               ) : (
-                <Badge className="bg-gray-400">Engine Stopped</Badge>
+                <Badge variant="secondary">Engine Stopped</Badge>
               )}
             </div>
           </div>

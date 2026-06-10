@@ -99,6 +99,9 @@ interface OverviewSettings {
   volumeFactorPreset: number
   marginMode:  "cross" | "isolated"
   volumeType:  "usdt" | "contract" | "spot"
+  positionMode: "one_way" | "hedge"
+  leveragePercentage: number
+  useMaximalLeverage: boolean
   /**
    * When true: do NOT place exchange-side reduce-only SL/TP control
    * orders for live positions on this connection. The engine instead
@@ -124,9 +127,9 @@ const DEFAULT_INDICATION_PROFILE: ChannelProfile = {
   auto:      { enabled: false, range: 25, timeout: 90, interval: 15 },
 }
 const DEFAULT_STRATEGY_PROFILE: StrategyChannel = {
-  base: { enabled: true, min_profit_factor: 1.10, max_drawdown_time: 180, max_positions: 250 },
-  main: { enabled: true, min_profit_factor: 1.15, max_drawdown_time: 180, max_positions: 250 },
-  real: { enabled: true, min_profit_factor: 1.20, max_drawdown_time: 180, max_positions: 100 },
+  base: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 250 },
+  main: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 250 },
+  real: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 100 },
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -141,6 +144,10 @@ export function ConnectionSettingsDialog({
   exchange = "bingx",
 }: ConnectionSettingsDialogProps) {
   const [tab, setTab] = useState<"overview" | "symbols" | "indications" | "strategies">("overview")
+
+  // Reset tab to Overview every time the dialog opens so state from a
+  // previous session does not persist between open/close cycles.
+  useEffect(() => { if (open) setTab("overview") }, [open])
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [exchangeKey, setExchangeKey] = useState<string>(exchange)
@@ -152,6 +159,9 @@ export function ConnectionSettingsDialog({
     volumeFactorPreset: 1.0,
     marginMode: "cross",
     volumeType: "usdt",
+    positionMode: "one_way",
+    leveragePercentage: 100,
+    useMaximalLeverage: true,
     useSystemCloseOnly: false,
   })
 
@@ -164,6 +174,10 @@ export function ConnectionSettingsDialog({
   const [symbolInput, setSymbolInput] = useState("")
   const [exchangeSymbols, setExchangeSymbols] = useState<string[]>([])
   const [loadingSymbols, setLoadingSymbols] = useState(false)
+  // The symbols the engine is currently running with (from active_symbols).
+  // Shown as a read-only preview so the operator knows what takes effect
+  // before and after saving.
+  const [activeSymbols, setActiveSymbols] = useState<string[]>([])
 
   // ── Indications & Strategies state (per channel) ────────────────
   const [indMain,   setIndMain]   = useState<ChannelProfile>(DEFAULT_INDICATION_PROFILE)
@@ -172,9 +186,9 @@ export function ConnectionSettingsDialog({
   const [stratPreset, setStratPreset] = useState<StrategyChannel>(DEFAULT_STRATEGY_PROFILE)
   const [coordination, setCoordination] = useState<CoordinationSettings>(DEFAULT_COORDINATION_SETTINGS)
 
-  // ─────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────���───────────────────
   // LOAD
-  // ──────────────────────────────────────���──────────────────────────
+  // ──────────────────────────────────────�����──────────────────────────
 
   const loadAll = useCallback(async () => {
     setLoading(true)
@@ -193,11 +207,19 @@ export function ConnectionSettingsDialog({
         const conn     = data.connection || {}
         setExchangeKey(String(conn.exchange || exchange).toLowerCase())
         setOverview({
-          volumeFactorBase:   Number(settings.volume_factor)        ?? Number(conn.volume_factor) ?? 1.0,
+          // Use `||` not `??` — Number(null/undefined) is 0 (falsy), not NaN,
+          // so `?? 1.0` would never fire on a missing field.
+          volumeFactorBase:   Number(settings.volume_factor)        || Number(conn.volume_factor) || 1.0,
           volumeFactorLive:   Number(settings.volume_factor_live)   || 1.0,
           volumeFactorPreset: Number(settings.volume_factor_preset) || 1.0,
           marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
           volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
+          positionMode: (settings.position_mode || conn.position_mode || "one_way") as "one_way" | "hedge",
+          leveragePercentage: Number(settings.leveragePercentage) || 100,
+          // Default to true when not set — the engine uses maximal leverage by
+          // default. The `=== false` path only fires when the operator
+          // explicitly disabled it in a prior save.
+          useMaximalLeverage: settings.useMaximalLeverage !== false && settings.useMaximalLeverage !== "false",
           useSystemCloseOnly: settings.use_system_close_only === true || settings.useSystemCloseOnly === true,
         })
         setSymbolsCfg(prev => ({
@@ -206,8 +228,50 @@ export function ConnectionSettingsDialog({
           symbolOrder: (settings.symbol_order as SymbolOrder) || prev.symbolOrder,
           symbolCount: Number(settings.symbol_count) || prev.symbolCount,
         }))
-        if (settings.strategies?.main)   setStratMain(settings.strategies.main)
-        if (settings.strategies?.preset) setStratPreset(settings.strategies.preset)
+        // Capture the engine's currently-active symbols for display in the
+        // Symbols tab so the operator sees what the engine is running before
+        // they change anything.
+        const rawActive = conn.active_symbols || settings.active_symbols
+        const parsedActive: string[] = (() => {
+          if (Array.isArray(rawActive)) return rawActive.filter(Boolean)
+          if (typeof rawActive === "string" && rawActive.startsWith("[")) {
+            try { return JSON.parse(rawActive).filter(Boolean) } catch { /* fall through */ }
+          }
+          if (typeof rawActive === "string" && rawActive.length > 0) return [rawActive]
+          return []
+        })()
+        setActiveSymbols(parsedActive)
+        // Merge saved strategy channels with per-field defaults so older
+        // saves (pre-slider, with missing or out-of-range fields) never feed
+        // undefined into .toFixed() or NaN into Slider's value prop.
+        const mergeStratChannel = (
+          saved: unknown,
+          defaults: StrategyChannel,
+        ): StrategyChannel => {
+          if (!saved || typeof saved !== "object") return defaults
+          const s = saved as Record<string, unknown>
+          const mergeStage = (stage: StrategyType): StrategyParams => {
+            const rawVal = s[stage]
+            const raw = (rawVal && typeof rawVal === "object" ? rawVal : {}) as Record<string, unknown>
+            const def = defaults[stage]
+            return {
+              enabled:           typeof raw.enabled === "boolean" ? raw.enabled : def.enabled,
+              min_profit_factor: Number.isFinite(Number(raw.min_profit_factor)) && Number(raw.min_profit_factor) >= 0.1
+                ? Number(raw.min_profit_factor) : def.min_profit_factor,
+              max_drawdown_time: Number.isFinite(Number(raw.max_drawdown_time)) && Number(raw.max_drawdown_time) >= 20
+                ? Number(raw.max_drawdown_time) : def.max_drawdown_time,
+              max_positions:     Number.isFinite(Number(raw.max_positions)) && Number(raw.max_positions) >= 1
+                ? Number(raw.max_positions) : def.max_positions,
+            }
+          }
+          return {
+            base: mergeStage("base"),
+            main: mergeStage("main"),
+            real: mergeStage("real"),
+          }
+        }
+        if (settings.strategies?.main)   setStratMain(mergeStratChannel(settings.strategies.main, DEFAULT_STRATEGY_PROFILE))
+        if (settings.strategies?.preset) setStratPreset(mergeStratChannel(settings.strategies.preset, DEFAULT_STRATEGY_PROFILE))
         // Merge saved coord into defaults so older saves (without the
         // Block ratio / max-stack fields, or without some variants) load
         // cleanly and the new sliders aren't fed undefined.
@@ -272,7 +336,7 @@ export function ConnectionSettingsDialog({
               if (Number.isFinite(nested) && nested >= 1) return snap(nested)
               return DEFAULT_COORDINATION_SETTINGS.realEvalPosCount
             })(),
-            // ── PF rolling-window hydrate (5-200 step 5) ────────────
+            // ── PF rolling-window hydrate (5-200 step 5) ����───────────
             // Same dual-path (flat top-level preferred for engine reads,
             // nested fallback). Snap to the 5-step grid the slider uses.
             prevPosWindow: (() => {
@@ -283,6 +347,14 @@ export function ConnectionSettingsDialog({
               const nested = Number((coord as Record<string, unknown>).prevPosWindow)
               if (Number.isFinite(nested) && nested >= 1) return snap(nested)
               return DEFAULT_COORDINATION_SETTINGS.prevPosWindow
+            })(),
+            // ── Minimal Step hydrate (3-30 step 1) ───────────────────
+            minStep: (() => {
+              const flat = Number((settings as Record<string, unknown>).minStep)
+              if (Number.isFinite(flat) && flat >= 3) return Math.min(30, Math.floor(flat))
+              const nested = Number((coord as Record<string, unknown>).minStep)
+              if (Number.isFinite(nested) && nested >= 3) return Math.min(30, Math.floor(nested))
+              return DEFAULT_COORDINATION_SETTINGS.minStep
             })(),
           })
         }
@@ -310,9 +382,18 @@ export function ConnectionSettingsDialog({
 
   useEffect(() => { if (open) loadAll() }, [open, loadAll])
 
+  // Auto-populate exchange symbol suggestions whenever the dialog opens or
+  // the symbol order changes. This ensures the "Suggested" panel is always
+  // pre-populated without requiring the operator to click "Refresh listings".
+  useEffect(() => {
+    if (!open) return
+    refreshExchangeSymbols()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, exchangeKey, symbolsCfg.symbolOrder])
+
   // ─────────────────────���───────────────────────────────────────────
   // EXCHANGE SYMBOLS REFRESH
-  // ─────────────────────────────────────────────────────────────────
+  // ────────────────────────────────────────────���────────────────────
 
   const refreshExchangeSymbols = useCallback(async () => {
     setLoadingSymbols(true)
@@ -357,6 +438,9 @@ export function ConnectionSettingsDialog({
         volume_factor_preset: overview.volumeFactorPreset,
         margin_mode: overview.marginMode,
         volume_type: overview.volumeType,
+        position_mode: overview.positionMode,
+        leveragePercentage: overview.leveragePercentage,
+        useMaximalLeverage: overview.useMaximalLeverage,
         use_system_close_only: overview.useSystemCloseOnly,
         useSystemCloseOnly:    overview.useSystemCloseOnly, // backwards-compat alias
         // Symbols
@@ -368,23 +452,21 @@ export function ConnectionSettingsDialog({
           main:   stratMain,
           preset: stratPreset,
         },
-        // Strategy coordination (axes + variants toggles)
-          coordination_settings: coordination,
-          coordinationSettings:  coordination, // legacy alias
-          // Flat top-level mirror so the engine + `getStrategyTracking`
-          // can read it as a plain `connection_settings` HASH field
-          // without parsing the nested coordination JSON every cycle.
-          prevPosMinCount: coordination.prevPosMinCount,
-          // Flat top-level mirror for the new stage-validation knobs so
-          // the engine picks them up via `connection_settings:{conn}`
-          // without parsing the nested coordination JSON every cycle.
-          mainEvalPosCount: coordination.mainEvalPosCount,
-          realEvalPosCount: coordination.realEvalPosCount,
-          // Flat mirror for the windowed-eval knob: prevPosWindow is the
-          // single cumulative last-N window feeding BOTH the windowed PF and
-          // the windowed DDT. The coordinator reads it straight off the
-          // `connection_settings:{conn}` hash each refresh window.
-          prevPosWindow:    coordination.prevPosWindow,
+        // Strategy coordination (axes + variants toggles).
+        // These MUST be top-level keys in the payload — NOT nested inside
+        // `strategies`. Previously they were mis-indented one level too deep,
+        // which caused them to be persisted as `strategies.coordination_settings`
+        // and never reached the engine's connection_settings hash reader.
+        coordination_settings: coordination,
+        coordinationSettings:  coordination, // legacy alias
+        // Flat top-level mirrors so the engine + `getStrategyTracking`
+        // can read them as plain `connection_settings` HASH fields
+        // without parsing the nested coordination JSON every cycle.
+        prevPosMinCount:  coordination.prevPosMinCount,
+        mainEvalPosCount: coordination.mainEvalPosCount,
+        realEvalPosCount: coordination.realEvalPosCount,
+        prevPosWindow:    coordination.prevPosWindow,
+        minStep:          coordination.minStep ?? 5,
       }
 
       const [settingsRes, indRes] = await Promise.all([
@@ -403,7 +485,27 @@ export function ConnectionSettingsDialog({
       if (!settingsRes.ok) throw new Error("Settings save failed")
       if (!indRes.ok)      throw new Error("Indications save failed")
 
-      toast.success("Settings saved", { description: `Updated ${connectionName}` })
+      // Re-read active_symbols from the updated settings response so the
+      // toast can show what the engine will actually run next cycle.
+      let resolvedDesc = `Updated ${connectionName}`
+      try {
+        const saved = await settingsRes.clone().json().catch(() => ({})) as Record<string, unknown>
+        const settingsData = (saved.settings || {}) as Record<string, unknown>
+        const rawResolved = settingsData.active_symbols || settingsData.symbols
+        const resolvedList: string[] = (() => {
+          if (Array.isArray(rawResolved)) return (rawResolved as string[]).filter(Boolean)
+          if (typeof rawResolved === "string" && rawResolved.startsWith("[")) {
+            try { return (JSON.parse(rawResolved) as string[]).filter(Boolean) } catch { /* fall through */ }
+          }
+          return []
+        })()
+        if (resolvedList.length > 0) {
+          resolvedDesc = `Symbols: ${resolvedList.join(", ")}`
+          setActiveSymbols(resolvedList)
+        }
+      } catch { /* non-fatal — description falls back to connection name */ }
+
+      toast.success("Settings saved", { description: resolvedDesc })
       window.dispatchEvent(new CustomEvent("connection-settings-updated", { detail: { connectionId } }))
       onOpenChange(false)
     } catch (err) {
@@ -552,6 +654,49 @@ export function ConnectionSettingsDialog({
                         </SelectContent>
                       </Select>
                     </div>
+
+                    <div className="space-y-1.5">
+                      <Label className="text-xs">Position Mode</Label>
+                      <Select
+                        value={overview.positionMode}
+                        onValueChange={(v) => setOverview(p => ({ ...p, positionMode: v as "one_way" | "hedge" }))}
+                      >
+                        <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="one_way">One-Way</SelectItem>
+                          <SelectItem value="hedge">Hedge</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div className={`space-y-1.5 ${overview.useMaximalLeverage ? "opacity-50 pointer-events-none" : ""}`}>
+                      <Label className="text-xs">Leverage %</Label>
+                      <NumberField
+                        label=""
+                        suffix="%"
+                        min={1}
+                        max={100}
+                        step={1}
+                        value={overview.leveragePercentage}
+                        onChange={(v) => setOverview(p => ({ ...p, leveragePercentage: v }))}
+                        disabled={overview.useMaximalLeverage}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between rounded-md border border-border p-3 mt-3">
+                    <div className="space-y-0.5">
+                      <Label className="text-xs font-medium">Use Maximal Leverage</Label>
+                      <p className="text-[11px] text-muted-foreground">
+                        {overview.useMaximalLeverage
+                          ? "On — engine uses the exchange's maximum supported leverage."
+                          : "Off — engine uses Leverage % of exchange max."}
+                      </p>
+                    </div>
+                    <Switch
+                      checked={overview.useMaximalLeverage}
+                      onCheckedChange={(v) => setOverview(p => ({ ...p, useMaximalLeverage: v }))}
+                    />
                   </div>
 
                   <Separator className="my-4" />
@@ -587,6 +732,22 @@ export function ConnectionSettingsDialog({
                 <TabsContent value="symbols" className="mt-0 space-y-5">
                   <SectionHeading icon={Database} title="Symbol Selection" subtitle="Choose how the engine ranks and picks symbols from the exchange." />
 
+                  {/* Currently-active symbols — read-only status banner */}
+                  {activeSymbols.length > 0 && (
+                    <div className="rounded-md border border-border bg-muted/40 px-3 py-2 space-y-1">
+                      <div className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium">
+                        Currently active on engine
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {activeSymbols.map((s) => (
+                          <Badge key={s} variant="outline" className="text-[10px] font-mono">
+                            {s}
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="grid grid-cols-2 gap-3">
                     <div className="space-y-1.5">
                       <Label className="text-xs">Order from Exchange</Label>
@@ -620,12 +781,29 @@ export function ConnectionSettingsDialog({
                     </div>
                   </div>
 
+                  {/* Auto-resolve notice when not in manual mode */}
+                  {symbolsCfg.symbolOrder !== "manual" && (
+                    <div className="rounded-md border border-primary/20 bg-primary/5 px-3 py-2 text-[11px] text-muted-foreground">
+                      <span className="font-medium text-foreground">Auto-assign:</span>{" "}
+                      On save, the engine will fetch the top <span className="font-mono font-medium">{symbolsCfg.symbolCount}</span> symbols
+                      by <span className="font-medium">{orderLabel[symbolsCfg.symbolOrder]}</span> from the exchange and apply them.
+                      {availableSymbols.length > 0 && (
+                        <span className="ml-1">
+                          Likely: <span className="font-mono">{availableSymbols.slice(0, symbolsCfg.symbolCount).join(", ")}</span>
+                        </span>
+                      )}
+                    </div>
+                  )}
+
                   <Separator />
 
-                  {/* Symbol chips */}
+                  {/* Symbol chips — manual override list */}
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
-                      <Label className="text-xs">Selected Symbols ({symbolsCfg.symbols.length})</Label>
+                      <Label className="text-xs">
+                        {symbolsCfg.symbolOrder === "manual" ? "Symbols" : "Manual Override"}{" "}
+                        ({symbolsCfg.symbols.length})
+                      </Label>
                       <Button
                         type="button"
                         size="sm" variant="outline"
@@ -641,7 +819,9 @@ export function ConnectionSettingsDialog({
                     <div className="flex flex-wrap gap-1.5 min-h-[2.5rem] rounded-md border border-dashed p-2">
                       {symbolsCfg.symbols.length === 0 && (
                         <span className="text-[11px] text-muted-foreground italic">
-                          No symbols selected — engine will use top-{symbolsCfg.symbolCount} from exchange ordering.
+                          {symbolsCfg.symbolOrder === "manual"
+                            ? "No symbols — add at least one below or switch to auto-assign."
+                            : `No manual override — engine will auto-assign top-${symbolsCfg.symbolCount} on save.`}
                         </span>
                       )}
                       {symbolsCfg.symbols.map((s) => (
@@ -723,11 +903,19 @@ export function ConnectionSettingsDialog({
                       <TabsTrigger value="preset" className="text-xs px-4">Preset</TabsTrigger>
                       <TabsTrigger value="coordination" className="text-xs px-4">Coordination</TabsTrigger>
                     </TabsList>
-                    <TabsContent value="main">
+                    <TabsContent value="main" className="space-y-4">
                       <StrategyProfileEditor profile={stratMain} onChange={setStratMain} />
+                      <StrategyOptionsPanel
+                        variants={coordination.variants}
+                        onChange={(v) => setCoordination((p) => ({ ...p, variants: { ...p.variants, ...v } }))}
+                      />
                     </TabsContent>
-                    <TabsContent value="preset">
+                    <TabsContent value="preset" className="space-y-4">
                       <StrategyProfileEditor profile={stratPreset} onChange={setStratPreset} />
+                      <StrategyOptionsPanel
+                        variants={coordination.variants}
+                        onChange={(v) => setCoordination((p) => ({ ...p, variants: { ...p.variants, ...v } }))}
+                      />
                     </TabsContent>
                     <TabsContent value="coordination">
                       <StrategyCoordinationSection value={coordination} onChange={setCoordination} />
@@ -846,6 +1034,28 @@ function IndicationProfileEditor({
   )
 }
 
+// ── Stage accent colours ─���─────────────────────���─────────────────────
+const STAGE_ACCENT: Record<StrategyType, { border: string; bg: string; dot: string; label: string }> = {
+  base: {
+    border: "border-orange-300/40",
+    bg:     "bg-orange-50/30 dark:bg-orange-950/10",
+    dot:    "bg-orange-400",
+    label:  "Base",
+  },
+  main: {
+    border: "border-yellow-300/40",
+    bg:     "bg-yellow-50/30 dark:bg-yellow-950/10",
+    dot:    "bg-yellow-400",
+    label:  "Main",
+  },
+  real: {
+    border: "border-emerald-300/40",
+    bg:     "bg-emerald-50/30 dark:bg-emerald-950/10",
+    dot:    "bg-emerald-400",
+    label:  "Real",
+  },
+}
+
 function StrategyProfileEditor({
   profile, onChange,
 }: { profile: StrategyChannel; onChange: (p: StrategyChannel) => void }) {
@@ -853,45 +1063,181 @@ function StrategyProfileEditor({
     onChange({ ...profile, [type]: { ...profile[type], ...patch } })
   }
   return (
-    <div className="space-y-3">
+    <div className="space-y-2.5">
       {STRATEGY_TYPES.map((type) => {
         const p = profile[type]
-        const accent =
-          type === "base" ? "border-orange-300/50 bg-orange-50/30 dark:bg-orange-950/10" :
-          type === "main" ? "border-yellow-300/50 bg-yellow-50/30 dark:bg-yellow-950/10" :
-          "border-green-300/50 bg-green-50/30 dark:bg-green-950/10"
+        const ac = STAGE_ACCENT[type]
         return (
-          <div key={type} className={`rounded-md border p-3 transition-opacity ${accent} ${p.enabled ? "" : "opacity-60"}`}>
-            <div className="flex items-center justify-between mb-3">
+          <div
+            key={type}
+            className={`rounded-lg border ${ac.border} ${ac.bg} p-3.5 transition-opacity ${p.enabled ? "" : "opacity-50"}`}
+          >
+            {/* Header row */}
+            <div className="flex items-center justify-between mb-3.5">
+              <div className="flex items-center gap-2.5">
+                <span className={`h-2 w-2 rounded-full ${ac.dot} shrink-0`} />
+                <span className="text-sm font-semibold tracking-tight">{ac.label} Stage</span>
+              </div>
               <div className="flex items-center gap-2">
+                <span className={`text-[10px] font-medium ${p.enabled ? "text-foreground" : "text-muted-foreground"}`}>
+                  {p.enabled ? "Active" : "Disabled"}
+                </span>
                 <Switch
                   checked={p.enabled}
                   onCheckedChange={(v) => update(type, { enabled: v })}
                 />
-                <Label className="text-sm font-medium capitalize">{type} Strategy</Label>
               </div>
-              <Badge variant={p.enabled ? "default" : "outline"} className="text-[9px]">
-                {p.enabled ? "Enabled" : "Disabled"}
-              </Badge>
             </div>
 
-            <div className="grid grid-cols-3 gap-3">
-              <NumberField
-                label="Min PF" suffix="×" min={1} max={3} step={0.05}
-                value={p.min_profit_factor} onChange={(v) => update(type, { min_profit_factor: v })} disabled={!p.enabled}
+            {/* Min PF slider */}
+            <div className="space-y-2 mb-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <Label className="text-xs font-medium">Min Profit Factor</Label>
+                  <div className="text-[10px] text-muted-foreground">Minimum PF required to pass this stage</div>
+                </div>
+                <span className="font-mono text-sm tabular-nums font-semibold min-w-[3rem] text-right">
+                  {p.min_profit_factor.toFixed(1)}
+                </span>
+              </div>
+              <Slider
+                min={0.1} max={3} step={0.1}
+                value={[p.min_profit_factor]}
+                onValueChange={([v]) => update(type, { min_profit_factor: Number(v.toFixed(1)) })}
+                disabled={!p.enabled}
+                className="py-1"
               />
-              <NumberField
-                label="Max DDT" suffix="m" min={1} max={1440} step={1}
-                value={p.max_drawdown_time} onChange={(v) => update(type, { max_drawdown_time: v })} disabled={!p.enabled}
+              <div className="flex justify-between text-[10px] text-muted-foreground">
+                <span>0.1</span>
+                <span className="text-muted-foreground/60">default 0.9</span>
+                <span>3.0</span>
+              </div>
+            </div>
+
+            {/* Max DDT slider */}
+            <div className="space-y-2 mb-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <Label className="text-xs font-medium">Max Drawdown Time</Label>
+                  <div className="text-[10px] text-muted-foreground">Maximum allowed drawdown duration</div>
+                </div>
+                <span className="font-mono text-sm tabular-nums font-semibold min-w-[4rem] text-right">
+                  {p.max_drawdown_time} min
+                </span>
+              </div>
+              <Slider
+                min={20} max={800} step={2}
+                value={[p.max_drawdown_time]}
+                onValueChange={([v]) => update(type, { max_drawdown_time: v })}
+                disabled={!p.enabled}
+                className="py-1"
               />
+              <div className="flex justify-between text-[10px] text-muted-foreground">
+                <span>20 min</span>
+                <span className="text-muted-foreground/60">default 160</span>
+                <span>800 min</span>
+              </div>
+            </div>
+
+            {/* Max Positions — keep as compact number field */}
+            <div className="pt-1 border-t border-border/40">
               <NumberField
-                label="Max Pos" suffix="" min={1} max={1000} step={1}
-                value={p.max_positions} onChange={(v) => update(type, { max_positions: v })} disabled={!p.enabled}
+                label="Max Positions"
+                suffix=""
+                min={1} max={1000} step={1}
+                value={p.max_positions}
+                onChange={(v) => update(type, { max_positions: v })}
+                disabled={!p.enabled}
               />
             </div>
           </div>
         )
       })}
+    </div>
+  )
+}
+
+// ── Strategy Options Panel ────────────────────────────────────────────
+// Surfaces the Trailing / Block / DCA variant toggles directly in the
+// Strategies tab so operators can enable / disable them without opening
+// the deeper Coordination sub-tab.
+const VARIANT_META: {
+  key:   keyof CoordinationSettings["variants"]
+  label: string
+  desc:  string
+  defaultOn: boolean
+}[] = [
+  {
+    key: "trailing",
+    label: "Trailing",
+    desc:  "Fires when last-N results show consecutive wins. Aggressively follows momentum.",
+    defaultOn: true,
+  },
+  {
+    key: "block",
+    label: "Block",
+    desc:  "Add-on entries when continuousCount is in the 1–2 range. Independent of axes.",
+    defaultOn: true,
+  },
+  {
+    key: "dca",
+    label: "DCA",
+    desc:  "Dollar-cost averaging on prior losses. Gate: prevLosses ≥ 1. Off by default.",
+    defaultOn: false,
+  },
+]
+
+function StrategyOptionsPanel({
+  variants,
+  onChange,
+}: {
+  variants: CoordinationSettings["variants"]
+  onChange: (patch: Partial<CoordinationSettings["variants"]>) => void
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-card/60 p-3.5 space-y-3">
+      <div className="flex items-center gap-2">
+        <div className="flex h-5 w-5 items-center justify-center rounded bg-primary/10">
+          <Zap className="h-3 w-3 text-primary" />
+        </div>
+        <span className="text-sm font-semibold">Strategy Options</span>
+        <span className="text-[10px] text-muted-foreground ml-1">Categorical variants applied on top of axis sets</span>
+      </div>
+
+      <div className="grid gap-2">
+        {VARIANT_META.map(({ key, label, desc, defaultOn }) => {
+          // `variants[key]` may be undefined if loaded from older persisted data
+          // that predates the field — fall back to the spec default.
+          const enabled = typeof variants[key] === "boolean" ? variants[key] : defaultOn
+          return (
+            <div
+              key={key}
+              className={`flex items-start justify-between gap-3 rounded-md border px-3 py-2.5 transition-colors ${
+                enabled
+                  ? "border-primary/30 bg-primary/5"
+                  : "border-border bg-muted/20"
+              }`}
+            >
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-medium">{label}</span>
+                  {!defaultOn && (
+                    <span className="text-[9px] uppercase tracking-wide rounded-sm px-1 py-0.5 bg-muted text-muted-foreground font-medium">
+                      off by default
+                    </span>
+                  )}
+                </div>
+                <div className="text-[10px] text-muted-foreground leading-relaxed mt-0.5">{desc}</div>
+              </div>
+              <Switch
+                checked={enabled}
+                onCheckedChange={(v) => onChange({ [key]: v })}
+                className="mt-0.5 shrink-0"
+              />
+            </div>
+          )
+        })}
+      </div>
     </div>
   )
 }

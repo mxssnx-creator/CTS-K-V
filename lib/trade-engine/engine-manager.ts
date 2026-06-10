@@ -1419,6 +1419,15 @@ export class TradeEngineManager {
 
       // Store canonical range metadata so dashboard can display timeframe details
       const redisClient = getRedisClient()
+      // SINGLE-WRITER RESET (fixes "0/N" stall): the run-start is the ONLY
+      // place that resets the prehistoric progress counters. Clear the stale
+      // dedup SET (it has an 86400 TTL so a prior partial run could otherwise
+      // leak survivors into this run's scard-derived count) and the legacy
+      // flat counter, then seed symbols_processed=0 + symbols_total here.
+      // From this point ConfigSetProcessor is the SOLE incremental writer of
+      // symbols_processed (always derived from scard of the SET it owns), so
+      // the displayed count can never disagree with symbols_total.
+      await redisClient.del(`prehistoric:${this.connectionId}:symbols`).catch(() => {})
       await redisClient.hset(`prehistoric:${this.connectionId}`, {
         range_start: prehistoricStart.toISOString(),
         range_end: prehistoricEnd.toISOString(),
@@ -1426,6 +1435,9 @@ export class TradeEngineManager {
         range_days: String(storedRangeDays),
         timeframe_seconds: String(storedTimeframeSec),
         is_complete: "0",
+        symbols_processed: "0",
+        symbols_total: String(symbols.length),
+        prehistoric_symbols_processed_count: "0",
         started_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
@@ -3387,7 +3399,14 @@ export class TradeEngineManager {
         ])
 
         if (connState && typeof connState === "object") {
-          const connSymbols = (connState as any).symbols || (connState as any).active_symbols
+          let connSymbols = (connState as any).symbols || (connState as any).active_symbols
+          // The settings PATCH route and updateEngineState write this field as a
+          // JSON.stringify'd array (the emulator stores hash values as strings).
+          // Parse it so this primary branch isn't silently skipped — otherwise we
+          // fall through to the connection-object fallback for no reason.
+          if (typeof connSymbols === "string") {
+            try { connSymbols = JSON.parse(connSymbols) } catch { /* ignore */ }
+          }
           if (Array.isArray(connSymbols) && connSymbols.length > 0) return connSymbols
         }
 

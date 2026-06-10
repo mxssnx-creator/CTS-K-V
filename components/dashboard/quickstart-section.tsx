@@ -240,9 +240,18 @@ interface LiveStats {
   // windows
   indLast5m: number
   indLast60m: number
+  // ── Real-stage rolling averages (5-min ring buffer) ──────────────────
+  // Mirrors the values shown in the active-connection-card Historical box.
+  realAverages: { activeSets: number; posPerSet: number; posOpen: number; samples: number } | null
+  // ── Stage cascade eval percentages ───────────────────────────────────
+  // base = mainInput/baseOutput, main = mainOutput/mainInput, real = realOutput/realInput
+  stageEvalPercent: { base: number; main: number; real: number } | null
   // phase
   phase: string
   engineRunning: boolean
+  // Timestamp (epoch-ms) written by the sessionStorage persistence layer
+  // so the restore path can skip excessively stale snapshots on reload.
+  updatedAt?: number
 }
 
 // One row of the Active Progressing breakdown — sets/trackings/positions.
@@ -299,6 +308,8 @@ const EMPTY_STATS: LiveStats = {
   apIndications: {},
   apStrategies:  {},
   indLast5m: 0, indLast60m: 0, phase: "—", engineRunning: false,
+  realAverages: null,
+  stageEvalPercent: null,
 }
 
 function fmt(n: number): string {
@@ -577,7 +588,22 @@ export function QuickstartSection() {
         indLast60m:            s.windows?.indications?.last60m    || 0,
         phase:                 s.metadata?.phase || (indCycles > 0 ? "realtime" : "—"),
         engineRunning:         s.metadata?.engineRunning || indCycles > 0,
+        // Real-stage rolling averages and stage cascade eval percentages.
+        // Both arrive from the /stats endpoint already computed.
+        realAverages:     s.realAverages     ?? null,
+        stageEvalPercent: s.stageEvalPercent ?? null,
       })
+      // Persist stats to sessionStorage so a page reload can restore the last
+      // known values instantly (before the first polling fetch returns).
+      // Key is per-connection so switching connections doesn't show stale data.
+      try {
+        if (connectionId) {
+          sessionStorage.setItem(
+            `qs:stats:${connectionId}`,
+            JSON.stringify({ ...stats, updatedAt: Date.now() })
+          )
+        }
+      } catch { /* sessionStorage unavailable */ }
       // NOTE: do NOT auto-set isRunning here — isRunning tracks user-initiated sessions only.
       // engineRunning in stats reflects the server state independently.
     } catch { /* non-critical */ }
@@ -615,7 +641,7 @@ export function QuickstartSection() {
       }
 
       const ex = (conn.exchange || "bingx").toLowerCase()
-      const symRes = await fetch(`/api/exchange/${ex}/top-symbols?t=` + Date.now(), { cache: "no-store" })
+      const symRes = await fetch(`/api/exchange/${ex}/top-symbols?sort=volatility&t=` + Date.now(), { cache: "no-store" })
       if (!symRes.ok) throw new Error("no symbols")
       const sym = await symRes.json()
       setVolatileSymbol({ symbol: sym.symbol || "BTCUSDT", exchange: ex, pct: sym.priceChangePercent ?? null, loading: false })
@@ -632,7 +658,7 @@ export function QuickstartSection() {
     return () => clearInterval(symbolInterval)
   }, [loadSymbol])
 
-  // ── auto-scroll logs ───────────────────────────────────────────────────────
+  // ── auto-scroll logs ────────────────────────────────��──���────��──────────────
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [logs])
@@ -714,13 +740,17 @@ export function QuickstartSection() {
       const clampedCount = Math.max(1, Math.min(10, symbolCount))
       addLog(
         clampedCount === 1
-          ? "Fetching most volatile symbol (1h)..."
-          : `Fetching top ${clampedCount} volatile symbols (1h)...`,
+          ? "Fetching most volatile symbol (24h)..."
+          : `Fetching top ${clampedCount} volatile symbols (24h)...`,
         "info",
       )
       const ex = (conn.exchange || "bingx").toLowerCase()
+      // sort=volatility is required — without it the API defaults to volume
+      // sort and the engine would start on large-cap low-movers (ETHUSDT,
+      // SOLUSDT) instead of the highest-momentum symbols the QuickStart is
+      // designed to target.
       const symRes = await fetch(
-        `/api/exchange/${ex}/top-symbols?limit=${clampedCount}&t=${Date.now()}`,
+        `/api/exchange/${ex}/top-symbols?sort=volatility&limit=${clampedCount}&t=${Date.now()}`,
         { cache: "no-store" },
       )
       let chosen: string[] = ["BTCUSDT"]
@@ -735,7 +765,7 @@ export function QuickstartSection() {
               : (sym.symbol ? [sym.symbol] : [])
         if (list.length > 0) chosen = list
         const top = chosen[0]
-        addLog(`Selected: ${chosen.join(", ")} (top: ${sym.priceChangePercent?.toFixed(2) ?? "—"}% 1h)`, "success")
+        addLog(`Selected: ${chosen.join(", ")} (top: ${sym.priceChangePercent?.toFixed(2) ?? "—"}% 24h volatile)`, "success")
         setVolatileSymbol({ symbol: top, exchange: ex, pct: sym.priceChangePercent ?? null, loading: false })
       }
 
@@ -889,6 +919,10 @@ export function QuickstartSection() {
   // render matches SSR (defaults) and React hydrates cleanly. Doing this in an
   // effect — rather than in the useState initialisers — is what prevents the
   // hydration mismatch on the Start button and the cascading radix id drift.
+  //
+  // Also restores the last-known stats from sessionStorage so the dashboard
+  // shows the previous progress immediately on page reload instead of showing
+  // zeros while the first polling fetch is in-flight (~3-5 s).
   useEffect(() => {
     try {
       if (localStorage.getItem("qs:isRunning") === "1") setIsRunning(true)
@@ -899,7 +933,25 @@ export function QuickstartSection() {
         if (Number.isFinite(n)) setSymbolCount(Math.max(1, Math.min(10, n || 10)))
       }
       const ac = localStorage.getItem("qs:activeConnectionId")
-      if (ac) setActiveConnectionId(ac)
+      if (ac) {
+        setActiveConnectionId(ac)
+        // Restore last-known stats for this connection so the UI shows
+        // continuous progress immediately, not zeros, on page reload.
+        try {
+          const cached = sessionStorage.getItem(`qs:stats:${ac}`)
+          if (cached) {
+            const parsed = JSON.parse(cached) as LiveStats
+            // Only hydrate if the snapshot is reasonably fresh (< 10 min).
+            // Stale snapshots are harmless — the first real fetch overwrites
+            // them — but we skip extremely old data to avoid confusing the
+            // operator with hours-old numbers that look "live".
+            const age = Date.now() - (parsed.updatedAt ?? 0)
+            if (age < 10 * 60 * 1000) {
+              setStats(parsed)
+            }
+          }
+        } catch { /* ignore corrupted sessionStorage data */ }
+      }
     } catch { /* localStorage may be unavailable */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -966,7 +1018,7 @@ export function QuickstartSection() {
 
       {/* ── options strip ─────────────────────────────────────────────
           Per-connection knobs the operator changes mid-run:
-            • Control Orders   — toggle live exchange order emission
+            ��� Control Orders   — toggle live exchange order emission
             • Profit Factor Mins (Base/Main/Real/Live) — stage gates
             • Volume Factor    — live volume multiplier
             • Strategies Pos. Counts — Block + DCA on/off
@@ -998,7 +1050,10 @@ export function QuickstartSection() {
             <>
               <span className="font-semibold text-foreground font-mono">{volatileSymbol.symbol}</span>
               {volatileSymbol.pct !== null && (
-                <span className={`text-[10px] tabular-nums ${volatileSymbol.pct >= 0 ? "text-green-600" : "text-red-500"}`}>
+                <span
+                  className={`text-[10px] tabular-nums ${volatileSymbol.pct >= 0 ? "text-green-600" : "text-red-500"}`}
+                  title="24h price change %"
+                >
                   {volatileSymbol.pct >= 0 ? "+" : ""}{volatileSymbol.pct.toFixed(2)}%
                 </span>
               )}
@@ -1516,6 +1571,35 @@ export function QuickstartSection() {
                     label="Real Pos"
                     value={fmt(stats.realOpen)}
                     sub="active"
+                  />
+                )}
+                {/* ── Real-stage rolling averages ── */}
+                {stats.realAverages && stats.realAverages.activeSets > 0 && (
+                  <MiniStat
+                    label="Avg Sets"
+                    value={stats.realAverages.activeSets.toFixed(1)}
+                    sub="real stage"
+                  />
+                )}
+                {stats.realAverages && stats.realAverages.posPerSet > 0 && (
+                  <MiniStat
+                    label="Avg Pos/Set"
+                    value={stats.realAverages.posPerSet.toFixed(1)}
+                  />
+                )}
+                {stats.realAverages && stats.realAverages.posOpen > 0 && (
+                  <MiniStat
+                    label="Avg Open"
+                    value={stats.realAverages.posOpen.toFixed(1)}
+                    sub="positions"
+                  />
+                )}
+                {/* ── Stage cascade eval percentages ── */}
+                {stats.stageEvalPercent && (
+                  <MiniStat
+                    label="Evals B/M/R"
+                    value={`${stats.stageEvalPercent.base.toFixed(1)}% / ${stats.stageEvalPercent.main.toFixed(0)}% / ${stats.stageEvalPercent.real.toFixed(0)}%`}
+                    sub="stage survival"
                   />
                 )}
               </div>

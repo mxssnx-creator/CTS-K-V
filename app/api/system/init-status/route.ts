@@ -14,9 +14,27 @@ export async function GET(request: NextRequest) {
     const { initRedis, isRedisConnected, getRedisStats, getAllConnections } = await import("@/lib/redis-db")
     const { getMigrationStatus } = await import("@/lib/redis-migrations")
 
-    // Try to connect to Redis
+    // Try to connect to Redis.
+    // Note: in Next.js dev, each route module re-evaluates with its own
+    // module-scoped `isConnected=false`. The initRedis() call below returns
+    // immediately via the globalThis in-flight guard (the engine's promise
+    // resolved on boot), but never sets isConnected in THIS scope. We
+    // therefore probe the client directly via a fast hget rather than relying
+    // on the module-scoped boolean or the (now-dead) resolved promise.
     await initRedis()
-    const connected = await isRedisConnected()
+    const { getRedisClient: _probeClient } = await import("@/lib/redis-db")
+    let connected = isRedisConnected()
+    if (!connected) {
+      try {
+        // A raw key probe is ~0.1 ms on the in-process store; any exception
+        // means the emulator is genuinely not up.
+        const probe = _probeClient()
+        await probe.get("_schema_version")
+        connected = true
+      } catch {
+        connected = false
+      }
+    }
 
     if (!connected) {
       return NextResponse.json(

@@ -41,15 +41,20 @@ export interface EngineTimings {
   // step with the freshest price data the venue gives us.
   liveSyncIntervalMs: number
 
-  // ── Pause AFTER a completed live sync ─────────────────────────────────
-  // Defence-in-depth on top of the single-flight guard. Once a sync
-  // cycle has fully completed (every per-position branch, every protection
-  // order placement / cancel, every Redis write), we wait this many ms
-  // before the next sync can be triggered. Mirrors the `cyclePauseMs`
-  // pattern used by the main progression cycle (see engine-manager.ts):
-  // each cycle runs to completion → short breath → next cycle. Range
-  // 10–200 ms, default 50 ms. Prevents back-to-back syncs starving the
-  // event loop on a slow exchange API while keeping close latency low.
+  // ── Post-completion breath for live sync ──────────────────────────────
+  // Elapsed AFTER the previous sync cycle fully finishes (all per-position
+  // branches, protection-order placements / cancels, Redis writes done)
+  // and BEFORE the next cycle is permitted to start.
+  //
+  // This is a POST-COMPLETION pause, not a start-to-start interval.
+  // The timing model is:
+  //   [cycle starts] → ... work ... → [cycle ends] → liveSyncPauseMs wait
+  //   → [next cycle may start, subject to liveSyncIntervalMs gate]
+  //
+  // Purpose: anti-hang / event-loop protection. A slow exchange response
+  // followed immediately by another dispatch would stack callbacks and
+  // starve other JS microtasks. The pause gives the runtime a guaranteed
+  // breath between back-to-back exchange calls. Range 10–200 ms, default 50 ms.
   liveSyncPauseMs: number
 
   // ── Realtime tick heartbeat throttle ──────────────────────────────────
@@ -84,28 +89,35 @@ export interface EngineTimings {
   progressionBufferFlushMs: number
 
   // ── Three independent progression loops (the engine's "heartbeat") ──
-  // The engine drives three top-level loops, EACH independent of the others
-  // but sharing one inner ind+strat pipeline:
+  // The engine drives three top-level loops, each independent of the others:
   //
-  //   A. Prehistoric Progression  (default 1 s, continuous forever)
-  //      → for each timeframe × symbol: runIndStratCycle(historical)
-  //   B. Realtime  Progression    (default 1 s, continuous forever)
-  //      → for each symbol:           runIndStratCycle(realtime)
-  //   C. LivePositions Progression (default 200 ms, continuous forever)
-  //      → live-exchange sync (mark price, SL/TP cross, control orders)
+  //   A. Prehistoric Progression
+  //   B. Realtime  Progression
+  //   C. LivePositions Progression (live-exchange sync)
   //
-  // Each loop has a start-to-start interval AND a post-completion pause
-  // ("breath"). The pause guarantees the previous cycle's Redis writes
-  // are durable before the next cycle reads — mirrors the live-sync
-  // pause pattern that fixed double-fire SL/TP bugs.
-  prehistoricIntervalMs: number       // Loop A start-to-start
-  prehistoricCyclePauseMs: number     // Loop A post-cycle breath
-  realtimeIntervalMs: number          // Loop B start-to-start
-  realtimeCyclePauseMs: number        // Loop B post-cycle breath
-  livePositionsCyclePauseMs: number   // Loop C post-cycle breath
-                                       //   (Loop C uses `liveSyncIntervalMs`
-                                       //    as start-to-start gate — that
-                                       //    field already exists above.)
+  // For every loop the timing model is:
+  //
+  //   [previous cycle ends] ──► *CyclePauseMs wait (anti-hang breath)
+  //                          ──► [new cycle may start if interval elapsed]
+  //
+  // *IntervalMs  = minimum start-to-start gap (schedule / cadence).
+  //               New cycle is skipped when now - lastStart < intervalMs.
+  //
+  // *CyclePauseMs = minimum post-COMPLETION gap (anti-hang protection).
+  //               After the previous cycle fully finishes, the loop waits
+  //               this long before triggering the next one — regardless of
+  //               how long the cycle itself took. This prevents tight
+  //               back-to-back dispatches from starving the event loop when
+  //               exchange calls are slow, and gives Redis writes time to
+  //               flush before the next read. Default 50 ms for A/B.
+  //               These are NOT cadence / interval timings.
+  prehistoricIntervalMs: number    // Loop A: start-to-start cadence
+  prehistoricCyclePauseMs: number  // Loop A: post-completion breath (anti-hang)
+  realtimeIntervalMs: number       // Loop B: start-to-start cadence
+  realtimeCyclePauseMs: number     // Loop B: post-completion breath (anti-hang)
+  livePositionsCyclePauseMs: number // Loop C: post-completion breath (anti-hang)
+  //  Loop C interval = liveSyncIntervalMs (exists above, shared with the
+  //  maybeRunLiveSync gate — same concept, same 200 ms value).
 
   // ── Hedge Accumulation / Directional Neutralisation ───────────────────────
   // Per spec: instead of blindly stacking long & short sets into exchange
@@ -134,6 +146,10 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   // the live exchange-positions cadence (~200 ms). Combined with the
   // `liveSyncPauseMs` post-cycle breath this gives ~5 close-path sweeps
   // per second while still letting each sweep finish cleanly.
+  // MUST stay at 200 ms — this is the start-to-start cadence for
+  // syncWithExchange (Loop C). 5 sweeps/sec is required to detect
+  // BingX-filled close orders within one realtime tick.
+  // Raising above 1000 ms risks stale position state and double-close.
   liveSyncIntervalMs:          200,
   liveSyncPauseMs:              50,
   heartbeatIntervalMs:       1_000,
@@ -144,11 +160,16 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
   maxPositionHoldMs:    4 * 60 * 60 * 1000,
   progressionBufferFlushMs:  3_000,
   // ── Three-progression defaults ────────────────────────────────────────
-  prehistoricIntervalMs:        1_000,  // 1s timeframe cadence
-  prehistoricCyclePauseMs:         50,
-  realtimeIntervalMs:           300,
-  realtimeCyclePauseMs:            50,
-  livePositionsCyclePauseMs:       300,
+  // *IntervalMs  = start-to-start cadence (skips new cycle if too soon)
+  // *CyclePauseMs = post-COMPLETION breath — anti-hang protection only.
+  //   After the previous cycle ends, wait this before the next may begin.
+  //   50 ms is deliberately short: just enough to yield the event loop
+  //   and let pending microtasks/I-O callbacks drain. Not a pacing timer.
+  prehistoricIntervalMs:       1_000,  // Loop A: 1 s cadence
+  prehistoricCyclePauseMs:        50,  // Loop A: post-completion breath
+  realtimeIntervalMs:            300,  // Loop B: 300 ms cadence
+  realtimeCyclePauseMs:           50,  // Loop B: post-completion breath
+  livePositionsCyclePauseMs:     300,  // Loop C: post-completion breath (interval = liveSyncIntervalMs 200 ms)
 // ── Hedge Accumulation defaults (disabled until opted-in) ────────────────
    neutralizeEnabled:               false,
    neutralizeThresholdPct:          10,   // 10 % imbalance before reducing
@@ -162,10 +183,11 @@ export const DEFAULT_ENGINE_TIMINGS: EngineTimings = {
 export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; max: number }> = {
   cronSyncIntervalSeconds:   { min: 5,           max: 60                  },
   // Lower bound 100 ms — anything faster than the exchange's own price
-  // tick is wasted REST calls. Upper bound retained at 60 s for
-  // operators who explicitly want a quiet REST footprint on paper-only
-  // setups.
-  liveSyncIntervalMs:        { min: 100,         max: 60_000              },
+  // tick is wasted REST calls. Upper bound capped at 1000 ms (1 sweep/sec)
+  // — raising above this causes fill/close detection to lag by >1 tick,
+  // producing stale position state and double-close races.
+  // Default 200 ms = 5 sweeps/sec. Do not raise without explicit intent.
+  liveSyncIntervalMs:        { min: 100,         max: 1_000               },
   liveSyncPauseMs:           { min: 10,          max: 200                 },
   heartbeatIntervalMs:       { min: 250,         max: 30_000              },
   strategyFlowMinIntervalMs: { min: 250,         max: 60_000              },
@@ -175,14 +197,17 @@ export const ENGINE_TIMING_BOUNDS: Record<keyof EngineTimings, { min: number; ma
   maxPositionHoldMs:         { min: 0 /* off */, max: 7 * 24 * 60 * 60_000 },
   progressionBufferFlushMs:  { min: 500,         max: 60_000              },
   // ── Three-progression bounds ──────────────────────────────────────────
-  // Floor at 200 ms protects the event loop from a runaway 1 ms cycle.
-  // Ceiling at 60 s gives operators a way to "park" a loop without
-  // disabling it entirely (e.g. quiet-mode for paper-only setups).
+  // Interval floors at 200 ms prevent a runaway 1 ms cadence from locking
+  // the event loop. Interval ceilings at 60 s let operators "park" a loop.
+  //
+  // Pause bounds are intentionally narrow (10–500 ms) because these are
+  // anti-hang breaths, not pacing timers. A pause > 500 ms would make the
+  // loop feel unresponsive; < 10 ms would give no meaningful yield.
   prehistoricIntervalMs:     { min: 200,         max: 60_000              },
-  prehistoricCyclePauseMs:   { min: 10,          max: 500                 },
+  prehistoricCyclePauseMs:   { min: 10,          max: 500                 },  // breath, not cadence
   realtimeIntervalMs:        { min: 200,         max: 60_000              },
-  realtimeCyclePauseMs:      { min: 10,          max: 500                 },
-  livePositionsCyclePauseMs:  { min: 10,          max: 200                 },
+  realtimeCyclePauseMs:      { min: 10,          max: 500                 },  // breath, not cadence
+  livePositionsCyclePauseMs: { min: 10,          max: 500                 },  // breath, not cadence
 // ── Hedge Accumulation bounds ─────────────────────────────────────────────
    neutralizeEnabled:           { min: 0,           max: 1  /* boolean */    },
    neutralizeThresholdPct:      { min: 0,           max: 50                  },

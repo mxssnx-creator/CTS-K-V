@@ -1,51 +1,18 @@
 /**
- * Trade Engine Module Exports V3
- * @version 3.0.0
- * 
- * This module provides two types of trade engines:
+ * Trade Engine Module Exports
  *
- * 1. GlobalTradeEngineCoordinator (from ../trade-engine.ts)
- *    - Global singleton that coordinates all connections
- *    - Use for system-wide trade management
- *    - Functions: getTradeEngine(), initializeTradeEngine()
+ * All consumers import directly from "@/lib/trade-engine" (the parent
+ * lib/trade-engine.ts) which contains the GlobalTradeEngineCoordinator
+ * singleton and all exported helpers.
  *
- * 2. TradeEngine (from ./trade-engine.tsx)
- *    - Per-connection service instance
- *    - Runs continuously with three parallel loops
- *    - Use for individual exchange connection management
- *    - Service name: project_name-trade
- *
- * V3 Changes: IndicationProcessor moved to indication-processor-v2.ts
+ * This barrel re-exports the two most-used sub-module classes for
+ * convenience, without duplicating the top-level coordinator exports
+ * (those live exclusively in lib/trade-engine.ts to avoid circular
+ * re-export confusion).
  */
 
-console.log("[v0] Trade Engine Index V3 loaded")
-
-// Explicit re-exports from parent trade-engine module
-export {
-  getTradeEngine,
-  getGlobalCoordinator,
-  initializeTradeEngine,
-  initializeGlobalCoordinator,
-  type GlobalTradeEngineCoordinator,
-  type TradeEngineInterface,
-  type EngineStatus,
-  type ConnectionStatus,
-  type HealthStatus,
-  type ComponentHealth,
-} from "../trade-engine"
-
 // Per-connection TradeEngine class
-export {
-  TradeEngine,
-  TRADE_SERVICE_NAME,
-  type TradeEngineConfig,
-} from "./trade-engine"
+export { TradeEngine, TRADE_SERVICE_NAME, type TradeEngineConfig } from "./trade-engine"
 
 // Engine manager for service lifecycle
-export {
-  TradeEngineManager,
-  type EngineConfig,
-} from "./engine-manager"
-
-// Re-export for compatibility
-export { getTradeEngine as getGlobalTradeEngine } from "../trade-engine"
+export { TradeEngineManager, type EngineConfig } from "./engine-manager"

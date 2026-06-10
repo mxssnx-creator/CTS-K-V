@@ -9,10 +9,20 @@ import { VolumeCalculator } from "@/lib/volume-calculator"
 import { emitPositionUpdate } from "@/lib/broadcast-helpers"
 import { StrategyConfigManager, type PseudoPosition as StrategyPseudoPosition } from "@/lib/strategy-config-manager"
 
-function nanoid(len = 12): string {
+/**
+ * Cryptographically-strong short ID generator.
+ * Uses crypto.getRandomValues (Web Crypto, available Node 18+ globally) so
+ * each character carries ~5.17 bits of entropy (36-char alphabet).
+ * 12-char default → ~62 bits total — zero collision risk at any realistic
+ * position-creation rate. Exported so live-stage.ts and strategy-coordinator.ts
+ * share the same canonical source instead of each having a Math.random variant.
+ */
+export function nanoid(len = 12): string {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+  const bytes = new Uint8Array(len)
+  crypto.getRandomValues(bytes)
   let id = ""
-  for (let i = 0; i < len; i++) id += chars[Math.floor(Math.random() * chars.length)]
+  for (let i = 0; i < len; i++) id += chars[bytes[i] % chars.length]
   return id
 }
 
@@ -282,12 +292,12 @@ export class PseudoPositionManager {
           const raw = parseFloat(String(settings.positions_average ?? "2"))
           return Number.isFinite(raw) && raw > 0 ? raw : 2
         })()
-        const leveragePercentage = parseFloat(String(settings.leveragePercentage ?? "100"))
-        const useMaxLeverage =
-          settings.useMaximalLeverage === true || settings.useMaximalLeverage === "true"
-        const rawLeverage = useMaxLeverage
-          ? 125
-          : Math.round(125 * (leveragePercentage / 100))
+        // Operator policy: always max leverage — resolved from the exchange
+        // predefinition rather than a stored preference flag.
+        const { getMaxLeverageForExchange: _getMaxLev } = await import("@/lib/leverage-policy")
+        const { getConnection: _getConn } = await import("@/lib/redis-db")
+        const _conn = await _getConn(this.connectionId).catch(() => null)
+        const rawLeverage = _getMaxLev(_conn?.exchange)
         const { accountBalance, maxLeverage } =
           await VolumeCalculator.resolveBalanceAndLeverage(this.connectionId, rawLeverage)
         const tradingPair = await getSettings(`trading_pair:${params.symbol}`)
@@ -329,7 +339,7 @@ export class PseudoPositionManager {
       // Store position in Redis
       const id = nanoid()
       // Generate unique tracking ID to identify system-created positions
-      const systemTrackingId = `sys-${this.connectionId}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
+      const systemTrackingId = `sys-${this.connectionId}-${nanoid(8)}`
       const client = getRedisClient()
 
       const positionData: Record<string, string> = {

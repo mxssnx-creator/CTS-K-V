@@ -47,6 +47,10 @@ const globalForRedis = globalThis as unknown as {
   // builds the instance early would otherwise make the loader think the
   // snapshot was already applied and skip it, booting with an empty store.
   __redis_snapshot_loaded?: boolean
+  // Global equivalent of the module-scoped `isConnected` flag. Allows fresh
+  // Next.js dev route modules (which re-evaluate and get isConnected=false) to
+  // see the real connected state without re-running initRedis/migrations.
+  __redis_fully_connected?: boolean
 }
 
 export class InlineLocalRedis {
@@ -1230,13 +1234,38 @@ export async function initRedis(): Promise<void> {
     if (!migrationsRan) {
       // runMigrations() calls ensureCoreRedis() internally (NOT initRedis), so
       // there is no re-entrancy with the promise we are currently inside.
-      const { runMigrations } = await import("@/lib/redis-migrations")
-      await runMigrations()
-      migrationsRan = true
+      //
+      // SAFETY: Wrap with a 35-second deadline. If a migration deadlocks
+      // (e.g. by calling initRedis() internally, which awaits THIS very
+      // promise), the race rejects after 35 s so the server becomes
+      // responsive. The underlying migration may still resolve later, but
+      // the server is unblocked. The migration runner also has its own
+      // per-migration 30-second deadline for individual migrations.
+      const { runMigrations, resetMigrationRunState } = await import("@/lib/redis-migrations")
+      const MIGRATIONS_DEADLINE_MS = 35_000
+      try {
+        await Promise.race([
+          runMigrations(),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`runMigrations() exceeded ${MIGRATIONS_DEADLINE_MS}ms global deadline — aborting to keep server responsive`)),
+              MIGRATIONS_DEADLINE_MS,
+            ),
+          ),
+        ])
+        migrationsRan = true
+      } catch (migErr) {
+        console.error("[v0] [Redis] runMigrations deadline/error:", migErr instanceof Error ? migErr.message : migErr)
+        // Reset so the next cold-boot can attempt migrations again
+        resetMigrationRunState()
+        migrationsRan = false
+        // Do NOT rethrow — let the server start anyway with schema as-is
+      }
     }
 
     connectionsInitialized = true
     isConnected = true
+    globalForRedis.__redis_fully_connected = true
   })()
 
   try {
@@ -1284,7 +1313,11 @@ export async function ensureRedisInitialized(): Promise<void> {
 }
 
 export function isRedisConnected(): boolean {
-  return isConnected
+  // The module-scoped `isConnected` is false in freshly-evaluated Next.js dev
+  // route modules that never called initRedis() in their own scope. Fall back
+  // to the globalThis flag which is set by the engine's full init path and
+  // survives across module re-evaluations.
+  return isConnected || !!globalForRedis.__redis_fully_connected
 }
 
 // ========== Helpers ==========
@@ -2066,6 +2099,7 @@ export function buildBaseConnectionEnableUpdate(connection: any): any {
 
 export async function closeRedis(): Promise<void> {
   isConnected = false
+  globalForRedis.__redis_fully_connected = false
 }
 
 export function getRedisRequestsPerSecond(): number {
