@@ -656,7 +656,7 @@ export class BingXConnector extends BaseExchangeConnector {
       // Sync server time before any signed request to prevent timestamp errors
       await this.syncServerTime()
 
-      // ── Quantity sanity & formatting ─────────────────────────────────────
+      // ��─ Quantity sanity & formatting ─────────────────────────────────────
       // BingX rejects quantities that fall below the symbol step size, and in
       // many cases responds with its generic "this api is not exist" error
       // instead of a precise reason. Normalise the quantity to a reasonable
@@ -985,10 +985,12 @@ export class BingXConnector extends BaseExchangeConnector {
           const tsData = await this.safeJson(tsResp)
           if (this.isBingXSuccess(tsData.code)) {
             const info = tsData.data?.order || tsData.data || {}
-            return {
-              success: true,
-              orderId: String(info.orderId ?? info.orderID ?? ""),
+            const id = info.orderId || info.orderID || tsData.data?.orderId
+            if (id) {
+              this.log(`✓ ${orderType} placed on timestamp retry: ${id}`)
+              return { success: true, orderId: String(id) }
             }
+            // Fall through to error handling if orderId was not found
           }
           Object.assign(data, tsData)
         }
@@ -1011,10 +1013,12 @@ export class BingXConnector extends BaseExchangeConnector {
           const retryData2 = await this.safeJson(retryResp2)
           if (this.isBingXSuccess(retryData2.code)) {
             const info2 = retryData2.data?.order || retryData2.data || {}
-            return {
-              success: true,
-              orderId: String(info2.orderId ?? info2.orderID ?? ""),
+            const id2 = info2.orderId || info2.id || retryData2.data?.orderId
+            if (id2) {
+              this.log(`✓ ${orderType} placed on reduceOnly hedge retry: ${id2}`)
+              return { success: true, orderId: String(id2) }
             }
+            // Fall through to error handling if orderId was not found
           }
           // Fall through to the normal error path with the retry's response.
           data.code = retryData2.code
@@ -1036,8 +1040,11 @@ export class BingXConnector extends BaseExchangeConnector {
           if (this.isBingXSuccess(retryData.code)) {
             const info = retryData.data?.order || retryData.data || {}
             const id = info.orderId || info.id || retryData.data?.orderId
-            this.log(`✓ ${orderType} placed on retry: ${id}`)
-            return { success: true, orderId: id ? String(id) : undefined }
+            if (id) {
+              this.log(`✓ ${orderType} placed on one-way retry: ${id}`)
+              return { success: true, orderId: String(id) }
+            }
+            // Fall through to error handling if orderId was not found
           }
           throw new Error(`BingX stop order error (code=${retryData.code}): ${retryData.msg || "Unknown"}`)
         }
@@ -1046,8 +1053,16 @@ export class BingXConnector extends BaseExchangeConnector {
 
       const info = data.data?.order || data.data || {}
       const orderId = info.orderId || info.id || data.data?.orderId
+      if (!orderId) {
+        // BingX returned success but we couldn't extract the order ID from the response.
+        // This is a malformed response that we should treat as a failure to prevent
+        // marking a position as protected when no actual protection order exists.
+        const errorMsg = `BingX returned success but orderId was missing/empty from response`
+        this.logError(`✗ ${orderType} placement failed: ${errorMsg}`)
+        return { success: false, error: errorMsg }
+      }
       this.log(`✓ ${orderType} placed: ${orderId} @ ${stopStr}`)
-      return { success: true, orderId: orderId ? String(orderId) : undefined }
+      return { success: true, orderId: String(orderId) }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error)
       this.logError(`✗ Failed to place stop order: ${errorMsg}`)
