@@ -30,7 +30,9 @@ export interface ExchangeAPI {
   placeOrder(order: any): Promise<any>
   cancelOrder(orderId: string): Promise<boolean>
   getOrderBook(symbol: string): Promise<any>
-  subscribeToTicker(symbol: string, callback: (data: any) => void): void
+  /** Subscribe to real-time ticker updates. Returns an unsubscribe function that
+   *  MUST be called when the subscription is no longer needed to prevent interval leaks. */
+  subscribeToTicker(symbol: string, callback: (data: any) => void): () => void
   setMarginMode?(symbol: string, mode: "cross" | "isolated"): Promise<boolean>
   setHedgingMode?(mode: "single" | "hedge"): Promise<boolean>
   setLeverage?(symbol: string, leverage: number): Promise<boolean>
@@ -341,7 +343,7 @@ export class BybitAPI implements ExchangeAPI {
     }
   }
 
-  subscribeToTicker(symbol: string, callback: (data: any) => void): void {
+  subscribeToTicker(symbol: string, callback: (data: any) => void): () => void {
     console.log(`[v0] [Bybit] [${this.activeConnectionMethod.toUpperCase()}] Subscribing to ticker for ${symbol}`)
     const interval = setInterval(() => {
       callback({
@@ -350,6 +352,7 @@ export class BybitAPI implements ExchangeAPI {
         timestamp: Date.now(),
       })
     }, 1000)
+    return () => clearInterval(interval)
   }
 }
 
@@ -621,7 +624,7 @@ export class BingXAPI implements ExchangeAPI {
     }
   }
 
-  subscribeToTicker(symbol: string, callback: (data: any) => void): void {
+  subscribeToTicker(symbol: string, callback: (data: any) => void): () => void {
     const interval = setInterval(() => {
       callback({
         symbol,
@@ -629,6 +632,7 @@ export class BingXAPI implements ExchangeAPI {
         timestamp: Date.now(),
       })
     }, 1200)
+    return () => clearInterval(interval)
   }
 }
 
@@ -898,7 +902,7 @@ export class PionexAPI implements ExchangeAPI {
     }
   }
 
-  subscribeToTicker(symbol: string, callback: (data: any) => void): void {
+  subscribeToTicker(symbol: string, callback: (data: any) => void): () => void {
     const interval = setInterval(() => {
       callback({
         symbol,
@@ -906,6 +910,7 @@ export class PionexAPI implements ExchangeAPI {
         timestamp: Date.now(),
       })
     }, 1500)
+    return () => clearInterval(interval)
   }
 }
 
@@ -1161,7 +1166,7 @@ export class OrangeXAPI implements ExchangeAPI {
     }
   }
 
-  subscribeToTicker(symbol: string, callback: (data: any) => void): void {
+  subscribeToTicker(symbol: string, callback: (data: any) => void): () => void {
     const interval = setInterval(() => {
       callback({
         symbol,
@@ -1169,6 +1174,7 @@ export class OrangeXAPI implements ExchangeAPI {
         timestamp: Date.now(),
       })
     }, 1100)
+    return () => clearInterval(interval)
   }
 }
 

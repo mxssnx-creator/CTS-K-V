@@ -41,6 +41,9 @@ export interface RecoveryOptions {
   fallbackValue?: any
   queueSize?: number
   timeout?: number
+  /** The async function to retry. Required when strategy === RecoveryStrategy.RETRY;
+   *  without it the retry loop has no operation to re-attempt. */
+  retryFn?: () => Promise<any>
 }
 
 export interface ErrorMetrics {
@@ -153,6 +156,17 @@ export class ComprehensiveErrorHandler {
   ): Promise<any> {
     const maxRetries = options.maxRetries ?? 3
     const baseDelay = options.retryDelayMs ?? 1000
+    const fn = options.retryFn
+
+    // If no retryFn was supplied the caller cannot be retried — fall back
+    // immediately rather than burning maxRetries × delay doing nothing.
+    if (!fn) {
+      logger.warn(
+        `retryStrategy for ${context.operation}: no retryFn supplied, returning fallback immediately`,
+        { originalError: error.message }
+      )
+      return options.fallbackValue ?? null
+    }
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       const delay = baseDelay * Math.pow(2, attempt - 1)
@@ -164,11 +178,29 @@ export class ComprehensiveErrorHandler {
 
       await new Promise(resolve => setTimeout(resolve, delay))
 
-      // Retry would be handled by caller
       metricsCollector.incrementCounter('error_retry_attempted', 1, {
         operation: context.operation,
         attempt: String(attempt)
       })
+
+      try {
+        const result = await fn()
+        logger.info(
+          `Retry succeeded on attempt ${attempt}/${maxRetries} for ${context.operation}`,
+          { attemptNumber: attempt }
+        )
+        return result
+      } catch (retryErr) {
+        const msg = retryErr instanceof Error ? retryErr.message : String(retryErr)
+        logger.warn(
+          `Retry attempt ${attempt}/${maxRetries} failed for ${context.operation}: ${msg}`,
+          { attemptNumber: attempt }
+        )
+        if (attempt === maxRetries) {
+          // All attempts exhausted — return fallback
+          return options.fallbackValue ?? null
+        }
+      }
     }
 
     return options.fallbackValue ?? null
