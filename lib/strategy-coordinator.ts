@@ -200,7 +200,7 @@ export interface StrategySet {
    *      Base→Main filters reject it.
    *   2. evaluateRealSets uses `successRate`/`profitFactor` to TUNE
    *      `entries[].sizeMultiplier` and `leverage` per variant — the
-   *      "Real stage �� accumulation for pos cnts sets … relying to
+   *      "Real stage ��� accumulation for pos cnts sets … relying to
    *      their base sets configs independent" path.
    */
   prevPos?: {
@@ -390,8 +390,12 @@ export class StrategyCoordinator {
     // Live Sets default is now per-exchange (see setExchangeMaxLive).
     // This is a placeholder; the real value is set during init.
     maxLiveSets: 500,
-    // Strategies (Real Sets) are now unlimited by default — no hard cap.
-    maxRealSets: Infinity,
+    // Real Sets default to the safety ceiling (12000). "Unlimited" (Infinity)
+    // previously bypassed the OOM-protection ceiling because the enforcement
+    // used `??` (Infinity is not nullish) — next-server was OOM-killed at the
+    // 4GB heap limit during live multi-symbol runs. The evaluate path also
+    // hard-clamps with Math.min as defense in depth.
+    maxRealSets: 12000,
     pruneStrategy: "hybrid",
   }
 
@@ -2429,7 +2433,13 @@ export class StrategyCoordinator {
     // above any realistic per-symbol Set count so normal multi-symbol runs
     // are unaffected — it exists purely to keep the process from being killed.
     const REAL_SETS_SAFETY_CEILING = 12000
-    const realSetsCap = this.config.maxRealSets ?? REAL_SETS_SAFETY_CEILING
+    // HARD ENFORCE with Math.min: the config default is Infinity, and
+    // `Infinity ?? CEILING` evaluates to Infinity — the previous `??` meant
+    // the safety ceiling NEVER engaged and the process was OOM-killed at
+    // ~4GB heap (verified: FATAL "Ineffective mark-compacts near heap limit"
+    // during a 5-symbol live run). The operator can LOWER the cap via
+    // maxRealSets but can never exceed the ceiling.
+    const realSetsCap = Math.min(this.config.maxRealSets ?? REAL_SETS_SAFETY_CEILING, REAL_SETS_SAFETY_CEILING)
     const realSets = realPostHedge.slice(0, realSetsCap)
     if (realPostHedge.length > realSetsCap) {
       console.warn(
