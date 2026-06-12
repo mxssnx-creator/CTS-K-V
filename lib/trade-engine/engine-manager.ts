@@ -2484,6 +2484,15 @@ export class TradeEngineManager {
     let errorCount = 0
     let liveSyncInFlight = false
     let lastSyncCompletedAt = 0
+    // ── Connector reuse (memory-pressure fix) ───────────────────────────
+    // The previous code constructed a BRAND-NEW exchange connector on EVERY
+    // 200ms tick (~5/sec, ~18k/hour). Each instance allocates headers,
+    // closures and retry state; under live trading this allocation churn
+    // outpaced GC and contributed to next-server being OOM-killed minutes
+    // after live-trade start. Cache one connector per credentials-set and
+    // only rebuild when the key/secret/testnet flag actually changes.
+    let cachedConnector: any = null
+    let cachedConnectorKey = ""
 
     const tickLivePositions = async () => {
       if (!this.isRunning) return
@@ -2536,14 +2545,25 @@ export class TradeEngineManager {
               const apiKey = (connection as any).api_key || (connection as any).apiKey || ""
               const apiSecret = (connection as any).api_secret || (connection as any).apiSecret || ""
               if (apiKey && apiSecret) {
-                const createExchangeConnector = await _createExchangeConnectorLazy()
-                connector = await createExchangeConnector(connection.exchange, {
-                  apiKey,
-                  apiSecret,
-                  apiType: connection.api_type,
-                  contractType: connection.contract_type,
-                  isTestnet: connection.is_testnet === true || connection.is_testnet === "true",
-                })
+                const isTestnet = connection.is_testnet === true || connection.is_testnet === "true"
+                const connectorKey = `${connection.exchange}:${apiKey}:${apiSecret.slice(-8)}:${isTestnet}:${connection.api_type ?? ""}:${connection.contract_type ?? ""}`
+                if (cachedConnector && cachedConnectorKey === connectorKey) {
+                  connector = cachedConnector
+                } else {
+                  const createExchangeConnector = await _createExchangeConnectorLazy()
+                  connector = await createExchangeConnector(connection.exchange, {
+                    apiKey,
+                    apiSecret,
+                    apiType: connection.api_type,
+                    contractType: connection.contract_type,
+                    isTestnet,
+                  })
+                  cachedConnector = connector
+                  cachedConnectorKey = connectorKey
+                }
+              } else {
+                cachedConnector = null
+                cachedConnectorKey = ""
               }
             }
             // syncWithExchange handles sim sweep unconditionally (no connector
