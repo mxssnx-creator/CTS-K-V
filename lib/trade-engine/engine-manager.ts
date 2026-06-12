@@ -191,7 +191,7 @@ import { loadMarketDataForEngine } from "@/lib/market-data-loader"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
 import { engineMonitor } from "@/lib/engine-performance-monitor"
 import { ConfigSetProcessor } from "./config-set-processor"
-import { prefetchMarketDataBatch } from "./market-data-cache"
+import { prefetchMarketDataBatch, getParsedCandlesCached } from "./market-data-cache"
 import {
   // ── Cross-process progression ownership (spec §"no multiple started
   // progressions per connection, no switching"). The lock guarantees a
@@ -3013,15 +3013,14 @@ export class TradeEngineManager {
         ): Promise<{ symbol: string; stepsReplayed: number; indications: number; strategies: number; durationMs: number; error?: string }> => {
           const symStart = Date.now()
           try {
-            // Load candles for this symbol (the same key the indication
-            // processor's getHistoricalCandles reads).
-            const candlesRaw = await client.get(`market_data:${symbol}:candles`)
-            if (!candlesRaw) {
-              return { symbol, stepsReplayed: 0, indications: 0, strategies: 0, durationMs: Date.now() - symStart }
-            }
-            const candles: any[] = JSON.parse(
-              typeof candlesRaw === "string" ? candlesRaw : JSON.stringify(candlesRaw),
-            )
+            // Load candles for this symbol via the parsed-candles cache.
+            // OOM-PROTECTION: previously this did client.get + JSON.parse of
+            // the FULL ~86,400-candle (~10 MB) blob PER SYMBOL on EVERY cycle
+            // (~1/sec) and then .filter().sort()'d it — the transient garbage
+            // outpaced GC and OOM-killed next-server minutes after the engine
+            // went active. The cache parses+sorts each blob at most once per
+            // data version and returns a shared read-only array.
+            const candles = await getParsedCandlesCached(symbol)
             if (!Array.isArray(candles) || candles.length === 0) {
               return { symbol, stepsReplayed: 0, indications: 0, strategies: 0, durationMs: Date.now() - symStart }
             }
@@ -3036,13 +3035,13 @@ export class TradeEngineManager {
             const resumeFrom = Number.isFinite(ckpt) ? ckpt : windowStartMs
 
             // Filter to candles strictly newer than the checkpoint AND
-            // within the look-back window. Ascending order is preserved.
+            // within the look-back window. The cached array is already sorted
+            // ascending by timestamp, so no re-sort is needed here.
             const pending = candles
               .filter((c: any) => {
                 const ts = Number(c?.timestamp ?? c?.t ?? 0)
                 return Number.isFinite(ts) && ts > resumeFrom && ts <= windowEndMs
               })
-              .sort((a: any, b: any) => Number(a?.timestamp ?? 0) - Number(b?.timestamp ?? 0))
 
             if (pending.length === 0) {
               return { symbol, stepsReplayed: 0, indications: 0, strategies: 0, durationMs: Date.now() - symStart }
