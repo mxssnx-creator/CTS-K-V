@@ -697,10 +697,17 @@ export class InlineLocalRedis {
     this.data.hashes.set(key, { ...this.data.hashes.get(key), ...obj })
   }
 
-  async hgetall(key: string): Promise<Record<string, string> | null> {
+  async hgetall(key: string): Promise<Record<string, string>> {
     this.trackOperation()
-    if (this.isExpired(key)) return null
-    return this.data.hashes.get(key) ?? null
+    // REAL REDIS SEMANTICS: node-redis hGetAll returns {} for missing keys,
+    // never null. The previous null return deviated from that and caused an
+    // entire class of "Cannot read properties of null" crashes in callers
+    // that (correctly, per redis docs) did not null-check.
+    // Also return a SHALLOW COPY — returning the live hash reference let
+    // callers that mutate the result silently corrupt the in-memory store.
+    if (this.isExpired(key)) return {}
+    const hash = this.data.hashes.get(key)
+    return hash ? { ...hash } : {}
   }
 
   async hlen(key: string): Promise<number> {
