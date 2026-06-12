@@ -188,6 +188,7 @@ export function SystemOverview() {
     if (typeof window !== 'undefined') {
       window.addEventListener('connection-toggled', handleConnectionToggled)
       window.addEventListener('live-trade-toggled', handleLiveTradeToggled)
+      window.addEventListener('connection-settings-updated', handleConnectionToggled)
     }
 
     return () => {
@@ -195,6 +196,7 @@ export function SystemOverview() {
       if (typeof window !== 'undefined') {
         window.removeEventListener('connection-toggled', handleConnectionToggled)
         window.removeEventListener('live-trade-toggled', handleLiveTradeToggled)
+        window.removeEventListener('connection-settings-updated', handleConnectionToggled)
       }
     }
   }, [])

@@ -171,6 +171,9 @@ export function ExchangeConnectionSettingsDialog({
       }
 
       toast.success("Connection settings saved successfully")
+      // Notify dashboard components so stats/cards refresh instantly
+      // instead of waiting for the next poll tick.
+      window.dispatchEvent(new CustomEvent("connection-settings-updated", { detail: { connectionId } }))
       onOpenChange(false)
     } catch (error) {
       console.error("[v0] Failed to save connection settings:", error)

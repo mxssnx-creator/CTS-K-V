@@ -848,6 +848,7 @@ export function StatisticsOverviewV2() {
       window.addEventListener("engine-state-changed", handleEngineStateChanged)
       window.addEventListener("connection-toggled", handleEngineStateChanged)
       window.addEventListener("live-trade-toggled", handleEngineStateChanged)
+      window.addEventListener("connection-settings-updated", handleEngineStateChanged)
     }
 
     return () => {
@@ -857,6 +858,7 @@ export function StatisticsOverviewV2() {
         window.removeEventListener("engine-state-changed", handleEngineStateChanged)
         window.removeEventListener("connection-toggled", handleEngineStateChanged)
         window.removeEventListener("live-trade-toggled", handleEngineStateChanged)
+        window.removeEventListener("connection-settings-updated", handleEngineStateChanged)
       }
     }
   }, [connectionId])

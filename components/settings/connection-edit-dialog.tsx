@@ -163,6 +163,10 @@ export function ConnectionEditDialog({ isOpen, connection, onClose, onSave }: Co
       toast.success("Connection Updated", {
         description: "Connection settings have been saved successfully",
       })
+      // Notify dashboard components so stats/cards refresh instantly
+      window.dispatchEvent(
+        new CustomEvent("connection-settings-updated", { detail: { connectionId: connection?.id } }),
+      )
       onClose()
     } catch (error) {
       toast.error("Save Failed", {

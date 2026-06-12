@@ -370,18 +370,40 @@ export function ActiveConnectionCard({
       if (res.ok) {
         const data = await res.json()
         if (res.ok) {
-          setProgression({
+          // The /stats payload exposes prehistoric data under `historic`, not
+          // `prehistoricProgress` (the shape the legacy /progression endpoint
+          // used). Map it explicitly — otherwise every consumer of
+          // progression.prehistoricProgress (Symbols X/N, candles, percent)
+          // silently reads undefined and the numbers vanish from the UI.
+          const h = data.historic
+          const nextProgression = {
             phase: data.metadata?.phase || "idle",
             isRunning: data.metadata?.engineRunning || false,
             started_at: data.metadata?.startedAt,
             ...data,
-          } as any)
+            prehistoricProgress: h
+              ? {
+                  symbolsProcessed: Number(h.symbolsProcessed) || 0,
+                  symbolsTotal: Number(h.symbolsTotal) || 0,
+                  candlesLoaded: Number(h.candlesLoaded ?? h.framesProcessed) || 0,
+                  candlesTotal: Number(h.candlesTotal) || 0,
+                  indicatorsCalculated: Number(h.indicatorsCalculated) || 0,
+                  currentSymbol: String(h.currentSymbol || ""),
+                  duration: Number(h.duration) || 0,
+                  percentComplete: Number(h.progressPercent) || 0,
+                }
+              : undefined,
+          }
+          setProgression(nextProgression as any)
           // Persist so the UI shows last-known progress immediately on reload
           // instead of blank/zero while the first poll completes.
+          // NOTE: cache the SAME object we render — the previous code cached
+          // `data.progression`, a key that does not exist in the /stats
+          // payload, so reloads restored an empty {} and blanked the card.
           try {
             sessionStorage.setItem(
               `acc:progression:${connection.connectionId}`,
-              JSON.stringify({ ...data.progression, _cachedAt: Date.now() })
+              JSON.stringify({ ...nextProgression, _cachedAt: Date.now() })
             )
           } catch { /* sessionStorage unavailable */ }
         }
@@ -467,13 +489,16 @@ export function ActiveConnectionCard({
     }
 
     // Subscribe to cross-component events so this card re-fetches when
-    // the operator toggles a connection, enables live trading, or
-    // changes the global engine state elsewhere in the app. All three
-    // listeners are cleaned up in the returned teardown below.
+    // the operator toggles a connection, enables live trading, changes
+    // the global engine state, or saves connection settings elsewhere in
+    // the app. All listeners are cleaned up in the returned teardown below.
+    // `connection-settings-updated` is scoped per-connection (same shape
+    // as live-trade-toggled) so only the affected card refreshes.
     if (typeof window !== "undefined") {
       window.addEventListener("connection-toggled", handleConnectionToggled)
       window.addEventListener("live-trade-toggled", handleLiveTradeToggled)
       window.addEventListener("engine-state-changed", handleConnectionToggled)
+      window.addEventListener("connection-settings-updated", handleLiveTradeToggled)
     }
 
     return () => {
@@ -482,6 +507,7 @@ export function ActiveConnectionCard({
         window.removeEventListener("connection-toggled", handleConnectionToggled)
         window.removeEventListener("live-trade-toggled", handleLiveTradeToggled)
         window.removeEventListener("engine-state-changed", handleConnectionToggled)
+        window.removeEventListener("connection-settings-updated", handleLiveTradeToggled)
       }
     }
   }, [fetchProgression, connection.connectionId])

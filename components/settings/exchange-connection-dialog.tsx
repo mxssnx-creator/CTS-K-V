@@ -503,6 +503,10 @@ export function ExchangeConnectionDialog({
       }
 
       toast.success(connection ? "Connection updated successfully" : "Connection added successfully")
+      // Notify dashboard components so stats/cards refresh instantly
+      window.dispatchEvent(
+        new CustomEvent("connection-settings-updated", { detail: { connectionId: connection?.id } }),
+      )
       onSuccess()
       onOpenChange(false)
     } catch (error) {

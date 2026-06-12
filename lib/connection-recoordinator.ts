@@ -119,14 +119,30 @@ export async function recoordinateAfterSettingsChange(
     const isRunning = coordinator.isEngineRunning(id)
 
     if (shouldRun && !isRunning) {
-      // Should run, doesn't — START.
-      // `startMissingEngines` is idempotent: a running engine is left
-      // alone, a stopped-but-should-be-running engine is started with
-      // the freshly-saved settings/config snapshot.
-      console.log(
-        `[v0] [${opts.logTag}] Recoordinate: starting engine for ${id} (was stopped, now should run)`,
-      )
-      await coordinator.startMissingEngines([after])
+      // Should run, doesn't — START, but ONLY if the operator has the
+      // global engine running. AUTO-START GUARD: without this gate,
+      // saving ANY setting while the operator had explicitly stopped the
+      // engine (connection flags still enabled) would silently resurrect
+      // it. Settings saved while stopped are picked up on the next
+      // explicit operator Start via the durable notify envelope (Step 1).
+      let globalRunning = false
+      try {
+        const { getRedisClient } = await import("@/lib/redis-db")
+        const globalState = await getRedisClient().hgetall("trade_engine:global")
+        globalRunning = (globalState as any)?.status === "running"
+      } catch {
+        globalRunning = false
+      }
+      if (globalRunning) {
+        console.log(
+          `[v0] [${opts.logTag}] Recoordinate: starting engine for ${id} (was stopped, now should run, global=running)`,
+        )
+        await coordinator.startMissingEngines([after])
+      } else {
+        console.log(
+          `[v0] [${opts.logTag}] Recoordinate: NOT starting ${id} — global engine not running (operator stop honored); settings apply on next Start`,
+        )
+      }
     } else if (!shouldRun && isRunning) {
       // Should NOT run, but is — STOP. This handles `is_enabled: false`
       // toggles, dashboard-disable, credential clear, etc.
