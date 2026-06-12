@@ -406,6 +406,7 @@ export class InlineLocalRedis {
         const heapUsedMB = (process.memoryUsage?.().heapUsed || 0) / 1024 / 1024
         if (heapUsedMB > HEAP_PRESSURE_MB) {
           console.log(`[v0] [Redis Memory] Heap at ${heapUsedMB.toFixed(0)}MB, evicting old records...`)
+          console.log(`[v0] [Redis Memory] Top key families: ${this.describeKeyFamilies()}`)
           this.evictOldRecords()
           // Nudge GC if exposed (dev runs with --expose-gc sometimes); the
           // emulator frees Map references above, this returns them to the OS.
@@ -418,6 +419,36 @@ export class InlineLocalRedis {
     ttlCleanupTimer.unref?.()
   }
   
+  /**
+   * Diagnostic: histogram of key counts (and rough sizes for big sets/strings)
+   * grouped by the first two `:`-separated segments. Lets the memory-pressure
+   * log show exactly WHICH key families grow instead of guessing.
+   */
+  private describeKeyFamilies(): string {
+    const counts = new Map<string, { n: number; approxBytes: number }>()
+    const famOf = (k: string) => k.split(":").slice(0, 2).join(":")
+    const bump = (k: string, bytes: number) => {
+      const fam = famOf(k)
+      const cur = counts.get(fam) || { n: 0, approxBytes: 0 }
+      cur.n++
+      cur.approxBytes += bytes
+      counts.set(fam, cur)
+    }
+    try {
+      for (const [k, v] of this.data.strings.entries()) bump(k, typeof v === "string" ? v.length : 64)
+      for (const [k, h] of this.data.hashes.entries()) bump(k, h.size * 96)
+      for (const [k, s] of this.data.sets.entries()) bump(k, s.size * 48)
+      for (const [k, l] of this.data.lists.entries()) bump(k, l.length * 96)
+      const top = [...counts.entries()]
+        .sort((a, b) => b[1].approxBytes - a[1].approxBytes)
+        .slice(0, 8)
+        .map(([fam, c]) => `${fam}=${c.n}keys/${(c.approxBytes / 1048576).toFixed(1)}MB`)
+      return top.join(" | ")
+    } catch {
+      return "unavailable"
+    }
+  }
+
   private cleanupExpiredKeys(): number {
     const now = Date.now()
     const ttlMap = this.data.ttl
@@ -1647,7 +1678,7 @@ export async function getAllSettings(): Promise<Record<string, any>> {
 // `getAppSettings()` returns a merged record with `app_settings` winning
 // on conflict (it's the canonical UI-facing key). Missing keys silently
 // fall back to an empty object so callers can use `?? default` patterns.
-// ─────────────────────────────────────────────────────────────────────
+// ─��───────────────────────────────────────────────────────────────────
 
 const APP_SETTINGS_KEY_CANONICAL = "app_settings" as const
 const APP_SETTINGS_KEY_LEGACY    = "all_settings" as const
