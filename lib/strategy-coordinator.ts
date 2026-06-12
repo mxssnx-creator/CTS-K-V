@@ -1767,25 +1767,45 @@ export class StrategyCoordinator {
     let axisSetsAdded = 0
     if (defaultByBaseKey.size > 0) {
       const minPF = metrics.minProfitFactor   // Same gate as Base→Main
-      // Live continuous-count snapshot from the **per-symbol** position
-      // context (continuousCount on `symbolCtx` was already patched to
-      // `ctx.perSymbolOpen[symbol]` at line ~1339). Capping each axis
-      // Set's `entryCount` by this value (inside expandAxisSets) is what
-      // makes the axis fan-out reflect the operator-spec'd "ongoing
-      // continuous count of Pis to be added, counted onto the new sets"
-      // instead of static projections. Per-symbol is correct because
-      // axis Sets and their hedge bucketing are scoped to one symbol.
+      // ── Per-symbol axis fan-out ceiling (OOM-protection) ─────────────
+      // expandAxisSets emits up to AXIS_PREV(5)×AXIS_LAST(4)×AXIS_CONT(8)×
+      // AXIS_DIRS(2)×outcomes(2 while warming up) = 640 Sets PER default
+      // Base. On a fresh bootstrap (no completed history) the prev PF gate
+      // admits neutrally and BOTH outcomes fire, so every default hits that
+      // maximum. With dozens of Base defaults × multiple symbols evaluated
+      // concurrently each cycle, the materialised StrategySet count exploded
+      // into the hundreds of thousands and was then expanded 1:1 into Real
+      // sets — BEFORE the Real-stage 12000 ceiling could apply. That burst
+      // drove RSS 1.5GB→7.3GB in ~60s and OOM-killed the process right as
+      // live trading began. Cap the fan-out PER SYMBOL so memory is bounded;
+      // because AXIS_PREV/AXIS_CONT are iterated ascending, the retained
+      // projections are the highest-priority (smallest prev/cont) ones.
+      const MAIN_AXIS_SETS_CEILING = 6000
+      let axisCapHit = false
       const liveCont = symbolCtx?.continuousCount ?? 0
       // Direction-specific open counts for this symbol — gives expandAxisSets
       // independent liveCont per direction so long and short axis Sets get
       // different entryCount values when one direction is more accumulated.
       const liveContByDir = ctx.perSymbolOpenByDir?.[symbol] ?? { long: 0, short: 0 }
       for (const defaultSet of defaultByBaseKey.values()) {
+        if (axisCapHit) break
         const expanded = this.expandAxisSets(defaultSet, minPF, liveCont, liveContByDir)
         for (const axisSet of expanded) {
           mainSets.push(axisSet)
           axisSetsAdded++
+          if (axisSetsAdded >= MAIN_AXIS_SETS_CEILING) {
+            axisCapHit = true
+            break
+          }
         }
+      }
+      if (axisCapHit) {
+        console.warn(
+          `[v0] [StrategyCoordinator] ${this.connectionId} ${symbol} axis fan-out hit ` +
+          `safety ceiling ${MAIN_AXIS_SETS_CEILING} (OOM-protection); ` +
+          `remaining Base defaults skipped this cycle. Highest-priority ` +
+          `(smallest prev/cont) projections retained.`,
+        )
       }
       if (axisSetsAdded > 0) {
         // Axis fan-out complete — each qualifying default Main variant
