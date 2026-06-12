@@ -436,9 +436,18 @@ export class InlineLocalRedis {
     }
     try {
       for (const [k, v] of this.data.strings.entries()) bump(k, typeof v === "string" ? v.length : 64)
-      for (const [k, h] of this.data.hashes.entries()) bump(k, h.size * 96)
+      for (const [k, h] of this.data.hashes.entries()) {
+        let bytes = 0
+        for (const f in h) bytes += f.length + (h[f]?.length ?? 0) + 32
+        bump(k, bytes)
+      }
       for (const [k, s] of this.data.sets.entries()) bump(k, s.size * 48)
-      for (const [k, l] of this.data.lists.entries()) bump(k, l.length * 96)
+      for (const [k, l] of this.data.lists.entries()) {
+        let bytes = 0
+        for (const item of l) bytes += (item?.length ?? 0) + 16
+        bump(k, bytes)
+      }
+      for (const [k, z] of this.data.sorted_sets.entries()) bump(k, z.length * 64)
       const top = [...counts.entries()]
         .sort((a, b) => b[1].approxBytes - a[1].approxBytes)
         .slice(0, 8)
