@@ -4,6 +4,23 @@ import { getConnection, updateConnection, deleteConnection, initRedis } from "@/
 import { ConnectionDataArchive } from "@/lib/connection-data-archive"
 import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
 
+// SECURITY: never return raw credentials from any handler in this route.
+// Masked values keep the UI informative ("key is set, ends in …abcd") while
+// the PUT/PATCH sanitizers ignore masked/empty values, so round-tripping a
+// fetched connection through an edit dialog can never corrupt stored secrets.
+const maskSecret = (v: unknown) =>
+  typeof v === "string" && v.length > 4 ? `••••${v.slice(-4)}` : v ? "••••" : v
+
+const maskConnectionSecrets = (conn: Record<string, any>) => ({
+  ...conn,
+  ...(conn.api_key !== undefined ? { api_key: maskSecret(conn.api_key) } : {}),
+  ...(conn.api_secret !== undefined ? { api_secret: maskSecret(conn.api_secret) } : {}),
+})
+
+// A value the client sends back that is empty or still masked must never
+// overwrite the stored secret.
+const isMaskedOrEmpty = (v: unknown) => typeof v === "string" && (v === "" || v.includes("••••"))
+
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params
@@ -17,7 +34,9 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       return NextResponse.json({ error: "Connection not found" }, { status: 404 })
     }
 
-    return NextResponse.json(connection, { status: 200 })
+    // Previous code returned the full connection hash including api_key and
+    // api_secret in PLAINTEXT to any caller.
+    return NextResponse.json(maskConnectionSecrets(connection), { status: 200 })
   } catch (error) {
     console.error("[v0] Failed to fetch connection:", error)
     await SystemLogger.logError(error, "api", `GET /api/settings/connections/${(await params).id}`)
@@ -134,10 +153,13 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
     }
 
     const sanitizedBody = { ...body }
-    if (sanitizedBody.api_key === "" && connection.api_key) {
+    // Ignore empty AND masked values (the GET handler returns masked secrets,
+    // so an edit dialog round-trip would otherwise overwrite the real key
+    // with "••••abcd").
+    if (isMaskedOrEmpty(sanitizedBody.api_key) && connection.api_key) {
       delete sanitizedBody.api_key
     }
-    if (sanitizedBody.api_secret === "" && connection.api_secret) {
+    if (isMaskedOrEmpty(sanitizedBody.api_secret) && connection.api_secret) {
       delete sanitizedBody.api_secret
     }
 
@@ -162,7 +184,7 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
 
     await SystemLogger.logConnection(`Connection patched successfully`, id, "info")
 
-    return NextResponse.json({ success: true, connection: updatedConnection })
+    return NextResponse.json({ success: true, connection: maskConnectionSecrets(updatedConnection) })
   } catch (error) {
     console.error("[v0] Failed to patch connection:", error)
     await SystemLogger.logError(error, "api", `PATCH /api/settings/connections/${(await params).id}`)
@@ -204,10 +226,11 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
     } catch { /* non-critical */ }
 
     const sanitizedBody = { ...body }
-    if (sanitizedBody.api_key === "" && connection.api_key) {
+    // Ignore empty AND masked values (see PATCH above).
+    if (isMaskedOrEmpty(sanitizedBody.api_key) && connection.api_key) {
       delete sanitizedBody.api_key
     }
-    if (sanitizedBody.api_secret === "" && connection.api_secret) {
+    if (isMaskedOrEmpty(sanitizedBody.api_secret) && connection.api_secret) {
       delete sanitizedBody.api_secret
     }
 
@@ -230,7 +253,7 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
 
     await SystemLogger.logConnection(`Connection updated successfully`, id, "info")
 
-    return NextResponse.json({ success: true, connection: updatedConnection })
+    return NextResponse.json({ success: true, connection: maskConnectionSecrets(updatedConnection) })
   } catch (error) {
     console.error("[v0] Failed to update connection:", error)
     await SystemLogger.logError(error, "api", `PUT /api/settings/connections/${(await params).id}`)

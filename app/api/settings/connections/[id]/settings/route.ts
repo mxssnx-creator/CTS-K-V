@@ -6,6 +6,7 @@ import { recoordinateAfterSettingsChange } from "@/lib/connection-recoordinator"
 import { getTradeEngine } from "@/lib/trade-engine"
 import { fetchTopSymbols } from "@/lib/top-symbols"
 import { ProgressionStateManager } from "@/lib/progression-state-manager"
+import { toRedisFlag } from "@/lib/boolean-utils"
 
 export async function GET(
   request: NextRequest,
@@ -190,6 +191,15 @@ export async function PATCH(
       // (re)start uses the operator's choice.
       ...(typeof settings.position_mode === "string" ? { position_mode: settings.position_mode } : {}),
       ...(typeof settings.margin_mode === "string" ? { margin_type: settings.margin_mode } : {}),
+      // MODE FLAGS (CRITICAL): is_live_trade / is_testnet / is_preset_trade are
+      // first-class connection flags read by the engine's live-stage on every
+      // cycle (connection.is_live_trade), NOT from connection_settings. The
+      // previous code stored them only inside the nested settings JSON, so
+      // saving Live Trade through this dialog claimed success but the engine
+      // never saw it. Mirror them top-level exactly like position_mode.
+      ...(settings.is_live_trade !== undefined ? { is_live_trade: toRedisFlag(settings.is_live_trade) } : {}),
+      ...(settings.is_testnet !== undefined ? { is_testnet: toRedisFlag(settings.is_testnet) } : {}),
+      ...(settings.is_preset_trade !== undefined ? { is_preset_trade: toRedisFlag(settings.is_preset_trade) } : {}),
       updated_at: new Date().toISOString(),
     }
 

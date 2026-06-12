@@ -30,8 +30,22 @@ import { BASE_CONNECTION_CREDENTIALS } from "@/lib/base-connection-credentials"
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id: connectionId } = await params
   try {
-    const body = await request.json()
-    const isLiveTrade = parseBooleanInput(body?.is_live_trade)
+    const body = await request.json().catch(() => ({}))
+    // Accept both `is_live_trade` and the common `enabled` alias. A request
+    // with NEITHER key must be rejected — the previous code parsed undefined
+    // as `false`, so any malformed/empty body silently DISABLED live trading.
+    const rawFlag = body?.is_live_trade ?? body?.enabled
+    if (rawFlag === undefined || rawFlag === null) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Missing required flag",
+          hint: 'Send {"is_live_trade": true|false} (or "enabled" alias)',
+        },
+        { status: 400 },
+      )
+    }
+    const isLiveTrade = parseBooleanInput(rawFlag)
 
     console.log(`[v0] [LiveTrade] POST for ${connectionId}, is_live_trade=${isLiveTrade}`)
 
@@ -143,12 +157,22 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       { is_live_trade: isLiveTrade, engineStartedNow, engineStatus },
     )
 
+    // SECURITY: never echo raw credentials back to the client. The previous
+    // response included api_key/api_secret in PLAINTEXT.
+    const maskSecret = (v: unknown) =>
+      typeof v === "string" && v.length > 4 ? `••••${v.slice(-4)}` : v ? "••••" : v
+    const safeConnection = {
+      ...updatedConnection,
+      api_key: maskSecret(updatedConnection.api_key),
+      api_secret: maskSecret(updatedConnection.api_secret),
+    }
+
     return NextResponse.json({
       success: true,
       is_live_trade: isLiveTrade,
       engineStatus,
       engineStartedNow,
-      connection: updatedConnection,
+      connection: safeConnection,
       message: `Live Trading ${isLiveTrade ? "enabled" : "disabled"}`,
       connectionName: connName,
       exchange: connection.exchange,

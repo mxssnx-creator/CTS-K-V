@@ -67,7 +67,17 @@ export async function GET(request: NextRequest) {
     console.log(`[v0] [API] [Connections] ${API_VERSION}: Active-inserted (in main panel): ${activeInserted.map(c => c.name).join(', ') || 'none'}`)
     console.log(`[v0] [API] [Connections] ${API_VERSION}: Enabled dashboard: ${connections.filter(c => c.is_enabled_dashboard === "1" || c.is_enabled_dashboard === true).map(c => c.name).join(', ') || 'none'}`)
     
-    return NextResponse.json({ success: true, count: connections.length, connections, version: API_VERSION }, { headers })
+    // SECURITY: never return raw credentials. Previous code returned every
+    // connection's api_key/api_secret in PLAINTEXT to any caller.
+    const maskSecret = (v: unknown) =>
+      typeof v === "string" && v.length > 4 ? `••••${v.slice(-4)}` : v ? "••••" : v
+    const safeConnections = connections.map((c) => ({
+      ...c,
+      ...(c.api_key !== undefined ? { api_key: maskSecret(c.api_key) } : {}),
+      ...(c.api_secret !== undefined ? { api_secret: maskSecret(c.api_secret) } : {}),
+    }))
+
+    return NextResponse.json({ success: true, count: safeConnections.length, connections: safeConnections, version: API_VERSION }, { headers })
   } catch (error) {
     console.error(`[v0] [API] [Connections] ${API_VERSION}: Error:`, error instanceof Error ? error.message : String(error))
     return NextResponse.json({ success: false, error: "Failed to fetch connections", connections: [], version: API_VERSION }, { status: 500, headers: {
