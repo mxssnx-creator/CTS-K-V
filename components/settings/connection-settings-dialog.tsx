@@ -126,10 +126,12 @@ const DEFAULT_INDICATION_PROFILE: ChannelProfile = {
   optimal:   { enabled: false, range: 20, timeout: 60, interval: 5 },
   auto:      { enabled: false, range: 25, timeout: 90, interval: 15 },
 }
+// Operator-spec defaults: base PF 1.0, main/real PF 1.2; max positions
+// raised for high-throughput pipelines (base/main: 5000, real: 2000).
 const DEFAULT_STRATEGY_PROFILE: StrategyChannel = {
-  base: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 2000 },
-  main: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 2000 },
-  real: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 1000 },
+  base: { enabled: true, min_profit_factor: 1.0, max_drawdown_time: 160, max_positions: 5000 },
+  main: { enabled: true, min_profit_factor: 1.2, max_drawdown_time: 160, max_positions: 5000 },
+  real: { enabled: true, min_profit_factor: 1.2, max_drawdown_time: 160, max_positions: 2000 },
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -147,7 +149,9 @@ export function ConnectionSettingsDialog({
 
   // Reset tab to Overview every time the dialog opens so state from a
   // previous session does not persist between open/close cycles.
-  useEffect(() => { if (open) setTab("overview") }, [open])
+  // Track whether settings have been loaded at least once for this dialog
+  // open — guards against the "blank dialog" flash on re-open.
+  useEffect(() => { if (open) { setTab("overview") } }, [open])
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [exchangeKey, setExchangeKey] = useState<string>(exchange)
@@ -155,7 +159,7 @@ export function ConnectionSettingsDialog({
   // ── Overview state ──────────────────────────────────────────────
   const [overview, setOverview] = useState<OverviewSettings>({
     volumeFactorBase: 1.0,
-    volumeFactorLive: 1.0,
+    volumeFactorLive: 2.2,   // operator spec: 2.2 default
     volumeFactorPreset: 1.0,
     marginMode: "cross",
     volumeType: "usdt",
@@ -166,10 +170,11 @@ export function ConnectionSettingsDialog({
   })
 
   // ── Symbols state ───────────────────────────────────────────────
+  // Operator spec: default symbolOrder = volatility_1h, symbolCount = 15
   const [symbolsCfg, setSymbolsCfg] = useState<SymbolsSettings>({
     symbols: [],
-    symbolOrder: "volume_24h",
-    symbolCount: 3,
+    symbolOrder: "volatility_1h",
+    symbolCount: 15,
   })
   const [symbolInput, setSymbolInput] = useState("")
   const [exchangeSymbols, setExchangeSymbols] = useState<string[]>([])
@@ -210,7 +215,8 @@ export function ConnectionSettingsDialog({
           // Use `||` not `??` — Number(null/undefined) is 0 (falsy), not NaN,
           // so `?? 1.0` would never fire on a missing field.
           volumeFactorBase:   Number(settings.volume_factor)        || Number(conn.volume_factor) || 1.0,
-          volumeFactorLive:   Number(settings.volume_factor_live)   || 1.0,
+          // Default 2.2 per operator spec (not 1.0) when no value has been saved yet.
+          volumeFactorLive:   Number(settings.volume_factor_live)   || 2.2,
           volumeFactorPreset: Number(settings.volume_factor_preset) || 1.0,
           marginMode:  (settings.margin_mode || conn.margin_type || "cross") as "cross" | "isolated",
           volumeType:  (settings.volume_type || (conn.api_type === "futures_inverse" ? "contract" : conn.api_type === "spot" ? "spot" : "usdt")) as "usdt" | "contract" | "spot",
@@ -225,6 +231,7 @@ export function ConnectionSettingsDialog({
         setSymbolsCfg(prev => ({
           ...prev,
           symbols:     Array.isArray(settings.symbols) ? settings.symbols : prev.symbols,
+          // Fall through to operator-spec default (volatility_1h / 15) if not set
           symbolOrder: (settings.symbol_order as SymbolOrder) || prev.symbolOrder,
           symbolCount: Number(settings.symbol_count) || prev.symbolCount,
         }))
@@ -553,9 +560,9 @@ export function ConnectionSettingsDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl max-h-[90vh] overflow-hidden flex flex-col p-0">
+      <DialogContent className="max-w-3xl h-[90vh] overflow-hidden flex flex-col p-0">
         {/* Header */}
-        <DialogHeader className="px-5 pt-4 pb-3 border-b">
+        <DialogHeader className="px-5 pt-4 pb-3 border-b shrink-0">
           <div className="flex items-center gap-2">
             <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary/10">
               <Sparkles className="h-4 w-4 text-primary" />
@@ -575,8 +582,8 @@ export function ConnectionSettingsDialog({
         </DialogHeader>
 
         {/* Top Tabs */}
-        <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)} className="flex-1 flex flex-col min-h-0 overflow-hidden">
-          <TabsList className="mx-5 mt-3 grid grid-cols-4 h-9 shrink-0">
+        <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)} className="flex-1 flex flex-col overflow-hidden min-h-0">
+          <TabsList className="mx-5 mt-3 grid grid-cols-4 h-9 shrink-0 z-10">
             <TabsTrigger value="overview" className="text-xs gap-1.5">
               <Activity className="h-3.5 w-3.5" /> Overview
             </TabsTrigger>
@@ -591,7 +598,7 @@ export function ConnectionSettingsDialog({
             </TabsTrigger>
           </TabsList>
 
-          <ScrollArea className="flex-1 min-h-0 px-5 py-4">
+          <ScrollArea className="flex-1 min-h-0 overflow-y-auto px-5 py-4" style={{ overflowY: "auto" }}>
             {loading && (
               <div className="flex items-center justify-center py-12 text-muted-foreground gap-2 text-sm">
                 <Loader2 className="h-4 w-4 animate-spin" /> Loading settings…
@@ -602,6 +609,54 @@ export function ConnectionSettingsDialog({
               <>
                 {/* OVERVIEW ──────────────────────────────────────── */}
                 <TabsContent value="overview" className="mt-0 space-y-5">
+
+                  {/* ── Minimal Position Step — promoted to page 1 per operator spec ─ */}
+                  <SectionHeading icon={Sparkles} title="Minimal Position-Creation Step" subtitle="Minimum step size for pseudo-position windows (Base stage). Controls which indication configs are generated — higher = fewer, smoother signals." />
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <Label className="text-xs">Min Step (3–30)</Label>
+                      <span className="text-xs font-mono tabular-nums font-semibold">{coordination.minStep ?? 5}</span>
+                    </div>
+                    <Slider
+                      min={3} max={30} step={1}
+                      value={[coordination.minStep ?? 5]}
+                      onValueChange={([v]) => setCoordination(p => ({ ...p, minStep: v }))}
+                      className="py-2"
+                    />
+                    <div className="flex justify-between text-[10px] text-muted-foreground">
+                      <span>3 — fast noise</span><span className="text-muted-foreground/60">default 5</span><span>30 — smooth</span>
+                    </div>
+                  </div>
+
+                  <Separator className="my-2" />
+
+                  {/* ── Quick Variant Toggles ─ */}
+                  <SectionHeading icon={Zap} title="Strategy Variants" subtitle="Enable or disable the main categorical variants that run on top of base sets." />
+                  <div className="grid gap-2">
+                    {(["trailing", "block", "dca"] as const).map((key) => {
+                      const labels: Record<string, { label: string; desc: string }> = {
+                        trailing: { label: "Trailing", desc: "Fires on consecutive wins — aggressive momentum follow." },
+                        block:    { label: "Block",    desc: "Add-on entries when continuousCount is 1–2 (independent of axes)." },
+                        dca:      { label: "DCA",      desc: "Dollar-cost averaging after prior losses (independent of axes)." },
+                      }
+                      const enabled = typeof coordination.variants[key] === "boolean" ? coordination.variants[key] : (key !== "dca")
+                      return (
+                        <div key={key} className={`flex items-center justify-between gap-3 rounded-md border px-3 py-2 transition-colors ${enabled ? "border-primary/30 bg-primary/5" : "border-border bg-muted/20"}`}>
+                          <div>
+                            <div className="text-xs font-medium">{labels[key].label}</div>
+                            <div className="text-[10px] text-muted-foreground leading-relaxed">{labels[key].desc}</div>
+                          </div>
+                          <Switch
+                            checked={enabled}
+                            onCheckedChange={(v) => setCoordination(p => ({ ...p, variants: { ...p.variants, [key]: v } }))}
+                          />
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  <Separator className="my-2" />
+
                   <SectionHeading icon={ArrowDownUp} title="Volume Factors" subtitle="Multiplier applied to position size for live and preset channels. Base channel uses internal ratios (system-managed, not configurable)." />
                   <VolumeSlider
                     label="Live"
@@ -764,13 +819,13 @@ export function ConnectionSettingsDialog({
                         <span className="text-xs font-mono tabular-nums">{symbolsCfg.symbolCount}</span>
                       </div>
                       <Slider
-                        min={1} max={25} step={1}
+                        min={1} max={32} step={1}
                         value={[symbolsCfg.symbolCount]}
                         onValueChange={([v]) => setSymbolsCfg(p => ({ ...p, symbolCount: v }))}
                         className="py-2"
                       />
                       <div className="flex justify-between text-[10px] text-muted-foreground">
-                        <span>1</span><span>default 3</span><span>25</span>
+                        <span>1</span><span>default 15</span><span>32</span>
                       </div>
                     </div>
                   </div>
@@ -921,7 +976,7 @@ export function ConnectionSettingsDialog({
           </ScrollArea>
         </Tabs>
 
-        <DialogFooter className="px-5 py-3 border-t bg-muted/30">
+        <DialogFooter className="px-5 py-3 border-t bg-muted/30 shrink-0">
           <Button variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={saving}>
             Cancel
           </Button>

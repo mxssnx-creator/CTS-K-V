@@ -421,7 +421,8 @@ export async function PATCH(
       try {
         const order = String((merged as Record<string, unknown>).symbol_order || "volume_24h")
         const rawCount = Number((merged as Record<string, unknown>).symbol_count)
-        const count = Number.isFinite(rawCount) && rawCount > 0 ? Math.max(1, Math.min(50, Math.floor(rawCount))) : 3
+        // Allow up to 32 symbols per operator spec (quickstart max 32)
+        const count = Number.isFinite(rawCount) && rawCount > 0 ? Math.max(1, Math.min(32, Math.floor(rawCount))) : 15
         const manualList = Array.isArray((merged as Record<string, unknown>).symbols)
           ? ((merged as Record<string, unknown>).symbols as unknown[]).filter(
               (s): s is string => typeof s === "string" && s.length > 0,
@@ -483,36 +484,29 @@ export async function PATCH(
       }
     }
 
-    // ── Progression clean-up on significant settings changes ─────────────────
-    // When the operator changes symbols, live-trade mode, testnet flag, or other
-    // fields that alter what the progression computes, we must clean the previous
-    // progress BEFORE the engine hot-reloads — otherwise the dashboard shows a
-    // blended timeline spanning two different configurations (old symbols + old PF
-    // output mixed with new-config output). `recoordinateForActualOne` compares the
-    // stored snapshot against the current live state and archives + resets the
-    // progression hash when a mismatch is detected, producing a fresh, solid
-    // progression aligned to the new configuration.
+    // ── Progression clean-up ONLY on symbol/mode changes (not PF/coordination) ────────
+    // Archive + restart progression ONLY when the actual symbols or trade-mode flags
+    // change — not on PF / DDT / coordination adjustments which are per-cycle settings
+    // that take effect immediately via the hot-reload path. Aggressively archiving on
+    // every save caused: (a) the connection to appear "gone" briefly (progression key
+    // deleted mid-poll), (b) prehistoric re-run for every PF slider touch, (c) counts
+    // reset to 0 just because the operator opened and saved the dialog.
     //
-    // Fields that trigger this: anything that changes what symbols the engine runs,
-    // or that changes the code-path (live/testnet/preset mode, connection method,
-    // margin type, position mode). Pure cosmetic changes (name, UI labels) skip it.
-    const significantKeys = [
-      "symbols", "symbol_order", "symbol_count", "active_symbols",
+    // SAFE to recoordinate when: symbols list changed, symbol count changed,
+    // live/testnet mode flipped, or connection_method changed. NOT on PF/DDT/axis
+    // changes, coordination, volume_factor, position_mode, margin_mode alone.
+    const symbolsModeKeys = [
+      "symbols", "symbol_order", "symbol_count",
       "is_live_trade", "is_testnet", "is_preset_trade",
-      "connection_method", "margin_mode", "margin_type", "position_mode",
+      "connection_method",
     ]
-    const touchedSignificant = significantKeys.some((k) =>
+    const symbolsModeChanged = symbolsModeKeys.some((k) =>
       Object.prototype.hasOwnProperty.call(settings, k)
     )
-    if (touchedSignificant) {
+    if (symbolsModeChanged) {
       try {
-        // Allow the symbol resolver above to finish writing to Redis BEFORE
-        // we compare snapshots — use setImmediate to yield to any in-flight
-        // microtask queue flush, then call recoordinate synchronously.
         await ProgressionStateManager.recoordinateForActualOne(id)
       } catch (recoordErr) {
-        // Non-fatal: the engine will still hot-reload with the new settings;
-        // we just won't have wiped the old progression hash.
         console.warn(
           `[v0] [Settings PATCH] recoordinateForActualOne failed for ${id} (non-fatal):`,
           recoordErr instanceof Error ? recoordErr.message : String(recoordErr),

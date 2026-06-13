@@ -80,6 +80,14 @@ const PROTECTED_PREFIXES = [
   "progression:",         // Progression metadata (coordination framework)
   "strategy_count:",      // Strategy count tracking (coordination framework)
   "pi_history:",          // Position history structure (coordination framework - base structure only, data will be cleared separately)
+  // ── Live positions — MUST survive a DB clear ──────────────────────
+  // When the operator clears progressions with open exchange positions,
+  // the new engine session adopts them via orphan-adoption on the first
+  // live-stage sync cycle. If these keys are deleted, the engine has no
+  // record of the open positions and the exchange holds them abandoned.
+  // Keeping them means a fresh engine start finds and tracks them.
+  "live:position:",       // Per-position JSON store (live:position:{id})
+  "live:positions:",      // Open/closed index LISTs (live:positions:{connId}, live:positions:{connId}:closed)
 ] as const
 
 // FORCE-CLEAR: prefixes that LOOK like they're protected but are pure
@@ -215,17 +223,21 @@ export async function POST() {
       const { getAllConnections, updateConnection } = await import("@/lib/redis-db")
       const conns = await getAllConnections()
       for (const c of conns) {
+        // Preserve is_live_trade and is_preset_trade so the engine can
+        // continue monitoring open positions on the next start. Also preserve
+        // is_active_inserted / is_assigned so the connection stays visible
+        // in the main panel after the reset (operator re-enables via Start).
         await updateConnection(c.id, {
           ...c,
           is_enabled_dashboard: "0",
           is_active: "0",
-          is_active_inserted: "0",
-          is_assigned: "0",
-          is_live_trade: "0",
-          is_preset_trade: "0",
           paused_by_global: "0",
           paused_preset_by_global: "0",
           updated_at: new Date().toISOString(),
+          // NOTE: is_live_trade, is_preset_trade, is_active_inserted,
+          // is_assigned are INTENTIONALLY preserved so:
+          //   • Live positions can be adopted on the next engine start.
+          //   • The connection card remains visible in the main panel.
         })
       }
       console.log(`[v0] [ClearProgressions] reset runtime flags on ${conns.length} connections (all disabled)`)

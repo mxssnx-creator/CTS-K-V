@@ -124,7 +124,12 @@ export interface CoordinationSettings {
   minStep: number
 }
 
-/** Spec-aligned defaults — match the constants in strategy-coordinator.ts. */
+/**
+ * Operator-spec defaults.
+ * - trailing: on, block: on, dca: off (per directive)
+ * - minStep: 5 (default; range 3-30)
+ * - PF defaults set in DEFAULT_STRATEGY_PROFILE (base=1.0, main/real=1.2)
+ */
 export const DEFAULT_COORDINATION_SETTINGS: CoordinationSettings = {
   axes: {
     prev:  { enabled: true,  maxWindow: 12 },
