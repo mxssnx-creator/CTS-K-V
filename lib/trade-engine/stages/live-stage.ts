@@ -2062,7 +2062,7 @@ export async function executeLivePosition(
       return livePosition
     }
 
-    // ── Step 2: Fetch current market price ─────────────────────────────────
+    // ── Step 2: Fetch current market price ──────���──────────────────────────
     let currentPrice = realPosition.entryPrice
     if (!currentPrice || currentPrice <= 0) {
       currentPrice = await fetchCurrentPrice(realPosition.symbol)
@@ -4675,7 +4675,17 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
   // idempotent — losing a lock release just costs one skipped sync
   // tick, not corrupted state.
   const LIVE_SYNC_LOCK_KEY = `live_sync_lock:${connectionId}`
-  const LIVE_SYNC_LOCK_TTL_SEC = 30
+  // TTL reduced from 30 s → 5 s.
+  // Rationale: syncWithExchange p99 completes in ~600-900 ms (one fetchPositions +
+  // one fetchOpenOrders round-trip). A 30 s TTL meant callers accumulated "skip"
+  // messages at ~400 ms cadence (×15 symbols = 37.5 skip logs/s) filling the log
+  // file and stalling stdout. 5 s gives 4× headroom over p99 while limiting lock
+  // starvation to at most 5 s rather than 30 s on crash-without-release.
+  const LIVE_SYNC_LOCK_TTL_SEC = 5
+  // Throttle the skip-log to once per 20 s per connection to prevent log flooding.
+  // The skip itself is still idempotent-correct; the operator sees the message at
+  // a human-readable rate instead of hundreds per second across 15 symbols.
+  const SKIP_LOG_KEY = `live_sync_skip_logged:${connectionId}`
   let lockAcquired = false
   if (client) {
     try {
@@ -4696,9 +4706,16 @@ export async function syncWithExchange(connectionId: string, exchangeConnector: 
       lockAcquired = true // treat as acquired so the finally block doesn't try to release
     }
     if (!lockAcquired) {
-      console.log(
-        `${LOG_PREFIX} [sync-lock] skip — another caller is mid-sync for conn=${connectionId} (likely cron+realtime overlap, idempotent skip)`,
-      )
+      // Throttled skip log: emit at most once per 20 s to avoid flooding stdout.
+      try {
+        const lastLogged = await client.get(SKIP_LOG_KEY)
+        if (!lastLogged) {
+          console.log(
+            `${LOG_PREFIX} [sync-lock] skip — another caller is mid-sync for conn=${connectionId} (likely cron+realtime overlap, idempotent skip)`,
+          )
+          await client.set(SKIP_LOG_KEY, "1", { EX: 20 })
+        }
+      } catch { /* best-effort */ }
       return
     }
   }

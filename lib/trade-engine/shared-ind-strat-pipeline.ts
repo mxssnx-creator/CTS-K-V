@@ -377,17 +377,17 @@ export async function runIndStratCycle(
       result.strategiesEvaluated = stratResult.strategiesEvaluated || 0
       result.liveReady = stratResult.liveReady || 0
 
-      // ── Phase 4: Execute ready Real Sets as live orders (realtime only) ──
-      if (mode === "realtime" && result.liveReady > 0 && deps?.liveStage) {
-        try {
-          await executeReadyStrategiesAsLiveOrders(connectionId, symbol, deps.liveStage)
-        } catch (err) {
-          console.error(
-            `[v0] [SharedPipeline] Live order execution error:`,
-            err instanceof Error ? err.message : String(err),
-          )
-        }
-      }
+      // ── Phase 4: REMOVED — live dispatch is handled exclusively by Phase 3 ──
+      // `processStrategy → StrategyCoordinator.createLiveSets` already dispatches
+      // exactly 1 executeLivePosition call per direction (the highest-PF qualifying
+      // Real Set). Running Phase 4 here caused a DOUBLE DISPATCH every cycle:
+      //   Phase 3 → dispatches L+S → dedup lock acquired for both directions
+      //   Phase 4 → reads real:sets → attempts L+S again → dedup lock skips them
+      //             but still burns 3-5 Redis round-trips × 2 × N symbols per cycle.
+      // With 15 symbols × 2 directions = 60 wasted round-trips per cycle at ~1Hz.
+      // The secondary `executeReadyStrategiesAsLiveOrders` function below is kept
+      // for now (it is still exported and may be invoked from other callers) but is
+      // no longer called from this cycle hot-path.
     }
   } catch (err) {
     result.error = err instanceof Error ? err.message : String(err)

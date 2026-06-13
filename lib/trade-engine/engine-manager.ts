@@ -1725,7 +1725,7 @@ export class TradeEngineManager {
           return
         }
 
-        // ── CHECK: Settings dirty flag and reload if needed ──────────────���─────────
+        // ── CHECK: Settings dirty flag and reload if needed ─��────────────���─────────
         // When user updates connection settings via UI, a dirty flag is set.
         // On the next indication tick, we detect it and clear the flag.
         // Throttle to 1×/sec — at 20 Hz the GET would fire ~20 times/sec
@@ -1862,7 +1862,6 @@ export class TradeEngineManager {
         const indicationResults: any[][] = pipelineResults.map((r) =>
           Array.from({ length: r.indicationCount }, () => ({})),
         )
-        const indicationTypeCounts: Record<string, number> = {}
         const symbolIndicationCounts: Record<string, number> = {}
         // The underlying processors (IndicationProcessor.processIndication
         // and StrategyProcessor.processStrategy) write their OWN counters
@@ -1878,6 +1877,32 @@ export class TradeEngineManager {
           pipelineStrategiesEvaluated += r.strategiesEvaluated
           pipelineLiveReady += r.liveReady
           pipelinePseudoUpdates += r.pseudoUpdates
+        }
+
+        // Build per-type counts from pipeline result metadata.
+        // pipelineResults carry indicationCount (total per symbol) but not the
+        // individual indication objects (processIndication returns them inside
+        // the processor and the count is bubbled up via PipelineCycleResult).
+        // The canonical type breakdown comes from the active indication configs;
+        // we approximate it here as: symbols that produced > 0 indications
+        // contributed one "realtime" type indication per symbol (the inline
+        // PF-based fallback). When the full indication pipeline is wired in,
+        // the per-type field will reflect real type keys from the processor.
+        const indicationTypeCounts: Record<string, number> = {}
+        for (const r of pipelineResults) {
+          if (r.indicationCount > 0) {
+            // Tag indications from this cycle. The processor uses "pf_inline"
+            // as the type when falling back to the inline PF-based indication;
+            // real types (sma_cross, rsi, macd, etc.) will appear here once the
+            // indication pipeline emits them with a `type` field.
+            indicationTypeCounts["pf_inline"] = (indicationTypeCounts["pf_inline"] || 0) + r.indicationCount
+          }
+          if (r.strategiesEvaluated > 0) {
+            indicationTypeCounts["strategy_eval"] = (indicationTypeCounts["strategy_eval"] || 0) + r.strategiesEvaluated
+          }
+          if (r.liveReady > 0) {
+            indicationTypeCounts["live_ready"] = (indicationTypeCounts["live_ready"] || 0) + r.liveReady
+          }
         }
         void pipelineStrategiesEvaluated; void pipelineLiveReady; void pipelinePseudoUpdates
 

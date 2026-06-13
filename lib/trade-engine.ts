@@ -236,6 +236,23 @@ export class GlobalTradeEngineCoordinator {
       // finally-block doesn't try to break it on success.
       lockHandle = undefined
       console.log(`[v0] [STARTUP LOCK] TradeEngine successfully started for connection: ${connectionId}`)
+
+      // ── Mark connection as active-inserted now that engine is live ────
+      // is_active_inserted controls the "Active Connections" panel on the
+      // dashboard. The migration seeds it as "0" (operator hasn't inserted
+      // it yet). Flip it to "1" on first successful engine start so the
+      // dashboard card moves into the Active panel automatically — the
+      // operator pressed Start, which is the explicit activation event.
+      // Idempotent: repeated starts on an already-active connection are safe.
+      try {
+        const { getRedisClient: _rc } = await import("@/lib/redis-db")
+        const _cl = _rc()
+        await _cl.hset(`connection:${connectionId}`, {
+          is_active_inserted:  "1",
+          is_active:           "1",
+          updated_at:          new Date().toISOString(),
+        })
+      } catch { /* non-critical — dashboard can lag */ }
     } catch (err) {
       // On startup failure, give the lock back so a retry can succeed
       // without waiting for the TTL to expire. We use force-break
@@ -292,7 +309,16 @@ export class GlobalTradeEngineCoordinator {
       try {
         const { getRedisClient } = await import("@/lib/redis-db")
         const redisClient = getRedisClient()
-        await redisClient.del(`engine_is_running:${connectionId}`)
+        await Promise.all([
+          redisClient.del(`engine_is_running:${connectionId}`),
+          // Flip is_active_inserted back to "0" so the dashboard card
+          // returns to the Connections panel on stop (mirrors the start path above).
+          redisClient.hset(`connection:${connectionId}`, {
+            is_active_inserted: "0",
+            is_active:          "0",
+            updated_at:         new Date().toISOString(),
+          }),
+        ])
         console.log(`[v0] ✓ Cleared engine_is_running flag for ${connectionId}`)
       } catch (redisErr) {
         console.warn(`[v0] [STOP LOCK] Could not clear engine_is_running flag for ${connectionId}:`, redisErr)

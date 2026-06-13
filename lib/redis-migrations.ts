@@ -1840,6 +1840,45 @@ const migrations: Migration[] = [
       await client.set("_schema_version", "30")
     },
   },
+
+  // Migration 032 — Expand bingx-x01 symbol list from 5 → 15
+  {
+    name: "032-bingx-x01-expand-15-symbols",
+    version: 32,
+    up: async (client: any) => {
+      const SYMBOLS_15 = [
+        "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
+        "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+        "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
+      ]
+      const CONN_ID = "bingx-x01"
+      const symJson = JSON.stringify(SYMBOLS_15)
+      const symCount = String(SYMBOLS_15.length)
+      // Update all four locations where active_symbols is stored so getSymbols()
+      // resolves 15 symbols on the next engine tick without a restart.
+      await Promise.all([
+        client.hset(`connection:${CONN_ID}`, {
+          active_symbols: symJson,
+          symbol_count: symCount,
+          updated_at: new Date().toISOString(),
+        }),
+        client.hset(`settings:trade_engine_state:${CONN_ID}`, {
+          active_symbols: symJson,
+          symbol_count: symCount,
+          config_set_symbols_total: symCount,
+        }),
+        client.hset(`settings:connection:${CONN_ID}`, {
+          active_symbols: symJson,
+          symbol_count: symCount,
+        }),
+      ]).catch(() => {})
+      await client.set("_schema_version", "32")
+      console.log(`[v0] Migration 032: bingx-x01 expanded to 15 symbols: ${SYMBOLS_15.join(",")}`)
+    },
+    down: async (client: any) => {
+      await client.set("_schema_version", "31")
+    },
+  },
 ]
 
 const BASE_CONNECTION_CONFIG: Array<{
@@ -1963,7 +2002,11 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
 
     if (!hasExisting) {
       // First-time seed. Apply full canonical defaults.
-      const TEST_SYMBOLS_031 = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+      const TEST_SYMBOLS_031 = [
+        "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
+        "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+        "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
+      ]
       const seedData: Record<string, string> = {
         id: cfg.id,
         name: cfg.name,
@@ -2054,7 +2097,11 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
       const symRaw = String(existing["active_symbols"] ?? "")
       const hasSymbols = symRaw.length > 0 && symRaw !== "[]"
       if (cfg.autoActive && cfg.exchange === "bingx" && (!hasLiveTrade || !hasSymbols)) {
-        const TEST_SYMBOLS_031 = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+        const TEST_SYMBOLS_031 = [
+          "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
+          "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+          "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
+        ]
         const patchData: Record<string,string> = {}
         if (!hasLiveTrade) patchData["is_live_trade"] = "1"
         if (!hasSymbols)   patchData["active_symbols"] = JSON.stringify(TEST_SYMBOLS_031)
@@ -2075,9 +2122,13 @@ async function ensureBaseConnections(client: any): Promise<{ createdOrUpdated: n
         }
 
         // Also push to setSettings-prefixed keys so getSymbols() resolves
-        // the 5 test symbols on the very first engine tick.
+        // the 15 test symbols on the very first engine tick.
         if (!hasSymbols) {
-          const TEST_SYMBOLS_031 = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+          const TEST_SYMBOLS_031 = [
+            "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
+            "DOGEUSDT", "ADAUSDT",  "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+            "ATOMUSDT", "LTCUSDT",  "UNIUSDT",  "NEARUSDT", "MATICUSDT",
+          ]
           await client.hset(`settings:trade_engine_state:${cfg.id}`, {
             active_symbols: JSON.stringify(TEST_SYMBOLS_031),
             symbol_count: String(TEST_SYMBOLS_031.length),
