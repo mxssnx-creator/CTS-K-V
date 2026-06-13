@@ -1841,10 +1841,11 @@ const migrations: Migration[] = [
     },
   },
 
-  // Migration 032 — Expand bingx-x01 symbol list from 5 → 15
+  // Migration 033 — Expand bingx-x01 to 15 symbols + write force_symbols override
+  // (supersedes v32 which lacked force_symbols; bumped so existing DBs re-run)
   {
-    name: "032-bingx-x01-expand-15-symbols",
-    version: 32,
+    name: "033-bingx-x01-force-15-symbols",
+    version: 33,
     up: async (client: any) => {
       const SYMBOLS_15 = [
         "BTCUSDT",  "ETHUSDT",  "SOLUSDT",  "BNBUSDT",  "XRPUSDT",
@@ -1854,29 +1855,68 @@ const migrations: Migration[] = [
       const CONN_ID = "bingx-x01"
       const symJson = JSON.stringify(SYMBOLS_15)
       const symCount = String(SYMBOLS_15.length)
-      // Update all four locations where active_symbols is stored so getSymbols()
-      // resolves 15 symbols on the next engine tick without a restart.
+      // Write `force_symbols` — the highest-priority field in getSymbols().
+      // Unlike `active_symbols` / `symbols`, `force_symbols` is NEVER written
+      // by the engine startup path, so it cannot be silently overwritten when
+      // the live BingX connection returns a different set (e.g. 12 exchange
+      // symbols from the user's actual account).  getSymbols() checks this
+      // field first and returns early, skipping all other fallbacks.
       await Promise.all([
         client.hset(`connection:${CONN_ID}`, {
           active_symbols: symJson,
-          symbol_count: symCount,
-          updated_at: new Date().toISOString(),
+          force_symbols:  symJson,
+          symbol_count:   symCount,
+          updated_at:     new Date().toISOString(),
         }),
         client.hset(`settings:trade_engine_state:${CONN_ID}`, {
-          active_symbols: symJson,
-          symbol_count: symCount,
+          active_symbols:        symJson,
+          force_symbols:         symJson,
+          symbols:               symJson,
+          symbol_count:          symCount,
           config_set_symbols_total: symCount,
         }),
         client.hset(`settings:connection:${CONN_ID}`, {
           active_symbols: symJson,
-          symbol_count: symCount,
+          force_symbols:  symJson,
+          symbol_count:   symCount,
         }),
       ]).catch(() => {})
-      await client.set("_schema_version", "32")
-      console.log(`[v0] Migration 032: bingx-x01 expanded to 15 symbols: ${SYMBOLS_15.join(",")}`)
+      await client.set("_schema_version", "33")
+      console.log(`[v0] Migration 033: bingx-x01 force_symbols set to 15 symbols: ${SYMBOLS_15.join(",")}`)
+
+      // Invalidate the running engine's symbol cache so the next cycle picks up
+      // force_symbols immediately rather than waiting for the 5-second TTL.
+      // Also update the progression snapshot so the status API reflects 15 symbols.
+      try {
+        const { getTradeEngine } = await import("@/lib/trade-engine")
+        const coordinator = getTradeEngine()
+        // invalidateSymbolsCacheForConnection is the public coordinator API;
+        // fall back silently if the running engine doesn't expose it (non-critical
+        // since the 5-second TTL will expire before the next cycle anyway).
+        if (coordinator && typeof (coordinator as any).invalidateSymbolsCacheForConnection === "function") {
+          ;(coordinator as any).invalidateSymbolsCacheForConnection(CONN_ID)
+          console.log(`[v0] Migration 033: invalidated symbol cache on running engine`)
+        }
+      } catch { /* engine may not be running — safe to ignore */ }
+
+      // Stamp a fresh progression snapshot so status API shows 15 symbols.
+      await client.hset(`progression:${CONN_ID}`, {
+        symbol_count:                 symCount,
+        active_symbols_hash:          SYMBOLS_15.sort().join("|"),
+        started_for_settings_version: new Date().toISOString(),
+        progress_settings_snapshot:   JSON.stringify({
+          symbol_count:      Number(symCount),
+          symbols_hash:      SYMBOLS_15.sort().join("|"),
+          is_live_trade:     "1",
+          is_preset_trade:   "0",
+          live_volume_factor: "1",
+          connection_method: "library",
+          updated_at:        new Date().toISOString(),
+        }),
+      }).catch(() => {})
     },
     down: async (client: any) => {
-      await client.set("_schema_version", "31")
+      await client.set("_schema_version", "32")
     },
   },
 ]

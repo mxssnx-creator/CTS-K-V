@@ -3424,6 +3424,21 @@ export class TradeEngineManager {
         ])
 
         if (connState && typeof connState === "object") {
+          // ── Highest priority: force_symbols set by migrations/admin ────────
+          // Migration 032 writes `force_symbols` to prevent the engine startup
+          // path from overwriting it with exchange-fetched symbols. This key is
+          // NEVER written by the engine itself, only by migrations and the admin
+          // API — so it always reflects the operator's intended symbol override.
+          let forceSymbols = (connState as any).force_symbols
+          if (typeof forceSymbols === "string") {
+            try { forceSymbols = JSON.parse(forceSymbols) } catch { /* ignore */ }
+          }
+          if (Array.isArray(forceSymbols) && forceSymbols.length > 0) {
+            console.log(`[v0] [getSymbols] ${this.connectionId}: using force_symbols (${forceSymbols.length} symbols from migration/admin override)`)
+            return forceSymbols
+          }
+
+          // ── Secondary: self-written symbols from previous engine start ─────
           let connSymbols = (connState as any).symbols || (connState as any).active_symbols
           // The settings PATCH route and updateEngineState write this field as a
           // JSON.stringify'd array (the emulator stores hash values as strings).

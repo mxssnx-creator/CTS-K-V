@@ -395,6 +395,20 @@ export class GlobalTradeEngineCoordinator {
   }
 
   /**
+   * Invalidate the symbol cache on a running engine so it re-reads
+   * force_symbols / active_symbols from Redis on the next cycle.
+   * Called by migration 033 after writing force_symbols to ensure the
+   * live engine adopts the 15-symbol set without a full restart.
+   */
+  public invalidateSymbolsCacheForConnection(connectionId: string): void {
+    const manager = this.engineManagers.get(connectionId)
+    if (manager) {
+      manager.invalidateSymbolsCache()
+      console.log(`[v0] [Coordinator] invalidated symbol cache for ${connectionId}`)
+    }
+  }
+
+  /**
    * Restart an engine using its stored connection config — used by the
    * watchdog escalation path after a confirmed stall. Loads the same
    * settings the normal start flow would (per-connection intervals
