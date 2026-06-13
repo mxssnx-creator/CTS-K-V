@@ -20,9 +20,25 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     await initRedis()
     const client = getRedisClient()
 
-    const position = await client.hgetall(`position:${connectionId}:${positionId}`)
-    
-    if (!position || Object.keys(position).length === 0) {
+    // Live positions are stored as JSON strings at live:position:{id}.
+    // The id from live-stage always starts with "live:" (e.g. "live:bingx-x01:BTCUSDT:long:...").
+    // Try the live store first, then fall back to the legacy hash.
+    let position: any = null
+
+    const liveRaw = await client.get(`live:position:${positionId}`).catch(() => null)
+    if (liveRaw) {
+      try { position = JSON.parse(liveRaw) } catch { /* fall through */ }
+    }
+
+    if (!position) {
+      // Fallback: legacy hash store (non-live / manually created positions)
+      const hash = await client.hgetall(`position:${connectionId}:${positionId}`).catch(() => null)
+      if (hash && Object.keys(hash).length > 0) {
+        position = { ...hash }
+      }
+    }
+
+    if (!position) {
       return NextResponse.json(
         { success: false, error: "Position not found" },
         { status: 404 }
@@ -68,9 +84,18 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
     await initRedis()
     const client = getRedisClient()
 
-    // Get current position
-    const position = await client.hgetall(`position:${connection_id}:${positionId}`)
-    if (!position || Object.keys(position).length === 0) {
+    // Try live store first, then legacy hash.
+    let isLive = false
+    let position: any = null
+    const liveRaw = await client.get(`live:position:${positionId}`).catch(() => null)
+    if (liveRaw) {
+      try { position = JSON.parse(liveRaw); isLive = true } catch { /* fall through */ }
+    }
+    if (!position) {
+      const hash = await client.hgetall(`position:${connection_id}:${positionId}`).catch(() => null)
+      if (hash && Object.keys(hash).length > 0) position = { ...hash }
+    }
+    if (!position) {
       return NextResponse.json({ success: false, error: "Position not found" }, { status: 404 })
     }
 
@@ -95,8 +120,17 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
     
     updates.updated_at = new Date().toISOString()
 
-    // Update position
-    await client.hset(`position:${connection_id}:${positionId}`, updates)
+    // Write back to the correct store
+    if (isLive) {
+      const updated = { ...position, ...updates, updatedAt: Date.now() }
+      try {
+        await client.set(`live:position:${positionId}`, JSON.stringify(updated), ({ ex: 7 * 24 * 60 * 60 } as any))
+      } catch {
+        await client.set(`live:position:${positionId}`, JSON.stringify(updated))
+      }
+    } else {
+      await client.hset(`position:${connection_id}:${positionId}`, updates)
+    }
 
     await logProgressionEvent(
       connection_id,
@@ -139,16 +173,25 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
     await initRedis()
     const client = getRedisClient()
 
-    // Get position for details and validation
-    const position = await client.hgetall(`position:${connectionId}:${positionId}`)
-    if (!position || Object.keys(position).length === 0) {
+    // Try live store first, then legacy hash.
+    let isLivePosition = false
+    let position: any = null
+    const liveRawD = await client.get(`live:position:${positionId}`).catch(() => null)
+    if (liveRawD) {
+      try { position = JSON.parse(liveRawD); isLivePosition = true } catch { /* fall through */ }
+    }
+    if (!position) {
+      const hash = await client.hgetall(`position:${connectionId}:${positionId}`).catch(() => null)
+      if (hash && Object.keys(hash).length > 0) {
+        position = { ...hash }
+        isLivePosition = !!(position.connectionId && (position.orderId || position.status === "filled"))
+      }
+    }
+    if (!position) {
       return NextResponse.json({ success: false, error: "Position not found" }, { status: 404 })
     }
 
     console.log(`[v0] [PositionsAPI] DELETE: Closing position ${positionId} via API (reason: ${closeReason})`)
-
-    // Determine if this is a live position or pseudo position by checking for live-position markers
-    const isLivePosition = position.connectionId && (position.orderId || position.status === "filled")
     
     if (isLivePosition && closePrice) {
       // For live positions with close price, use the live-stage close logic

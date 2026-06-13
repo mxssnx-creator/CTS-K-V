@@ -25,37 +25,49 @@ export async function GET(request: NextRequest) {
     }
 
     const client = getRedisClient()
-    
-    // Get all position IDs for this connection
-    const positionIds = await client.smembers(`positions:${connectionId}`)
-    
-    if (!positionIds || positionIds.length === 0) {
-      return NextResponse.json({
-        success: true,
-        data: [],
-        count: 0,
-        total: 0,
-        limit,
-        offset,
-        duration: Date.now() - startTime,
-      })
-    }
 
-    // Fetch and filter positions (batch processing)
+    // Fetch live positions from the live-stage index (primary store).
+    // live-stage stores positions as JSON strings at live:position:{id}
+    // with an open-index LIST at live:positions:{connId}.
     const positions: any[] = []
     let processed = 0
-    
-    for (const posId of positionIds) {
-      const pos = await client.hgetall(`position:${connectionId}:${posId}`)
-      if (!pos || Object.keys(pos).length === 0) continue
-      
+
+    // --- Primary: live positions open index (LIST) ---
+    const liveOpenIds = await client.lrange(`live:positions:${connectionId}`, 0, -1).catch(() => [] as string[])
+    for (const posId of liveOpenIds) {
+      const raw = await client.get(`live:position:${posId}`).catch(() => null)
+      if (!raw) continue
+      let pos: any
+      try { pos = JSON.parse(raw) } catch { continue }
       processed++
-      
-      // Apply filters
+      if (status !== "all" && status !== "open" && pos.status !== status) continue
+      if (symbol && pos.symbol !== symbol) continue
+      positions.push({ ...pos, id: posId, _source: "live_open" })
+    }
+
+    // --- Secondary: live positions closed index (LIST), only when status filter allows ---
+    if (status === "all" || status === "closed") {
+      const closedIds = await client.lrange(`live:positions:${connectionId}:closed`, 0, 99).catch(() => [] as string[])
+      for (const posId of closedIds) {
+        const raw = await client.get(`live:position:${posId}`).catch(() => null)
+        if (!raw) continue
+        let pos: any
+        try { pos = JSON.parse(raw) } catch { continue }
+        processed++
+        if (symbol && pos.symbol !== symbol) continue
+        positions.push({ ...pos, id: posId, _source: "live_closed" })
+      }
+    }
+
+    // --- Tertiary: legacy positions SET (non-live, manually created via POST) ---
+    const legacyIds = await client.smembers(`positions:${connectionId}`).catch(() => [] as string[])
+    for (const posId of legacyIds) {
+      const pos = await client.hgetall(`position:${connectionId}:${posId}`).catch(() => null)
+      if (!pos || Object.keys(pos).length === 0) continue
+      processed++
       if (status !== "all" && pos.status !== status) continue
       if (symbol && pos.symbol !== symbol) continue
-      
-      positions.push({ ...pos, id: posId })
+      positions.push({ ...pos, id: posId, _source: "legacy" })
     }
 
     // Apply pagination
