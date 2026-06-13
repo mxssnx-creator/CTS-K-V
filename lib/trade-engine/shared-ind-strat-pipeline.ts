@@ -117,9 +117,25 @@ async function executeReadyStrategiesAsLiveOrders(
     const { getSettings, setSettings } = await import("@/lib/redis-db")
     const { executeLivePosition } = liveStageExports
 
-    const realKey = `strategies:${connectionId}:${symbol}:real:sets`
-    const stored = await getSettings(realKey)
-    const realSets = stored?.sets || []
+    const realKey    = `strategies:${connectionId}:${symbol}:real:sets`
+    const stored     = await getSettings(realKey) as any
+    let realSets: any[] = []
+
+    if (stored && typeof stored === "object") {
+      if (stored._slim && Array.isArray(stored.setKeys)) {
+        // ── Slim format: resolve full Sets from Base (Step 5 of coord plan) ──
+        // Real/Live keys are now written as slim { setKeys[], _slim:true } blobs.
+        // Base sets are the single authoritative source for entries+quality data.
+        const baseKey  = `strategies:${connectionId}:${symbol}:base:sets`
+        const baseSt   = await getSettings(baseKey) as any
+        const baseArr: any[] = Array.isArray(baseSt?.sets) ? baseSt.sets : []
+        const keySet   = new Set<string>(stored.setKeys as string[])
+        realSets       = baseArr.filter((s: any) => keySet.has(s.setKey))
+      } else {
+        // Legacy full-blob format — tolerate during rollout.
+        realSets = Array.isArray(stored.sets) ? stored.sets : []
+      }
+    }
 
     if (realSets.length === 0) return
 

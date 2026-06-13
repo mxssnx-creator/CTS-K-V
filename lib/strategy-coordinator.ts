@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ── Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─�� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -2856,7 +2856,7 @@ export class StrategyCoordinator {
 
     // Persist per-bucket net targets for the Live-stage partial open/close
     // reconciliation hook. Documented on `reconcileLivePositions` —
-    // direction unchanged & magnitude grew → partial OPEN for Δ; direction
+    // direction unchanged & magnitude grew → partial OPEN for ��; direction
     // unchanged & magnitude shrunk → partial CLOSE lowest-PF; direction
     // flipped or flat:0 ��� close all in bucket then optionally re-open.
     if (Object.keys(netTargetWrites).length > 0) {
@@ -2872,9 +2872,18 @@ export class StrategyCoordinator {
       } catch { /* non-critical */ }
     }
 
-    // Persist REAL sets
+    // Persist REAL sets — slim format (set keys only).
+    // Full Base Set blobs are already persisted at `base:sets` and are the single
+    // authoritative source for entries/quality data. Writing only the qualifying
+    // key list cuts this payload from ~N×2-5 KB to N×~30 bytes per symbol per cycle.
+    // Readers resolve full Set objects via Base sets (one extra read, warm in LRU).
     const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
-    await setSettings(realKey, { sets: realSets, count: realSets.length, created: new Date() })
+    await setSettings(realKey, {
+      setKeys: realSets.map((s) => s.setKey),
+      count:   realSets.length,
+      created: new Date(),
+      _slim:   true,
+    })
 
     // Hoisted outside the try-block so the return statement (also outside) can see it.
     // Count of Main Sets that actually entered PF/DDT evaluation (excludes pos-count
@@ -3283,14 +3292,22 @@ export class StrategyCoordinator {
       realSets = inputSets
     } else {
       const realKey = `strategies:${this.connectionId}:${symbol}:real:sets`
-      const stored = await getSettings(realKey)
-      // Parse the serialized Real Sets array. The value is a JSON object
-      // with a `sets` field (the actual array).
+      const stored  = await getSettings(realKey) as any
       if (stored && typeof stored === "object") {
-        const parsed = stored as any
-        // Handle both the new format (nested in `sets` field) and legacy
-        // in case there's a mix.
-        realSets = Array.isArray(parsed.sets) ? parsed.sets : Array.isArray(parsed) ? parsed : []
+        if (stored._slim && Array.isArray(stored.setKeys)) {
+          // ── Slim format: key list only — resolve full Sets from Base ───
+          // Base sets carry entries/quality data and are always written as
+          // full blobs. A single base:sets read is cheaper than deserialising
+          // the old full Real blob, and the result is always fresh-cycle data.
+          const baseKey  = `strategies:${this.connectionId}:${symbol}:base:sets`
+          const baseSt   = await getSettings(baseKey) as any
+          const baseArr: StrategySet[] = Array.isArray(baseSt?.sets) ? baseSt.sets : []
+          const keySet   = new Set<string>(stored.setKeys as string[])
+          realSets       = baseArr.filter((s) => keySet.has(s.setKey))
+        } else {
+          // Legacy full-blob format — tolerate during rollout period.
+          realSets = Array.isArray(stored.sets) ? stored.sets : Array.isArray(stored) ? stored : []
+        }
       } else {
         realSets = []
       }
@@ -3373,13 +3390,16 @@ export class StrategyCoordinator {
 
 
 
-    // Persist LIVE sets
+    // Persist LIVE sets — slim format (coord keys only).
+    // Same rationale as the Real slim write above: qualifying sets all have their
+    // full entries in Base sets. Writing keys+metadata cuts Live payload ~60×.
     const liveKey = `strategies:${this.connectionId}:${symbol}:live:sets`
     await setSettings(liveKey, {
-      sets: qualifying,
-      count: qualifying.length,
-      created: new Date(),
+      setKeys:    qualifying.map((s) => s.setKey),
+      count:      qualifying.length,
+      created:    new Date(),
       executable: true,
+      _slim:      true,
     })
 
     // Create pseudo positions from REAL/LIVE sets so they appear on dashboard

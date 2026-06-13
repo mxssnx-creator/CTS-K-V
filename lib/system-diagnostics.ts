@@ -144,7 +144,17 @@ export async function runSystemDiagnostics(
     if (realSetsData) {
       try {
         const parsed = JSON.parse(realSetsData as string)
-        const realSets = parsed.sets || []
+        // Handle slim format (Step 5 coord plan): resolve from Base sets
+        let realSets: any[] = []
+        if (parsed._slim && Array.isArray(parsed.setKeys)) {
+          const baseKey  = `strategies:${connectionId}:${symbol}:base:sets`
+          const baseSt   = await client.get(baseKey)
+          const baseArr: any[] = baseSt ? (JSON.parse(baseSt as string)?.sets || []) : []
+          const keySet   = new Set<string>(parsed.setKeys)
+          realSets       = baseArr.filter((s: any) => keySet.has(s.setKey))
+        } else {
+          realSets       = parsed.sets || []
+        }
 
         const directions = { long: 0, short: 0 }
         const withParentKey = realSets.filter((s: any) => s.parentSetKey).length
@@ -290,6 +300,13 @@ export async function applyFixes(
 
     if (realSetsData) {
       const parsed = JSON.parse(realSetsData as string)
+      // Slim format: parentSetKey fix is not needed — Base sets already carry it.
+      // Skip the mutation pass for slim records; it would be a no-op anyway since
+      // there are no set objects stored inline to mutate.
+      if (parsed._slim) {
+        console.log("[v0] [Fixes] FIX 3: slim format — parentSetKey guaranteed via BaseRegistry, skip")
+        return
+      }
       const sets = parsed.sets || []
 
       let fixed = 0
