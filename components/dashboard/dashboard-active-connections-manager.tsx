@@ -100,8 +100,14 @@ export function DashboardActiveConnectionsManager() {
           toBoolean(conn.is_enabled_dashboard)
 
         if (isActiveInserted || isEnabledDashboard) {
-          if (seenIds.has(conn.id)) continue
-          seenIds.add(conn.id)
+          // Normalise IDs: strip the "conn-" prefix so that both the raw
+          // predefined key (e.g. "bingx-x01") and its stored form
+          // ("conn-bingx-x01") collapse to the same canonical token.
+          // Without this, getAllConnections() returning both forms would
+          // create two separate cards for the same physical connection.
+          const canonId = conn.id.replace(/^conn-/, "")
+          if (seenIds.has(canonId)) continue
+          seenIds.add(canonId)
           const exchange = (conn.exchange || "").toLowerCase().trim()
           const isBase = BASE_EXCHANGES.includes(exchange)
           activeConns.push({

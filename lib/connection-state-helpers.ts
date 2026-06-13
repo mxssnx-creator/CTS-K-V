@@ -44,11 +44,17 @@ export function buildMainConnectionEnableUpdate(conn: any): Record<string, any> 
  * Build update object to DISABLE a connection in Main Connections
  * - Keep is_inserted stable
  * - Set is_enabled_dashboard=0, is_active=0
- * - Keep is_assigned=1 (connection still assigned, just not enabled)
+ * - ALWAYS keep is_assigned=1 so the card stays visible in the panel
+ *   (disappear bug: a connection seeded with only is_enabled_dashboard=1 and
+ *   no is_assigned flag would vanish from the list on first disable because
+ *   both visible-flags became 0. Explicitly pinning is_assigned=1 here
+ *   ensures the card persists in a disabled/inactive state.)
  */
 export function buildMainConnectionDisableUpdate(conn: any): Record<string, any> {
   return {
     ...conn,
+    is_assigned: "1",          // keep card visible after disable
+    is_active_inserted: "1",   // keep is_active_inserted in sync
     is_enabled_dashboard: "0",
     is_active: "0",
     updated_at: new Date().toISOString(),

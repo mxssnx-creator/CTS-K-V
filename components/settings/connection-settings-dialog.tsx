@@ -127,9 +127,9 @@ const DEFAULT_INDICATION_PROFILE: ChannelProfile = {
   auto:      { enabled: false, range: 25, timeout: 90, interval: 15 },
 }
 const DEFAULT_STRATEGY_PROFILE: StrategyChannel = {
-  base: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 250 },
-  main: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 250 },
-  real: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 100 },
+  base: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 2000 },
+  main: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 2000 },
+  real: { enabled: true, min_profit_factor: 0.9, max_drawdown_time: 160, max_positions: 1000 },
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -575,8 +575,8 @@ export function ConnectionSettingsDialog({
         </DialogHeader>
 
         {/* Top Tabs */}
-        <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)} className="flex-1 flex flex-col overflow-hidden">
-          <TabsList className="mx-5 mt-3 grid grid-cols-4 h-9">
+        <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)} className="flex-1 flex flex-col min-h-0 overflow-hidden">
+          <TabsList className="mx-5 mt-3 grid grid-cols-4 h-9 shrink-0">
             <TabsTrigger value="overview" className="text-xs gap-1.5">
               <Activity className="h-3.5 w-3.5" /> Overview
             </TabsTrigger>
@@ -591,7 +591,7 @@ export function ConnectionSettingsDialog({
             </TabsTrigger>
           </TabsList>
 
-          <ScrollArea className="flex-1 px-5 py-4">
+          <ScrollArea className="flex-1 min-h-0 px-5 py-4">
             {loading && (
               <div className="flex items-center justify-center py-12 text-muted-foreground gap-2 text-sm">
                 <Loader2 className="h-4 w-4 animate-spin" /> Loading settings…
@@ -602,13 +602,7 @@ export function ConnectionSettingsDialog({
               <>
                 {/* OVERVIEW ──────────────────────────────────────── */}
                 <TabsContent value="overview" className="mt-0 space-y-5">
-                  <SectionHeading icon={ArrowDownUp} title="Volume Factors" subtitle="Multiplier applied to position size for each trade channel." />
-                  <VolumeSlider
-                    label="Base"
-                    description="Default multiplier for the standard pipeline."
-                    value={overview.volumeFactorBase}
-                    onChange={(v) => setOverview(p => ({ ...p, volumeFactorBase: v }))}
-                  />
+                  <SectionHeading icon={ArrowDownUp} title="Volume Factors" subtitle="Multiplier applied to position size for live and preset channels. Base channel uses internal ratios (system-managed, not configurable)." />
                   <VolumeSlider
                     label="Live"
                     description="Applied while a Live position is open."
@@ -1139,16 +1133,29 @@ function StrategyProfileEditor({
               </div>
             </div>
 
-            {/* Max Positions — keep as compact number field */}
-            <div className="pt-1 border-t border-border/40">
-              <NumberField
-                label="Max Positions"
-                suffix=""
-                min={1} max={1000} step={1}
-                value={p.max_positions}
-                onChange={(v) => update(type, { max_positions: v })}
+            {/* Max Positions slider — raised ceiling for high-throughput pipelines */}
+            <div className="space-y-2 pt-1 border-t border-border/40">
+              <div className="flex items-center justify-between">
+                <div>
+                  <Label className="text-xs font-medium">Max Positions</Label>
+                  <div className="text-[10px] text-muted-foreground">Maximum concurrent pseudo-positions for this stage</div>
+                </div>
+                <span className="font-mono text-sm tabular-nums font-semibold min-w-[4rem] text-right">
+                  {p.max_positions.toLocaleString()}
+                </span>
+              </div>
+              <Slider
+                min={100} max={10000} step={100}
+                value={[p.max_positions]}
+                onValueChange={([v]) => update(type, { max_positions: v })}
                 disabled={!p.enabled}
+                className="py-1"
               />
+              <div className="flex justify-between text-[10px] text-muted-foreground">
+                <span>100</span>
+                <span className="text-muted-foreground/60">{type === "real" ? "default 1,000" : "default 2,000"}</span>
+                <span>10,000</span>
+              </div>
             </div>
           </div>
         )
