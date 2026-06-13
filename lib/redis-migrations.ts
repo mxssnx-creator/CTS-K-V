@@ -38,6 +38,7 @@ import { getRedisClient, ensureCoreRedis, setMigrationsRun, haveMigrationsRun } 
  */
 const globalMigrationGuard = globalThis as unknown as {
   __migration_run_promise?: Promise<{ success: boolean; message: string; version: number }> | null
+  __coverage_repair_done?: boolean
 }
 
 function getMigrationRunPromise() {
@@ -54,6 +55,9 @@ export function resetMigrationRunState(): void {
   // Clear the one-shot diagnostic set so post-reset boot logs are emitted
   // again (e.g. "already at latest", operator_stopped honoured).
   ensureBootstrapDiag.clear()
+  // Allow coverage repair to run again after a DB flush so fresh connections
+  // get their metadata scaffolding.
+  globalMigrationGuard.__coverage_repair_done = false
   try {
     setMigrationsRun(false)
   } catch {
@@ -2180,16 +2184,19 @@ async function ensureCompleteProductionCoverage(client: any): Promise<void> {
         }
       }
 
-      await client.set(`prehistoric:${connId}:done`, "1", { EX: 86400 } as any).catch(() => {})
-      await client.set(`prehistoric:${connId}:firstpass:done`, "1", { EX: 86400 } as any).catch(() => {})
+      // DO NOT stamp prehistoric:done / firstpass:done here.
+      // These gates are written by the engine itself after a genuine prehistoric
+      // run completes. Stamping them unconditionally on every coverage-repair call
+      // (which fires on EVERY migration fast-path invocation = every request)
+      // silently skips prehistoric processing for every new/reset connection and
+      // directly prevents the "settings change → progression restarts" behaviour.
+      // The engine-manager's error path already writes both flags as a safety net
+      // when prehistoric genuinely fails.
 
-      const progKey = `progression:${connId}`
-      if (!(await client.hget(progKey, "engine_started"))) {
-        await client.hset(progKey, {
-          engine_started: "true",
-          last_update: new Date().toISOString(),
-        })
-      }
+      // DO NOT stamp engine_started:true here.
+      // That flag is the engine's own heartbeat marker. Writing it in the coverage
+      // repair resurrects zombie progressions (connections that were stopped/disabled)
+      // and fights with the operator-stop path. Only the engine itself sets it.
     }
   } catch (err) {
     console.warn("[v0] [Migrations] Essential progression repair warning:", err)
@@ -2405,8 +2412,14 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
         )
       }
 
-      // PRODUCTION: always run the INTENSIVE coverage repair (fills holes, missing processings, ensures complete state)
-      await ensureCompleteProductionCoverage(client)
+      // Coverage repair runs at most ONCE per process (one-shot guard on
+      // globalThis). On every subsequent fast-path call (= every API request)
+      // we skip it entirely — it iterates all connections and was the primary
+      // cause of slow startup on repeated requests.
+      if (!globalMigrationGuard.__coverage_repair_done) {
+        globalMigrationGuard.__coverage_repair_done = true
+        await ensureCompleteProductionCoverage(client)
+      }
 
       return { success: true, message: "Already run in this process", version: finalVer }
     }
@@ -2446,10 +2459,11 @@ async function runMigrationsInternal(): Promise<{ success: boolean; message: str
       }
        await setMigrationsRun(true)
 
-      // PRODUCTION: always run the full coverage repair (progression, counts, engine status, etc.)
-      // even when we are already at the latest schema version. This is what eliminates
-      // "No Progress / No counts" after deploys and cold starts in prod/preview.
-      await ensureCompleteProductionCoverage(client)
+      // Coverage repair: once per process only (same guard as the fast-path above).
+      if (!globalMigrationGuard.__coverage_repair_done) {
+        globalMigrationGuard.__coverage_repair_done = true
+        await ensureCompleteProductionCoverage(client)
+      }
 
       return { success: true, message: `Already at latest version ${finalVersion}`, version: finalVersion }
     }

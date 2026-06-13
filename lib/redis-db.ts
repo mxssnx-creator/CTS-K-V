@@ -487,8 +487,12 @@ export class InlineLocalRedis {
     //    `-<nowMs>` or timestamp component, so insertion order ≈ chronological.
     const hashFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
       { match: (k) => k.startsWith("pseudo_position:"), cap: 4000 },
-      { match: (k) => k.startsWith("config_set:") || k.includes(":config_set:"), cap: 6000 },
+      { match: (k) => k.startsWith("config_set:") || k.includes(":config_set:"), cap: 3000 },
       { match: (k) => k.startsWith("strategy:") && k.includes(":positions"), cap: 2000 },
+      { match: (k) => k.startsWith("strategy:") && k.includes(":detail"), cap: 2000 },
+      { match: (k) => k.startsWith("real_stage:") || k.startsWith("realstage:"), cap: 2000 },
+      { match: (k) => k.startsWith("indication:") && k.includes(":result"), cap: 3000 },
+      { match: (k) => k.startsWith("live_positions:") && k.includes(":history"), cap: 1000 },
     ]
     for (const { match, cap } of hashFamilyCaps) {
       const matching: string[] = []
@@ -509,6 +513,8 @@ export class InlineLocalRedis {
     const stringFamilyCaps: Array<{ match: (k: string) => boolean; cap: number }> = [
       { match: (k) => k.startsWith("pseudo_position:"), cap: 4000 },
       { match: (k) => k.includes(":exists:") || k.includes(":dedup:"), cap: 6000 },
+      { match: (k) => k.startsWith("strategy_detail:"), cap: 2000 },
+      { match: (k) => k.startsWith("candle_cache:") || k.startsWith("market_data_cache:"), cap: 60 },
     ]
     for (const { match, cap } of stringFamilyCaps) {
       const matching: string[] = []

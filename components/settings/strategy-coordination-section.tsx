@@ -844,18 +844,19 @@ export function StrategyCoordinationSection({
           <div className="flex items-center justify-between gap-2">
             <div>
               <CardTitle className="text-sm">
-                Minimal Step — Pseudo-Position Window Floor
+                Minimal Base Pseudo-Position Range Step
               </CardTitle>
               <CardDescription className="text-xs">
-                Minimum step-window size for indication configs (Steps 3–30).
-                Only windows <strong>≥ this value</strong> are generated and
-                evaluated. Raising the floor removes fast short-window configs
-                that react quickly but tend to trigger on noise. Lower = more
-                configs tested; higher = fewer but smoother signals.
+                Minimum step size used when generating pseudo-position windows
+                for Base-stage indication configs (range 3–30, monotonic step
+                5 by default). Only step values <strong>≥ this floor</strong>{" "}
+                are created and evaluated. Raising the value removes fast
+                short-window configs that react quickly but fire on noise.
+                Lower = more configs; higher = fewer, smoother signals.
               </CardDescription>
             </div>
             <Badge variant="outline" className="text-[10px] tabular-nums">
-              3–30 step 1
+              3–30, step 1
             </Badge>
           </div>
         </CardHeader>
@@ -863,7 +864,7 @@ export function StrategyCoordinationSection({
           <div className="rounded-lg border border-border/60 p-3 space-y-2">
             <div className="flex items-center justify-between gap-3">
               <Label className="text-sm font-semibold">
-                Min step window size
+                Min position-creation step
               </Label>
               <Badge variant="secondary" className="text-[10px] tabular-nums">
                 default 5
@@ -880,16 +881,20 @@ export function StrategyCoordinationSection({
                 }
                 className="flex-1"
               />
-              <span className="text-xs font-semibold tabular-nums w-8 text-right">
+              <span className="text-sm font-semibold tabular-nums w-8 text-right">
                 {value.minStep ?? 5}
               </span>
             </div>
+            <div className="flex justify-between text-[10px] text-muted-foreground pt-0.5">
+              <span>3 (all)</span>
+              <span className="text-muted-foreground/60">default 5</span>
+              <span>30 (slowest)</span>
+            </div>
             <p className="text-[11px] text-muted-foreground leading-relaxed pt-1">
-              Steps range from 3 to 30. At default 5 the engine tests
-              [5, 10, 15, 20, 25, 30] window sizes. Setting to 10 drops
-              the two shortest (noisiest) windows. Setting to 3 restores
-              all windows including the fastest. Effective from the next
-              indication config regeneration cycle.
+              At default 5 the engine creates windows [5, 10, 15, 20, 25, 30].
+              Setting to 3 adds the two fastest windows. Setting to 10 removes
+              the two shortest (noisiest). Changes take effect from the next
+              indication-config regeneration cycle.
             </p>
           </div>
         </CardContent>

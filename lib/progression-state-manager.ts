@@ -870,7 +870,13 @@ return {
       const key = `progression:${connectionId}`
       const existing = await client.hgetall(key).catch(() => null)
       if (!existing || Object.keys(existing).length === 0) {
-        // No active progress — nothing to re-coordinate
+        // No active progression yet — initialise a fresh one so the engine
+        // starts prehistoric processing on the next cycle instead of silently
+        // sitting idle. This covers the "enable connection → nothing starts"
+        // bug where the engine saw no progression and returned early without
+        // beginning the prehistoric phase.
+        const epoch = Date.now()
+        await this.archiveAndStartNewProgression(connectionId, epoch)
         return
       }
 
@@ -985,7 +991,19 @@ return {
         const newEpoch = Date.now()
         await this.archiveAndStartNewProgression(connectionId, newEpoch)
 
-        // Immediately solidify the new one with the *actual* live data
+        // Clear the prehistoric gate flags so the engine re-runs the full
+        // historic processing for the new symbol set / config. Without this
+        // the engine sees `:done` and `:firstpass:done` still set from the
+        // previous run and skips prehistoric entirely, leaving the new
+        // symbols completely unprocessed.
+        await Promise.all([
+          client.del(`prehistoric:${connectionId}:done`).catch(() => {}),
+          client.del(`prehistoric:${connectionId}:firstpass:done`).catch(() => {}),
+          client.del(`prehistoric:${connectionId}`).catch(() => {}),
+          client.del(`prehistoric:${connectionId}:symbols`).catch(() => {}),
+        ])
+
+        // Immediately solidify the new progression with the *actual* live data
         await client.hset(key, {
           symbol_count: String(liveSymbolCount),
           active_symbols_hash: liveSymbolsHash,
