@@ -281,15 +281,16 @@ export async function POST(request: Request) {
     // but we accept `body.symbolCount` so a future caller can request N
     // without forcing array construction. Bound to [1, 50] to defend
     // against accidental absurd values.
-    let requestedCount = 1
+    // Operator spec: quickstart supports up to 32 symbols, default 15.
+    let requestedCount = 15
     if (typeof rawSymbols === "number" && Number.isFinite(rawSymbols) && rawSymbols > 0) {
-      requestedCount = Math.max(1, Math.min(50, Math.floor(rawSymbols)))
+      requestedCount = Math.max(1, Math.min(32, Math.floor(rawSymbols)))
     } else if (
       typeof body.symbolCount === "number" &&
       Number.isFinite(body.symbolCount) &&
       body.symbolCount > 0
     ) {
-      requestedCount = Math.max(1, Math.min(50, Math.floor(body.symbolCount)))
+      requestedCount = Math.max(1, Math.min(32, Math.floor(body.symbolCount)))
     }
     // The auto-pick branches honour `requestedCount` so a caller that
     // posts `{ symbolCount: 2 }` (or `symbols: 2`) gets two symbols, not

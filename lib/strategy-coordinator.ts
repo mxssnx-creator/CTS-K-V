@@ -362,7 +362,7 @@ function registerCoordRecord(idx: CoordIndex, rec: SetCoordRecord): void {
   arr.push(rec)
 }
 
-// ─��� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
+// ─���� Position-Count Cartesian Axis Windows (operator spec) ────────────────────
 //
 // At Strategy Main, every Base Set that survives the Base→Main gate fans out
 // into additional "position-count" Sets along three operator-defined axes
@@ -740,10 +740,12 @@ export class StrategyCoordinator {
   // values gate the AVERAGE-PF of an already-built Set into the next
   // stage. Conceptually the operator wants ONE Base PF knob — so we
   // load the same `baseProfitFactor` into both fields.
-  private PF_BASE_MIN = 0.9    // Minimum to enter BASE set
-  private PF_MAIN_MIN = 1.0    // Base sets must have avgPF >= 1.0 to enter MAIN
-  private PF_REAL_MIN = 1.0    // Main sets must have avgPF >= 1.0 to enter REAL
-  private PF_LIVE_MIN = 1.0    // Real sets must have avgPF >= 1.0 to enter LIVE
+  // Operator spec defaults: base=1.0, main=1.2, real=1.2, live=1.2
+  // These are fallbacks used when no operator setting is found in Redis.
+  private PF_BASE_MIN = 1.0    // Minimum to enter BASE set
+  private PF_MAIN_MIN = 1.2    // Base sets must have avgPF >= 1.2 to enter MAIN
+  private PF_REAL_MIN = 1.2    // Main sets must have avgPF >= 1.2 to enter REAL
+  private PF_LIVE_MIN = 1.2    // Real sets must have avgPF >= 1.2 to enter LIVE
 
   // ── PF threshold settings cache (per-cycle) ─────────────────────
   // `loadAppPFThresholds()` hits Redis to pull the operator's slider
@@ -796,25 +798,25 @@ export class StrategyCoordinator {
   private METRICS: Record<string, EvaluationMetrics> = {
     base: {
       maxDrawdownTime: 999999,
-      minProfitFactor: 0.9,   // spec default — operator-tunable
-      confidence: 0.3,  // advisory only
+      minProfitFactor: 1.0,   // operator spec default (base=1.0)
+      confidence: 0.3,        // advisory only
       description: "One Set per (indication_type × direction) — all qualifying",
     },
     main: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default — operator-tunable
+      minProfitFactor: 1.2,   // operator spec default (main=1.2)
       confidence: 0.5,        // advisory only
       description: "Sets promoted from BASE with profitFactor >= main-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
     real: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default ����������������� operator-tunable
+      minProfitFactor: 1.2,   // operator spec default (real=1.2)
       confidence: 0.65,       // advisory only
       description: "Sets promoted from MAIN with profitFactor >= real-threshold + DDT <= maxDrawdownTime, gated by minPositions",
     },
     live: {
       maxDrawdownTime: 240,   // 4 hours — operator spec default, tunable
-      minProfitFactor: 1.0,   // spec default — operator-tunable
+      minProfitFactor: 1.2,   // operator spec default (live=1.2)
       confidence: 0.65,       // advisory only
       description: "Best 500 Sets from REAL (PF >= live-threshold + DDT <= maxDrawdownTime) ready for live trading",
     },
@@ -873,10 +875,12 @@ export class StrategyCoordinator {
         if (!Number.isFinite(n) || n < 0) return fallback
         return Math.max(0, Math.min(5, n))
       }
-      const basePF = clamp(s.baseProfitFactor, 0.9)
-      const mainPF = clamp(s.mainProfitFactor, 1.0)
-      const realPF = clamp(s.realProfitFactor, 1.0)
-      const livePF = clamp(s.liveProfitFactor, 1.0)
+      // Operator spec: base=1.0, main/real/live=1.2 as the fallback when
+      // the operator has never touched the PF sliders.
+      const basePF = clamp(s.baseProfitFactor, 1.0)
+      const mainPF = clamp(s.mainProfitFactor, 1.2)
+      const realPF = clamp(s.realProfitFactor, 1.2)
+      const livePF = clamp(s.liveProfitFactor, 1.2)
 
       this.PF_BASE_MIN = basePF
       this.PF_MAIN_MIN = mainPF
@@ -3037,7 +3041,7 @@ export class StrategyCoordinator {
         client.set(`strategies:${this.connectionId}:real:count`, String(realSets.length)),
         client.set(`strategies:${this.connectionId}:real:evaluated`, String(mainPFEligible)),
         client.set(`strategies:${this.connectionId}:main:passed`, String(realSets.length)),
-        // ── CRITICAL: Persist Real Sets for Live evaluation ────────────────────
+        // ── CRITICAL: Persist Real Sets for Live evaluation ───────────────────��
         // Bug fix: Real Sets were computed but never written, causing Live to load
         // an empty array and never fire. Now serialize the full realSets array so
         // createLiveSets can read and filter them for Live stage.
