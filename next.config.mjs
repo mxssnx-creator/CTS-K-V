@@ -8,6 +8,7 @@ const nextConfig = {
   eslint: {
     ignoreDuringBuilds: true,
   },
+  turbopack: {},
   images: {
     unoptimized: true,
   },
